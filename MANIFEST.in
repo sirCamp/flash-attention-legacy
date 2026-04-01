@@ -1,0 +1,16 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include Makefile
+
+recursive-include csrc *.cpp *.cu *.cuh *.h
+recursive-include flash_attn_legacy *.py
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include benchmarks *.py
+
+exclude .gitignore
+prune __pycache__
+prune build
+prune dist
+prune *.egg-info

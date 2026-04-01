@@ -1,0 +1,51 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.eggs/
+*.so
+*.o
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# CUDA build
+*.cubin
+*.fatbin
+*.ptx
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Distribution
+*.whl
+*.tar.gz
+MANIFEST
+
+# Secrets (should never exist here)
+.env
+*.pem
+*.key
