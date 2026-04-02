@@ -6,29 +6,31 @@ CUDA implementation of [Flash Attention v2](https://arxiv.org/abs/2307.09288) fo
 
 ## Why?
 
-This project started as a fun experiment to avoid throwing away a couple of old Pascal GPUs. Turns out, there's a real use case: plenty of V100s and P100s are still running in clusters, labs, and home setups — perfectly functional hardware that gets left behind because modern LLM tooling assumes Ampere or newer.
+This project started as a fun experiment to avoid throwing away a couple of old Pascal GPUs. It turned into something useful for a specific, real problem.
 
-Many modern LLMs are designed around flash attention — they expect O(N) memory attention and won't fit on your GPU without it. The official `flash-attn` package requires Ampere (SM 8.0+), leaving **V100s, P100s, GTX 1080s** without support.
+### The problem
 
-Without flash attention on these GPUs:
-- Standard attention allocates the full **N x N score matrix** per head per layer
-- A 3B model with 1024 context uses **~300 MB** just for attention scores
-- At 4096 context, that's **~5 GB** — often more than the model weights themselves
-- You hit OOM long before reaching the model's actual context limit
+Many HuggingFace models and libraries explicitly require `attn_implementation="flash_attention_2"` — and the official [flash-attn](https://github.com/Dao-AILab/flash-attention) package only supports Ampere and newer (SM 8.0+). If you try to use it on a **V100, P100, or GTX 1080**, you get an error:
 
-If you have older GPUs collecting dust, this project gives them a second life.
+```
+ValueError: FlashAttention2 is not supported on this GPU architecture (sm_70).
+```
 
-## The Solution
+This leaves perfectly functional GPUs locked out — not because the hardware can't handle attention efficiently, but because the software won't run on it.
 
-Flash Attention Legacy brings the same O(N) memory algorithm to Pascal and Volta GPUs. It trades slightly more compute for dramatically less memory:
+### What about SDPA?
 
-| | Standard (eager) | Flash Attention Legacy |
-|---|---|---|
-| **Attention memory** | O(N^2) — full score matrix | O(N) — tiled, never materialized |
-| **Prefill speed** | Faster on Pascal (no tensor cores) | ~10-20% slower |
-| **What it enables** | Limited by GPU memory | Longer contexts, larger models, bigger batches |
+PyTorch's `scaled_dot_product_attention` (SDPA) already provides memory-efficient attention on these GPUs via its `memory_efficient` backend. If you can use `attn_implementation="sdpa"`, **you should** — it works out of the box with no extra dependencies.
 
-**The key insight**: on memory-constrained GPUs, the bottleneck is not compute — it's memory. Flash attention lets you run models that would otherwise OOM.
+But not all code paths go through SDPA. Some models, training frameworks, and research codebases explicitly require `flash_attention_2` and won't fall back gracefully. That's where this package comes in.
+
+### What this project actually is
+
+1. **A drop-in replacement** for `flash_attention_2` on Pascal/Volta GPUs. If a model requires it and your GPU is rejected, `pip install` this and use `attn_implementation="flash_attn_legacy"` instead.
+
+2. **A from-scratch CUDA implementation** of Flash Attention v2 — hand-written kernels with WMMA tensor cores (Volta) and half2 packed math (Pascal). No cuDNN, no ATen, no black boxes. If you want to understand how flash attention works at the CUDA level, this is a readable reference.
+
+3. **Variable-length sequence support** (`flash_attn_varlen_func`) for packed batching without padding waste — useful for training with heterogeneous sequence lengths.
 
 ## Supported Hardware
 
@@ -46,14 +48,16 @@ Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 ```bash
 git clone https://github.com/sirCamp/flash-attention-legacy.git
 cd flash-attention-legacy
-pip install -e .
+pip install -e . --no-build-isolation
 
 # With HuggingFace integration
-pip install -e ".[transformers]"
+pip install -e ".[transformers]" --no-build-isolation
 
 # With tests and benchmarks
-pip install -e ".[test,bench]"
+pip install -e ".[test,bench]" --no-build-isolation
 ```
+
+> **Why `--no-build-isolation`?** The CUDA extension needs to link against your installed PyTorch at build time. With build isolation, pip creates a temporary environment where PyTorch may not be available, causing the build to fail.
 
 **Requirements**: CUDA toolkit >= 11.0, PyTorch >= 1.12 (PyTorch 2.4 for Pascal/SM 6.0), a Pascal or Volta GPU.
 
@@ -170,6 +174,8 @@ check_gpu_compatibility()
 
 ## Benchmarks
 
+> **Note**: All benchmarks below compare against **eager attention** (the naive O(N^2) implementation) to show the algorithmic difference. PyTorch's SDPA provides similar memory savings via its built-in `memory_efficient` backend — these numbers are about our kernel's characteristics, not a claim that eager is the only alternative.
+
 ### V100 — Prefill with TinyLlama 1.1B
 
 Measured on **Tesla V100-SXM2-32GB**. Extra memory above model weights during a single forward pass (prefill only, no generation). Both Q@K^T and P@V use WMMA tensor cores.
@@ -221,7 +227,7 @@ On Pascal, flash attention is ~10-20% slower (no tensor cores, only CUDA cores),
 | 2048 | 99% | 0.6x |
 | 4096 | 100% | 0.7x |
 
-**This is the right trade-off on memory-constrained GPUs**: being slightly slower but fitting a model that would otherwise OOM is strictly better than not running at all.
+On Pascal, the trade-off is pure compute for memory: no tensor cores means slower matmuls, but the O(N) memory footprint is the same as on Volta.
 
 ### V100 — Variable-length (packed sequences)
 
@@ -249,7 +255,7 @@ End-to-end training comparison (forward + backward) on **Tesla V100-SXM2-32GB**.
 
 At N=2048, flash is **16% faster** than eager in full training (forward + backward) thanks to WMMA tensor cores in both passes. Both backends produce coherent loss curves (< 1% relative difference).
 
-At N=4096, eager runs out of memory while flash trains successfully — this is the core value proposition on memory-constrained GPUs.
+At N=4096, eager runs out of memory while flash trains successfully. Note: SDPA (`attn_implementation="sdpa"`) would also handle this — these numbers demonstrate our kernel's correctness and performance characteristics vs the naive baseline.
 
 ## How It Works
 
@@ -298,7 +304,7 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 ## Testing
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[test]" --no-build-isolation
 pytest tests/ -v
 
 # Performance comparison table
