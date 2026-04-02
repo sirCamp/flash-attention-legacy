@@ -394,3 +394,156 @@ class TestGeneration:
                 print(f"  {backend:>20} | {'OOM':>14} {'':>8} | {'':>6}")
 
         print(f"{'=' * W}")
+
+
+# ---------------------------------------------------------------------------
+# Variable-length (packed sequences) benchmarks
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestVarlenBenchmark:
+    """Compare varlen (packed) vs padded attention at kernel level.
+
+    Shows memory and speed impact of packing variable-length sequences
+    instead of padding to max length.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+    def _measure(self, fn, warmup=3, repeats=10):
+        """Measure time (ms) and peak extra memory (MB) for a function."""
+        import math as _math
+        try:
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+
+            times_ms = []
+            extra_mbs = []
+            for _ in range(repeats):
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                baseline = torch.cuda.memory_allocated()
+
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                fn()
+                end.record()
+                torch.cuda.synchronize()
+
+                times_ms.append(start.elapsed_time(end))
+                peak = torch.cuda.max_memory_allocated()
+                extra_mbs.append((peak - baseline) / (1024 ** 2))
+
+            return {
+                'time_mean': statistics.mean(times_ms),
+                'time_std': statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0,
+                'mem_mean': statistics.mean(extra_mbs),
+                'mem_std': statistics.stdev(extra_mbs) if len(extra_mbs) > 1 else 0.0,
+            }
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return None
+
+    def test_varlen_vs_padded(self):
+        """Compare packed (varlen) vs padded attention.
+
+        Simulates a batch with variable-length sequences. Padded = pad all
+        to max_len and use standard flash_attention. Packed = concatenate
+        and use flash_attn_varlen_func.
+        """
+        from flash_attn_legacy import flash_attention, flash_attn_varlen_func
+        import math
+
+        H, d = 8, 64
+        scale = 1.0 / math.sqrt(d)
+
+        scenarios = [
+            ("uniform_short",       [64] * 16),
+            ("uniform_medium",      [256] * 8),
+            ("mixed_short",         [32, 64, 48, 16, 96, 80, 24, 128]),
+            ("mixed_heavy",         [512, 64, 256, 32, 128, 64, 512, 32]),
+            ("one_long_rest_short", [1024] + [32] * 15),
+            ("all_long",            [1024] * 4),
+        ]
+
+        props = torch.cuda.get_device_properties(0)
+        W = 105
+        print(f"\n{'=' * W}")
+        print(f"  VARLEN (PACKED) vs PADDED BENCHMARK")
+        print(f"  GPU:  {props.name} ({props.total_memory / (1024**3):.1f} GB)")
+        print(f"  Config: H={H}, d={d}, FP16, causal=True")
+        print(f"{'=' * W}")
+        print(f"\n  {'scenario':>25} | {'seqs':>4} {'max_len':>7} {'total':>6} {'pad_waste':>9} |"
+              f" {'padded (MB)':>12} {'packed (MB)':>12} {'mem_saved':>9} |"
+              f" {'padded (ms)':>12} {'packed (ms)':>12} {'speedup':>8}")
+        print(f"  {'-' * 100}")
+
+        for name, seq_lens in scenarios:
+            batch = len(seq_lens)
+            max_len = max(seq_lens)
+            total_tokens = sum(seq_lens)
+            padded_tokens = batch * max_len
+            waste_pct = (1 - total_tokens / padded_tokens) * 100
+
+            # --- Padded: pad all to max_len, single kernel call ---
+            q_pad = torch.randn(batch, H, max_len, d, device='cuda', dtype=torch.float16) * 0.3
+            k_pad = torch.randn(batch, H, max_len, d, device='cuda', dtype=torch.float16) * 0.3
+            v_pad = torch.randn(batch, H, max_len, d, device='cuda', dtype=torch.float16) * 0.3
+
+            def run_padded(q=q_pad, k=k_pad, v=v_pad):
+                with torch.no_grad():
+                    flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+
+            # --- Packed: concatenate, use varlen ---
+            q_pack = torch.randn(total_tokens, H, d, device='cuda', dtype=torch.float16) * 0.3
+            k_pack = torch.randn(total_tokens, H, d, device='cuda', dtype=torch.float16) * 0.3
+            v_pack = torch.randn(total_tokens, H, d, device='cuda', dtype=torch.float16) * 0.3
+
+            offsets = [0]
+            for sl in seq_lens:
+                offsets.append(offsets[-1] + sl)
+            cu = torch.tensor(offsets, dtype=torch.int32, device='cuda')
+
+            def run_packed(q=q_pack, k=k_pack, v=v_pack, c=cu, ml=max_len):
+                with torch.no_grad():
+                    flash_attn_varlen_func(q, k, v, c, c, ml, ml,
+                                          softmax_scale=scale, causal=True)
+
+            padded_stats = self._measure(run_padded)
+            packed_stats = self._measure(run_packed)
+
+            del q_pad, k_pad, v_pad, q_pack, k_pack, v_pack
+            torch.cuda.empty_cache()
+
+            p_mem = f"{padded_stats['mem_mean']:.1f}" if padded_stats else "OOM"
+            k_mem = f"{packed_stats['mem_mean']:.1f}" if packed_stats else "OOM"
+            p_ms = f"{padded_stats['time_mean']:.2f}" if padded_stats else "OOM"
+            k_ms = f"{packed_stats['time_mean']:.2f}" if packed_stats else "OOM"
+
+            if padded_stats and packed_stats:
+                saved = (1 - packed_stats['mem_mean'] / max(padded_stats['mem_mean'], 0.1)) * 100
+                saved_str = f"{saved:+.0f}%"
+                spd = padded_stats['time_mean'] / max(packed_stats['time_mean'], 0.001)
+                spd_str = f"{spd:.2f}x"
+            elif padded_stats is None and packed_stats:
+                saved_str = "pad OOM"
+                spd_str = "n/a"
+            else:
+                saved_str = "n/a"
+                spd_str = "n/a"
+
+            print(f"  {name:>25} | {batch:>4} {max_len:>7} {total_tokens:>6} {waste_pct:>8.0f}% |"
+                  f" {p_mem:>12} {k_mem:>12} {saved_str:>9} |"
+                  f" {p_ms:>12} {k_ms:>12} {spd_str:>8}")
+
+        print(f"\n  padded = all sequences padded to max_len, single flash_attention call")
+        print(f"  packed = concatenated sequences, flash_attn_varlen_func (per-seq kernel calls)")
+        print(f"  pad_waste = % of padded tokens that are padding")
+        print(f"  mem_saved = memory reduction of packed vs padded")
+        eq_line = "=" * W
+        print(eq_line)

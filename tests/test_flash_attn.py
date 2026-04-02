@@ -283,6 +283,142 @@ class TestBackwardGQA:
 # Module tests
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Variable-length (packed sequences)
+# ---------------------------------------------------------------------------
+
+class TestVarlen:
+    """Test flash_attn_varlen_func with packed sequences."""
+
+    def _ref_varlen(self, q, k, v, cu_seqlens_q, cu_seqlens_k, scale, causal=False):
+        """Reference: loop over sequences, compute standard attention per seq."""
+        batch_size = cu_seqlens_q.shape[0] - 1
+        outputs = []
+        for i in range(batch_size):
+            qs = cu_seqlens_q[i].item()
+            qe = cu_seqlens_q[i + 1].item()
+            ks = cu_seqlens_k[i].item()
+            ke = cu_seqlens_k[i + 1].item()
+            # [seq, H, d] -> [1, H, seq, d]
+            qi = q[qs:qe].permute(1, 0, 2).unsqueeze(0)
+            ki = k[ks:ke].permute(1, 0, 2).unsqueeze(0)
+            vi = v[ks:ke].permute(1, 0, 2).unsqueeze(0)
+            oi = ref_attention(qi, ki, vi, scale, is_causal=causal)
+            outputs.append(oi.squeeze(0).permute(1, 0, 2))
+        return torch.cat(outputs, dim=0)
+
+    @pytest.mark.parametrize("d", [64, 128])
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen_correctness(self, d, causal):
+        """Varlen matches per-sequence reference attention."""
+        from flash_attn_legacy import flash_attn_varlen_func
+
+        H = 4
+        seq_lens = [32, 64, 48]
+        total = sum(seq_lens)
+        scale = 1.0 / math.sqrt(d)
+
+        q = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+        k = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+        v = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+
+        cu = torch.tensor([0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
+                          dtype=torch.int32, device='cuda')
+
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max(seq_lens), max(seq_lens),
+                                     softmax_scale=scale, causal=causal)
+        ref = self._ref_varlen(q, k, v, cu, cu, scale, causal)
+
+        assert out.shape == (total, H, d)
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=5e-3)
+
+    @pytest.mark.parametrize("d", [64, 128])
+    def test_varlen_gqa(self, d):
+        """Varlen with GQA (different Q and KV head counts)."""
+        from flash_attn_legacy import flash_attn_varlen_func
+
+        H_q, H_kv = 8, 2
+        seq_lens = [64, 32]
+        total = sum(seq_lens)
+        scale = 1.0 / math.sqrt(d)
+
+        q = torch.randn(total, H_q, d, device='cuda', dtype=torch.float16) * 0.3
+        k = torch.randn(total, H_kv, d, device='cuda', dtype=torch.float16) * 0.3
+        v = torch.randn(total, H_kv, d, device='cuda', dtype=torch.float16) * 0.3
+
+        cu = torch.tensor([0, 64, 96], dtype=torch.int32, device='cuda')
+
+        out = flash_attn_varlen_func(q, k, v, cu, cu, 64, 64,
+                                     softmax_scale=scale, causal=True)
+        assert out.shape == (total, H_q, d)
+        assert not torch.isnan(out).any()
+
+    def test_varlen_single_sequence(self):
+        """Single sequence should match regular flash_attention."""
+        from flash_attn_legacy import flash_attention, flash_attn_varlen_func
+
+        H, N, d = 4, 128, 64
+        scale = 1.0 / math.sqrt(d)
+
+        q = torch.randn(N, H, d, device='cuda', dtype=torch.float16) * 0.3
+        k = torch.randn(N, H, d, device='cuda', dtype=torch.float16) * 0.3
+        v = torch.randn(N, H, d, device='cuda', dtype=torch.float16) * 0.3
+
+        cu = torch.tensor([0, N], dtype=torch.int32, device='cuda')
+        out_varlen = flash_attn_varlen_func(q, k, v, cu, cu, N, N,
+                                            softmax_scale=scale, causal=True)
+
+        # Compare with batched version
+        q_b = q.permute(1, 0, 2).unsqueeze(0)  # [1, H, N, d]
+        k_b = k.permute(1, 0, 2).unsqueeze(0)
+        v_b = v.permute(1, 0, 2).unsqueeze(0)
+        out_batch = flash_attention(q_b, k_b, v_b, softmax_scale=scale, is_causal=True)
+        out_batch = out_batch.squeeze(0).permute(1, 0, 2)  # [N, H, d]
+
+        torch.testing.assert_close(out_varlen, out_batch, rtol=1e-4, atol=1e-4)
+
+    def test_varlen_backward(self):
+        """Gradients flow through varlen."""
+        from flash_attn_legacy import flash_attn_varlen_func
+
+        H, d = 4, 64
+        seq_lens = [32, 64]
+        total = sum(seq_lens)
+
+        q = torch.randn(total, H, d, device='cuda', dtype=torch.float16, requires_grad=True)
+        k = torch.randn(total, H, d, device='cuda', dtype=torch.float16, requires_grad=True)
+        v = torch.randn(total, H, d, device='cuda', dtype=torch.float16, requires_grad=True)
+
+        cu = torch.tensor([0, 32, 96], dtype=torch.int32, device='cuda')
+
+        out = flash_attn_varlen_func(q, k, v, cu, cu, 64, 64, causal=True)
+        out.sum().backward()
+
+        assert q.grad is not None and not torch.all(q.grad == 0)
+        assert k.grad is not None and not torch.all(k.grad == 0)
+        assert v.grad is not None and not torch.all(v.grad == 0)
+
+    def test_varlen_many_short_seqs(self):
+        """Many short sequences packed together."""
+        from flash_attn_legacy import flash_attn_varlen_func
+
+        H, d = 2, 64
+        seq_lens = [16, 8, 32, 4, 24]
+        total = sum(seq_lens)
+
+        q = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+        k = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+        v = torch.randn(total, H, d, device='cuda', dtype=torch.float16) * 0.3
+
+        cu = torch.tensor([0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
+                          dtype=torch.int32, device='cuda')
+
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max(seq_lens), max(seq_lens),
+                                     causal=True)
+        assert out.shape == (total, H, d)
+        assert not torch.isnan(out).any()
+
+
 class TestModules:
 
     def test_mha_module(self):

@@ -238,8 +238,9 @@ class TestComparisonTable:
                 print(f"{N:>6} | {std_str:>14} {flash_str:>14} {speedup:>7.2f}x | "
                       f"{std_mb:>8.1f} {flash_mb:>9.1f} {saved:>6.0f}% | {max_diff:>9.5f}")
             except torch.cuda.OutOfMemoryError:
-                print(f"{N:>6} | {'OOM':>14} {'\u2014':>14} {'\u2014':>8} | "
-                      f"{'OOM':>8} {'\u2014':>9} {'\u2014':>7} | {'\u2014':>9}")
+                dash = "\u2014"
+                print(f"{N:>6} | {'OOM':>14} {dash:>14} {dash:>8} | "
+                      f"{'OOM':>8} {dash:>9} {dash:>7} | {dash:>9}")
                 torch.cuda.empty_cache()
 
         print()

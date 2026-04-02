@@ -69,6 +69,41 @@ struct FlashAttnParams {
 };
 
 // ---------------------------------------------------------------------------
+// Forward kernel launch parameters — variable-length (packed sequences)
+// ---------------------------------------------------------------------------
+struct FlashAttnVarlenParams {
+    // Pointers (device) — packed format: [total_tokens, H, d]
+    const half* __restrict__ Q;   // [total_q, H_q, d]
+    const half* __restrict__ K;   // [total_k, H_kv, d]
+    const half* __restrict__ V;   // [total_k, H_kv, d]
+    half* __restrict__ O;         // [total_q, H_q, d]
+    float* __restrict__ L;        // [total_q, H_q] — logsumexp for backward
+
+    // Sequence boundaries
+    const int* __restrict__ cu_seqlens_q;   // [num_seqs + 1]
+    const int* __restrict__ cu_seqlens_k;   // [num_seqs + 1]
+    const int* __restrict__ block_offsets;   // [num_seqs + 1] — cumulative Q block counts
+
+    int num_seqs;
+    int num_heads;       // H_q
+    int num_heads_k;     // H_kv
+    int head_dim;        // 64 or 128
+
+    // Strides (in elements) — layout is [total, H, d]
+    int q_token_stride;  // H_q * d
+    int q_head_stride;   // d
+    int k_token_stride;  // H_kv * d
+    int k_head_stride;   // d
+    int v_token_stride;
+    int v_head_stride;
+    int o_token_stride;
+    int o_head_stride;
+
+    float softmax_scale;
+    bool is_causal;
+};
+
+// ---------------------------------------------------------------------------
 // Backward kernel launch parameters — shared between all kernels
 // ---------------------------------------------------------------------------
 struct FlashAttnBwdParams {

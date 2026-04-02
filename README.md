@@ -128,6 +128,29 @@ v = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
 out = flash_attention(q, k, v, is_causal=True)
 ```
 
+### Variable-length (packed sequences)
+
+```python
+from flash_attn_legacy import flash_attn_varlen_func
+
+# Batch of 3 sequences with different lengths (no padding waste)
+seq_lens = [128, 256, 64]
+total = sum(seq_lens)  # 448
+
+q = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16)
+k = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16)
+v = torch.randn(total, 8, 64, device='cuda', dtype=torch.float16)
+
+# Cumulative sequence lengths: [0, 128, 384, 448]
+cu_seqlens = torch.tensor([0, 128, 384, 448], dtype=torch.int32, device='cuda')
+
+out = flash_attn_varlen_func(
+    q, k, v, cu_seqlens, cu_seqlens,
+    max_seqlen_q=256, max_seqlen_k=256,
+    causal=True,
+)  # [448, 8, 64]
+```
+
 ### Multi-Head Attention module
 
 ```python
@@ -200,6 +223,34 @@ On Pascal, flash attention is ~10-20% slower (no tensor cores, only CUDA cores),
 
 **This is the right trade-off on memory-constrained GPUs**: being slightly slower but fitting a model that would otherwise OOM is strictly better than not running at all.
 
+### V100 — Variable-length (packed sequences)
+
+Compares padded batching (all sequences padded to max length) vs packed batching (`flash_attn_varlen_func`, single kernel launch). Measured on **Tesla V100-SXM2-32GB**, H=8, d=64, FP16, causal.
+
+| Scenario | Seqs | Max len | Padding waste | Memory saved | Speedup |
+|---|---|---|---|---|---|
+| uniform_short | 16 | 64 | 0% | 0% | 0.81x |
+| uniform_medium | 8 | 256 | 0% | 0% | 0.90x |
+| mixed_short | 8 | 128 | 52% | **52%** | 0.74x |
+| mixed_heavy | 8 | 512 | 61% | **61%** | **1.88x** |
+| one_long + rest_short | 16 | 1024 | 91% | **91%** | **6.78x** |
+| all_long | 4 | 1024 | 0% | 0% | 0.97x |
+
+When sequences have very different lengths (common in training), packing avoids wasting compute and memory on padding tokens. The `one_long_rest_short` scenario (1×1024 + 15×32) shows **6.78x speedup** and **91% memory savings** — padded would compute attention on 16×1024 = 16K tokens, packed only processes 1504 actual tokens.
+
+### V100 — Training with TinyLlama 1.1B
+
+End-to-end training comparison (forward + backward) on **Tesla V100-SXM2-32GB**. TinyLlama 1.1B, FP32 weights + FP16 autocast + GradScaler, B=2, 20 steps, gradient checkpointing enabled.
+
+| N | eager (ms/step) | flash (ms/step) | Speedup | eager loss | flash loss | Note |
+|---|---|---|---|---|---|---|
+| 2048 | 1369.5 | 1179.9 | **1.16x** | 9.24 | 9.31 | Flash faster thanks to WMMA backward |
+| 4096 | OOM | 2975.6 | -- | OOM | 8.24 | **Eager cannot train at this length** |
+
+At N=2048, flash is **16% faster** than eager in full training (forward + backward) thanks to WMMA tensor cores in both passes. Both backends produce coherent loss curves (< 1% relative difference).
+
+At N=4096, eager runs out of memory while flash trains successfully — this is the core value proposition on memory-constrained GPUs.
+
 ## How It Works
 
 ### Algorithm
@@ -222,8 +273,15 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 
 ### Backward pass
 
-Both architectures share a unified backward kernel:
+**Volta (SM 7.0):**
 - **D = rowsum(dO * O)** precomputed in a separate kernel
+- All 5 matmuls use `wmma::mma_sync` (16x16x16 tensor core fragments):
+  - S = Q @ K^T (recompute), dP = dO @ V^T, dV += P^T @ dO, dK += dS^T @ Q, dQ += dS @ K
+- **dK, dV** accumulated in shared memory FP32 buffers with WMMA in-place accumulation
+- **dQ** accumulated in global FP32 buffer with `atomicAdd`
+
+**Pascal (SM 6.0/6.1):**
+- Same algorithm with `half2` packed multiply-add (no tensor cores)
 - **dQ** accumulated in FP32 with `atomicAdd`
 - **dK, dV** accumulated in per-thread FP32 registers, converted to FP16 on writeback
 - Multi-thread per KV row with warp shuffle reduction
@@ -255,16 +313,15 @@ pytest tests/test_generation_benchmark.py -v -s -k "prefill"
 1. **Head dimensions**: only d=64 and d=128
 2. **FP16 only**: no BF16 (Pascal/Volta lack native BF16)
 3. **No dropout** in attention kernel
-4. **No variable-length** (packed batching) support
-5. **Prefill only**: decode (q_len=1) falls back to standard attention (no O(N^2) issue there)
+4. **Prefill only**: decode (q_len=1) falls back to standard attention (no O(N^2) issue there)
 
 ## Roadmap
 
 - [x] GQA/MQA support
 - [x] HuggingFace Transformers native integration (`attn_implementation="flash_attn_legacy"`)
 - [x] WMMA tensor cores for both Q@K^T and P@V on Volta
-- [ ] WMMA-based backward on Volta
-- [ ] Variable-length sequence support
+- [x] WMMA-based backward on Volta
+- [x] Variable-length sequence support (`flash_attn_varlen_func`)
 - [ ] Turing (SM 7.5) optimized path
 
 ## References

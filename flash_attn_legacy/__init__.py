@@ -26,10 +26,11 @@ Quick start:
     >>> out_gqa = flash_attention(q, k_gqa, v_gqa, is_causal=True)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .flash_attn import (
     flash_attention,
+    flash_attn_varlen_func,
     FlashAttention,
     FlashMultiHeadAttention,
 )
@@ -43,6 +44,7 @@ from .integrations import register
 
 __all__ = [
     "flash_attention",
+    "flash_attn_varlen_func",
     "FlashAttention",
     "FlashMultiHeadAttention",
     "check_gpu_compatibility",

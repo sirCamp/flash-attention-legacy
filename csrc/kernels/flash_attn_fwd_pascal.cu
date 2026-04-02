@@ -223,6 +223,169 @@ flash_attn_fwd_pascal_kernel(FlashAttnParams params) {
 }
 
 // ---------------------------------------------------------------------------
+// Forward kernel — Pascal — Variable-length (packed sequences)
+// ---------------------------------------------------------------------------
+template <typename Tile>
+__global__ void __launch_bounds__(Tile::kNumWarps * 32)
+flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
+
+    constexpr int Br = Tile::Br;
+    constexpr int Bc = Tile::Bc;
+    constexpr int d  = Tile::d;
+    constexpr int NUM_THREADS = Tile::kNumWarps * 32;
+
+    const int h_idx = blockIdx.y;
+    const int block_x = blockIdx.x;
+
+    // Binary search: find which sequence this block belongs to
+    int seq_idx = 0;
+    {
+        int lo = 0, hi = params.num_seqs;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (params.block_offsets[mid + 1] <= block_x)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        seq_idx = lo;
+    }
+
+    const int local_block = block_x - params.block_offsets[seq_idx];
+    const int q_start_tok = params.cu_seqlens_q[seq_idx];
+    const int k_start_tok = params.cu_seqlens_k[seq_idx];
+    const int seq_len_q = params.cu_seqlens_q[seq_idx + 1] - q_start_tok;
+    const int seq_len_k = params.cu_seqlens_k[seq_idx + 1] - k_start_tok;
+
+    const int q_row_start = local_block * Br;
+    if (q_row_start >= seq_len_q) return;
+    const int valid_q = min(Br, seq_len_q - q_row_start);
+
+    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
+
+    // Pointers into packed [total, H, d] tensors
+    const half* Q_ptr = params.Q + (q_start_tok + q_row_start) * params.q_token_stride
+                                 + h_idx * params.q_head_stride;
+    const half* K_ptr = params.K + k_start_tok * params.k_token_stride
+                                 + kv_h_idx * params.k_head_stride;
+    const half* V_ptr = params.V + k_start_tok * params.v_token_stride
+                                 + kv_h_idx * params.v_head_stride;
+    half* O_ptr = params.O + (q_start_tok + q_row_start) * params.o_token_stride
+                           + h_idx * params.o_head_stride;
+
+    // Shared memory
+    extern __shared__ char smem_raw[];
+    half*  smem_Q = reinterpret_cast<half*>(smem_raw);
+    half*  smem_K = smem_Q + Br * d;
+    half*  smem_V = smem_K + Bc * d;
+    float* smem_P = reinterpret_cast<float*>(smem_V + Bc * d);
+
+    const int tid = threadIdx.x;
+    const bool owns_row = (tid < Br) && (tid < valid_q);
+
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+    float my_O[d];
+    #pragma unroll
+    for (int j = 0; j < d; j++) my_O[j] = 0.0f;
+
+    // Load Q — stride is token_stride
+    load_tile_g2s<Br, d, NUM_THREADS>(Q_ptr, params.q_token_stride, smem_Q, valid_q);
+    __syncthreads();
+
+    // Main loop over K/V blocks (within this sequence)
+    const int nkv = cdiv(seq_len_k, Bc);
+    const int kv_limit = params.is_causal ? min(nkv, cdiv(q_row_start + Br, Bc)) : nkv;
+
+    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
+        const int kv_start = kv_blk * Bc;
+        const int valid_kv = min(Bc, seq_len_k - kv_start);
+
+        // Load K
+        load_tile_g2s<Bc, d, NUM_THREADS>(
+            K_ptr + kv_start * params.k_token_stride,
+            params.k_token_stride, smem_K, valid_kv);
+        __syncthreads();
+
+        // Compute S, softmax → P in shared memory
+        if (owns_row) {
+            float local_max = -INFINITY;
+
+            #pragma unroll
+            for (int c = 0; c < Bc; c++) {
+                float s;
+                if ((kv_start + c) >= seq_len_k ||
+                    (params.is_causal && (kv_start + c) > (q_row_start + tid))) {
+                    s = -INFINITY;
+                } else {
+                    s = half2_dot<d>(smem_Q + tid * d, smem_K + c * d) * params.softmax_scale;
+                }
+                smem_P[tid * Bc + c] = s;
+                local_max = fmaxf(local_max, s);
+            }
+
+            float new_max = fmaxf(row_max, local_max);
+            float rescale = expf(row_max - new_max);
+            row_max = new_max;
+            row_sum *= rescale;
+            #pragma unroll
+            for (int j = 0; j < d; j++) my_O[j] *= rescale;
+
+            float local_sum = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < Bc; c++) {
+                float s = smem_P[tid * Bc + c];
+                float p = (s == -INFINITY) ? 0.0f : expf(s - new_max);
+                smem_P[tid * Bc + c] = p;
+                local_sum += p;
+            }
+            row_sum += local_sum;
+        }
+        __syncthreads();
+
+        // Load V
+        load_tile_g2s<Bc, d, NUM_THREADS>(
+            V_ptr + kv_start * params.v_token_stride,
+            params.v_token_stride, smem_V, valid_kv);
+        __syncthreads();
+
+        // O += P @ V
+        if (owns_row) {
+            #pragma unroll
+            for (int c = 0; c < Bc; c++) {
+                float p = smem_P[tid * Bc + c];
+                if (p == 0.0f) continue;
+                const half2* v2 = reinterpret_cast<const half2*>(smem_V + c * d);
+                constexpr int d2 = d / 2;
+                #pragma unroll
+                for (int j = 0; j < d2; j++) {
+                    half2 v = v2[j];
+                    my_O[j * 2]     += p * __half2float(v.x);
+                    my_O[j * 2 + 1] += p * __half2float(v.y);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Finalize — write O and L with packed strides
+    if (owns_row) {
+        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * params.o_token_stride);
+        constexpr int d2 = d / 2;
+        #pragma unroll
+        for (int j = 0; j < d2; j++) {
+            half2 val;
+            val.x = __float2half(my_O[j * 2] * inv_sum);
+            val.y = __float2half(my_O[j * 2 + 1] * inv_sum);
+            o_dst2[j] = val;
+        }
+        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] =
+            row_max + logf(fmaxf(row_sum, 1e-20f));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host launcher
 // ---------------------------------------------------------------------------
 void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream) {
@@ -242,6 +405,28 @@ void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream) {
         dim3 grid(cdiv(params.seq_len, T::Br), nbh);
         dim3 block(T::kNumWarps * 32);
         flash_attn_fwd_pascal_kernel<T><<<grid, block, smem, stream>>>(params);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher — variable-length
+// ---------------------------------------------------------------------------
+void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params,
+                                   int total_q_blocks, cudaStream_t stream) {
+    if (params.head_dim == 64) {
+        using T = TilePascal_d64;
+        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
+                           + T::Br * T::Bc * sizeof(float);
+        dim3 grid(total_q_blocks, params.num_heads);
+        dim3 block(T::kNumWarps * 32);
+        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);
+    } else {
+        using T = TilePascal_d128;
+        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
+                           + T::Br * T::Bc * sizeof(float);
+        dim3 grid(total_q_blocks, params.num_heads);
+        dim3 block(T::kNumWarps * 32);
+        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);
     }
 }
 
