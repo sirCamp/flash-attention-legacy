@@ -57,6 +57,14 @@ pip install -e ".[test,bench]"
 
 **Requirements**: CUDA toolkit >= 11.0, PyTorch >= 1.12 (PyTorch 2.4 for Pascal/SM 6.0), a Pascal or Volta GPU.
 
+> **Beta**: This project is under active development. It has been tested with the following configuration:
+> - PyTorch 2.4 (last version supporting SM 6.0 / Pascal)
+> - Transformers 5.4
+> - CUDA 12.4 / 12.8 (NVIDIA driver 580)
+> - Tesla P100 16GB, Tesla V100-SXM2-32GB
+>
+> Other combinations may work but are not yet validated. Bug reports and contributions are welcome.
+
 ## Usage with HuggingFace Models
 
 ### Native integration (transformers >= 5.0)
@@ -139,39 +147,58 @@ check_gpu_compatibility()
 
 ## Benchmarks
 
-> Benchmarks below are preliminary — measured on a P100 without active cooling (thermal throttling at 84C). Speed numbers will improve with proper cooling. Memory numbers are unaffected by thermals.
+### V100 — Prefill with TinyLlama 1.1B
 
-### Prefill memory: eager vs flash_attn_legacy
+Measured on **Tesla V100-SXM2-32GB**. Extra memory above model weights during a single forward pass (prefill only, no generation). Both Q@K^T and P@V use WMMA tensor cores.
 
-Measured on **Tesla P100 16GB** with TinyLlama 1.1B. Extra memory above model weights during a single forward pass (prefill):
-
-| Context (N) | eager (MB) | flash (MB) | Saved |
-|---|---|---|---|
-| 256 | 27.7 | 22.1 | 20% |
-| 512 | 87.6 | 45.0 | 49% |
-| 1024 | 304.3 | 88.5 | 71% |
-| 2048 | OOM | 104.5 | eager OOM |
-
-Memory grows **quadratically** with eager (O(N^2) score matrix) but **linearly** with flash. At N=2048, eager needs more memory than the GPU has — flash fits easily.
-
-### Kernel-level performance
-
-Raw kernel comparison (B=2, H=8, d=64) on P100:
-
-| N | eager (MB) | flash (MB) | Memory saved | Speed |
+| N | eager (MB) | flash (MB) | Memory saved | Speedup |
 |---|---|---|---|---|
-| 512 | 34 | 1 | 97% | 0.5x |
-| 1024 | 134 | 2 | 99% | 0.5x |
-| 2048 | 537 | 4 | 99% | 0.6x |
-| 4096 | 2147 | 7 | 100% | 0.7x |
+| 256 | 27.7 | 22.1 | 20% | 1.24x |
+| 512 | 87.6 | 45.0 | 49% | 0.86x |
+| 1024 | 304.3 | 88.5 | 71% | 0.87x |
+| 2048 | 1124.5 | 178.0 | 84% | 1.13x |
+| 4096 | 4313.0 | 354.0 | 92% | 1.12x |
+| 8192 | 16882.1 | 708.0 | **96%** | **1.15x** |
 
-Flash is ~2x slower on Pascal (no tensor cores), but uses **97-100% less memory**. The speed gap narrows on Volta (V100) which has 1st-gen tensor cores.
+On V100, flash attention is **faster than eager for N >= 2048** thanks to WMMA tensor cores for both matmuls. Memory grows linearly (O(N)) instead of quadratically (O(N^2)).
 
-### Why is flash slower on Pascal?
+### V100 — Prefill with Llama 3.1 8B Instruct
 
-Flash Attention trades compute for memory: it recomputes partial softmax values instead of storing the full N x N matrix. On modern GPUs (A100, H100), tensor cores make this recomputation nearly free. On Pascal, which only has standard CUDA cores, the extra arithmetic costs ~10-20% more time.
+Same setup, larger model (head_dim=128, GQA 32Q/8KV heads, ~16GB FP16):
 
-**This is the right trade-off on memory-constrained GPUs**: being 10% slower but fitting a model that would otherwise OOM is strictly better than not running at all.
+| N | eager (MB) | flash (MB) | Memory saved | Speedup |
+|---|---|---|---|---|
+| 256 | 96.6 | 96.6 | 0% | 0.91x |
+| 512 | 194.0 | 194.0 | 0% | 0.86x |
+| 1024 | 434.5 | 386.5 | 11% | 0.86x |
+| 2048 | 1385.0 | 774.0 | 44% | 0.92x |
+| 4096 | 4834.0 | 1546.0 | **68%** | 0.87x |
+
+With head_dim=128, the attention score matrix is smaller per-element (fewer heads after GQA), so memory savings start later but are still substantial. At N=4096, flash saves **3.2 GB** of attention memory.
+
+### V100 — Kernel-level comparison
+
+Raw kernel (B=2, H=8, d=64):
+
+| N | eager (MB) | flash (MB) | Memory saved | Speedup |
+|---|---|---|---|---|
+| 128 | 3.2 | 0.3 | 91% | 1.67x |
+| 512 | 38.0 | 1.1 | 97% | 0.87x |
+| 2048 | 557.8 | 4.3 | 99% | 1.07x |
+| 4096 | 2197.8 | 8.7 | 100% | 1.26x |
+
+### Pascal (P100) — no tensor cores
+
+On Pascal, flash attention is ~10-20% slower (no tensor cores, only CUDA cores), but uses **97-100% less memory**. This enables running models that would otherwise OOM.
+
+| N | Memory saved | Speed |
+|---|---|---|
+| 512 | 97% | 0.5x |
+| 1024 | 99% | 0.5x |
+| 2048 | 99% | 0.6x |
+| 4096 | 100% | 0.7x |
+
+**This is the right trade-off on memory-constrained GPUs**: being slightly slower but fitting a model that would otherwise OOM is strictly better than not running at all.
 
 ## How It Works
 
@@ -183,8 +210,8 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 
 **Volta (SM 7.0):**
 - S = Q @ K^T via `wmma::mma_sync` (16x16x16 tensor core fragments)
-- P stored in shared memory as float
-- O += P @ V accumulated in registers per thread
+- P stored in shared memory as float, converted to half for WMMA
+- O += P @ V via `wmma::mma_sync` (P converted to half, output in float registers)
 - Tiles: Br=128, Bc=64 (d=64) / Br=128, Bc=32 (d=128)
 
 **Pascal (SM 6.0/6.1):**
@@ -235,7 +262,7 @@ pytest tests/test_generation_benchmark.py -v -s -k "prefill"
 
 - [x] GQA/MQA support
 - [x] HuggingFace Transformers native integration (`attn_implementation="flash_attn_legacy"`)
-- [ ] WMMA-based P@V in Volta forward (currently scalar)
+- [x] WMMA tensor cores for both Q@K^T and P@V on Volta
 - [ ] WMMA-based backward on Volta
 - [ ] Variable-length sequence support
 - [ ] Turing (SM 7.5) optimized path

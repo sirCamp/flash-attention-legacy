@@ -1,9 +1,9 @@
 """
 Prefill & generation benchmarks with real HuggingFace models.
 
-Compares eager (O(N^2)) vs sdpa vs flash_attn_legacy (O(N)) on:
-  - TinyLlama 1.1B  (~2.2GB FP16)
-  - Qwen2.5 3B      (~6GB FP16)
+Compares eager (O(N^2)) vs flash_attn_legacy (O(N)) on:
+  - TinyLlama 1.1B       (~2.2GB FP16, head_dim=64)
+  - Llama 3.1 8B Instruct (~16GB FP16, head_dim=128, GQA)
 
 Run:  pytest tests/test_generation_benchmark.py -v -s
       pytest tests/test_generation_benchmark.py -v -s -k "prefill"
@@ -27,11 +27,11 @@ try:
 except ImportError:
     HAS_TRANSFORMERS = False
 
-BACKENDS = ["eager", "sdpa", "flash_attn_legacy"]
+BACKENDS = ["eager", "flash_attn_legacy"]
 
 MODELS = {
     "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "qwen3b": "Qwen/Qwen2.5-3B",
+    "llama3_8b": "meta-llama/Llama-3.1-8B-Instruct",
 }
 
 
@@ -121,6 +121,52 @@ def _prefill_memory(model, input_ids, warmup=2, repeats=5):
         return None
 
 
+def _generate_timed(model, tokenizer, prompt, max_new_tokens=64,
+                    warmup=2, repeats=5):
+    """Generate multiple times and return timing/memory stats."""
+    inputs = tokenizer(prompt, return_tensors='pt').to('cuda')
+
+    for _ in range(warmup):
+        with torch.no_grad():
+            model.generate(**inputs, max_new_tokens=4, max_length=None,
+                           do_sample=False, pad_token_id=tokenizer.pad_token_id)
+        torch.cuda.synchronize()
+
+    times = []
+    peak_mems = []
+    out = None
+
+    for _ in range(repeats):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=max_new_tokens,
+                max_length=None,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+        peak_mems.append(torch.cuda.max_memory_allocated() / (1024**3))
+
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    num_tokens = out.shape[1] - inputs['input_ids'].shape[1]
+
+    return {
+        'time_mean': statistics.mean(times),
+        'time_std': statistics.stdev(times) if len(times) > 1 else 0.0,
+        'mem_mean': statistics.mean(peak_mems),
+        'mem_std': statistics.stdev(peak_mems) if len(peak_mems) > 1 else 0.0,
+        'tokens': num_tokens,
+        'text': text,
+    }
+
+
 def _run_prefill_benchmark(model_name, seq_lengths, backends=BACKENDS, repeats=5):
     """Run prefill benchmark for all backends and sequence lengths.
 
@@ -169,70 +215,36 @@ def _print_prefill_table(model_name, rows, backends=BACKENDS):
     print(f"  Values: mean\u00b1std over multiple runs")
     print(f"{'=' * W}")
 
-    # --- Memory table ---
-    print(f"\n  EXTRA MEMORY (MB above model weights)")
-    cols = "  ".join(f"{b:>16}" for b in backends)
-    header = f"  {'N':>6} | {cols} |"
-    print(header)
-    print(f"  {'-' * (len(header) - 2)}")
+    # --- Combined table: memory + time + savings ---
+    print(f"\n  {'N':>6} | {'eager (MB)':>14} {'flash (MB)':>14} {'saved':>8} | {'eager (ms)':>14} {'flash (ms)':>14} {'speedup':>8}")
+    print(f"  {'-' * 85}")
 
     for N in sorted(by_n.keys()):
-        parts = []
-        for b in backends:
-            s = by_n[N].get(b)
-            if s:
-                parts.append(f"{s['mem_mean']:.1f}\u00b1{s['mem_std']:.1f}")
-            else:
-                parts.append("OOM")
-        cols = "  ".join(f"{p:>16}" for p in parts)
-        print(f"  {N:>6} | {cols} |")
+        e = by_n[N].get("eager")
+        f = by_n[N].get("flash_attn_legacy")
 
-    # --- Memory savings vs eager ---
-    print(f"\n  MEMORY SAVINGS vs eager")
-    savings_backends = [b for b in backends if b != "eager"]
-    cols = "  ".join(f"{b:>16}" for b in savings_backends)
-    header = f"  {'N':>6} | {cols} |"
-    print(header)
-    print(f"  {'-' * (len(header) - 2)}")
+        e_mem = f"{e['mem_mean']:.1f}\u00b1{e['mem_std']:.1f}" if e else "OOM"
+        f_mem = f"{f['mem_mean']:.1f}\u00b1{f['mem_std']:.1f}" if f else "OOM"
+        e_ms = f"{e['time_mean']:.1f}\u00b1{e['time_std']:.1f}" if e else "OOM"
+        f_ms = f"{f['time_mean']:.1f}\u00b1{f['time_std']:.1f}" if f else "OOM"
 
-    for N in sorted(by_n.keys()):
-        eager = by_n[N].get("eager")
-        parts = []
-        for b in savings_backends:
-            s = by_n[N].get(b)
-            if eager and s:
-                pct = (1 - s['mem_mean'] / max(eager['mem_mean'], 0.1)) * 100
-                parts.append(f"{pct:+.1f}%")
-            elif eager is None and s:
-                parts.append("eager OOM!")
-            elif s is None:
-                parts.append("OOM")
-            else:
-                parts.append("n/a")
-        cols = "  ".join(f"{p:>16}" for p in parts)
-        print(f"  {N:>6} | {cols} |")
+        if e and f:
+            saved = (1 - f['mem_mean'] / max(e['mem_mean'], 0.1)) * 100
+            saved_str = f"{saved:+.0f}%"
+            spd = e['time_mean'] / max(f['time_mean'], 0.001)
+            spd_str = f"{spd:.2f}x"
+        elif e is None and f:
+            saved_str = "eager OOM"
+            spd_str = "n/a"
+        else:
+            saved_str = "n/a"
+            spd_str = "n/a"
 
-    # --- Time table ---
-    print(f"\n  PREFILL TIME (ms)")
-    cols = "  ".join(f"{b:>16}" for b in backends)
-    header = f"  {'N':>6} | {cols} |"
-    print(header)
-    print(f"  {'-' * (len(header) - 2)}")
+        print(f"  {N:>6} | {e_mem:>14} {f_mem:>14} {saved_str:>8} | {e_ms:>14} {f_ms:>14} {spd_str:>8}")
 
-    for N in sorted(by_n.keys()):
-        parts = []
-        for b in backends:
-            s = by_n[N].get(b)
-            if s:
-                parts.append(f"{s['time_mean']:.1f}\u00b1{s['time_std']:.1f}")
-            else:
-                parts.append("OOM")
-        cols = "  ".join(f"{p:>16}" for p in parts)
-        print(f"  {N:>6} | {cols} |")
-
-    print(f"\n  eager            = standard O(N\u00b2) attention (full score matrix)")
-    print(f"  sdpa             = torch scaled_dot_product_attention")
-    print(f"  flash_attn_legacy = our O(N) CUDA kernel for Pascal/Volta")
+    print(f"\n  eager = standard O(N\u00b2) attention (full score matrix)")
+    print(f"  flash = flash_attn_legacy (O(N) tiled, no score matrix)")
+    print(f"  saved = memory reduction vs eager | speedup > 1.0 = flash is faster")
     print(f"{'=' * W}")
 
 
@@ -255,7 +267,7 @@ class TestPrefillTinyLlama:
         """3-way prefill comparison: eager vs sdpa vs flash_attn_legacy."""
         rows = _run_prefill_benchmark(
             self.MODEL,
-            seq_lengths=[256, 512, 1024, 2048],
+            seq_lengths=[256, 512, 1024, 2048, 4096, 8192],
         )
         _print_prefill_table(self.MODEL, rows)
 
@@ -275,12 +287,13 @@ class TestPrefillTinyLlama:
 
 
 @pytest.mark.skipif(not HAS_TRANSFORMERS, reason="transformers not installed")
-class TestPrefillQwen3B:
-    """Prefill memory benchmark on Qwen2.5 3B.
-    Larger model = more heads/layers = bigger attention matrices = more savings.
+class TestPrefillLlama3:
+    """Prefill memory benchmark on Llama 3.1 8B Instruct.
+    head_dim=128, GQA (32 Q heads, 8 KV heads), ~16GB FP16.
+    Needs >= 20GB GPU memory.
     """
 
-    MODEL = MODELS["qwen3b"]
+    MODEL = MODELS["llama3_8b"]
 
     @pytest.fixture(autouse=True)
     def _setup(self):
@@ -290,16 +303,16 @@ class TestPrefillQwen3B:
     def _check_gpu(self):
         props = torch.cuda.get_device_properties(0)
         gpu_gb = props.total_memory / (1024**3)
-        if gpu_gb < 10:
-            pytest.skip(f"Need >= 10GB GPU for 3B model, have {gpu_gb:.1f}GB")
+        if gpu_gb < 20:
+            pytest.skip(f"Need >= 20GB GPU for Llama 3.1 8B, have {gpu_gb:.1f}GB")
 
     def test_prefill_memory(self):
-        """3-way prefill comparison on Qwen2.5 3B."""
+        """Prefill comparison on Llama 3.1 8B."""
         self._check_gpu()
 
         rows = _run_prefill_benchmark(
             self.MODEL,
-            seq_lengths=[256, 512, 1024],
+            seq_lengths=[256, 512, 1024, 2048, 4096],
         )
         _print_prefill_table(self.MODEL, rows)
 
@@ -340,7 +353,7 @@ class TestGeneration:
         print(f"\n  flash_attn_legacy output: {stats['text'][:200]}")
 
     def test_generation_speed(self):
-        """Compare generation speed: eager vs sdpa vs flash_attn_legacy."""
+        """Compare generation speed: eager vs flash_attn_legacy."""
         import flash_attn_legacy
 
         prompt = "Explain how transformers work in deep learning."
