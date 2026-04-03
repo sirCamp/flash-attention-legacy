@@ -176,9 +176,11 @@ check_gpu_compatibility()
 
 > **Note**: All benchmarks below compare against **eager attention** (the naive O(N^2) implementation) to show the algorithmic difference. PyTorch's SDPA provides similar memory savings via its built-in `memory_efficient` backend — these numbers are about our kernel's characteristics, not a claim that eager is the only alternative.
 
-### V100 — Prefill with TinyLlama 1.1B
+### Prefill with TinyLlama 1.1B
 
-Measured on **Tesla V100-SXM2-32GB**. Extra memory above model weights during a single forward pass (prefill only, no generation). Both Q@K^T and P@V use WMMA tensor cores.
+Extra memory above model weights during a single forward pass (prefill only, no generation).
+
+**V100 (Tesla V100-SXM2-32GB)** — WMMA tensor cores for both matmuls:
 
 | N | eager (MB) | flash (MB) | Memory saved | Speedup |
 |---|---|---|---|---|
@@ -189,7 +191,22 @@ Measured on **Tesla V100-SXM2-32GB**. Extra memory above model weights during a 
 | 4096 | 4313.0 | 354.0 | 92% | 1.12x |
 | 8192 | 16882.1 | 708.0 | **96%** | **1.15x** |
 
-On V100, flash attention is **faster than eager for N >= 2048** thanks to WMMA tensor cores for both matmuls. Memory grows linearly (O(N)) instead of quadratically (O(N^2)).
+On V100, flash attention is **faster than eager for N >= 2048** thanks to WMMA tensor cores for both matmuls.
+
+**P100 (Tesla P100-PCIE-16GB)** — half2 packed FP16, no tensor cores:
+
+| N | eager (MB) | flash (MB) | Memory saved | Speedup |
+|---|---|---|---|---|
+| 256 | 27.7 | 22.1 | 20% | 0.91x |
+| 512 | 87.6 | 45.0 | 49% | 0.91x |
+| 1024 | 304.3 | 88.5 | 71% | 0.90x |
+| 2048 | 1124.5 | 178.0 | 84% | 0.94x |
+| 4096 | 4313.0 | 354.0 | 92% | 0.92x |
+| 8192 | OOM | 708.0 | **eager OOM** | -- |
+
+On P100, flash is ~6-10% slower (no tensor cores) but the memory savings are identical. At N=8192, **eager OOMs on 16GB while flash fits comfortably**.
+
+Memory grows linearly (O(N)) instead of quadratically (O(N^2)) on both architectures.
 
 ### V100 — Prefill with Llama 3.1 8B Instruct
 
@@ -216,22 +233,26 @@ Raw kernel (B=2, H=8, d=64):
 | 2048 | 557.8 | 4.3 | 99% | 1.07x |
 | 4096 | 2197.8 | 8.7 | 100% | 1.26x |
 
-### Pascal (P100) — no tensor cores
+### Pascal (P100) — Kernel-level comparison
 
-On Pascal, flash attention is ~10-20% slower (no tensor cores, only CUDA cores), but uses **97-100% less memory**. This enables running models that would otherwise OOM.
+Raw kernel on **Tesla P100-PCIE-16GB** (B=2, H=8, d=64):
 
-| N | Memory saved | Speed |
-|---|---|---|
-| 512 | 97% | 0.5x |
-| 1024 | 99% | 0.5x |
-| 2048 | 99% | 0.6x |
-| 4096 | 100% | 0.7x |
+| N | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
+|---|---|---|---|---|---|---|
+| 128 | 0.19 | 0.27 | 0.70x | 3.2 | 0.3 | 91% |
+| 256 | 0.23 | 0.51 | 0.45x | 10.6 | 0.5 | 95% |
+| 512 | 0.57 | 1.20 | 0.48x | 38.0 | 1.1 | 97% |
+| 1024 | 1.95 | 3.35 | 0.58x | 143.7 | 2.2 | 98% |
+| 2048 | 8.08 | 10.42 | 0.78x | 557.8 | 4.3 | 99% |
+| 4096 | 28.16 | 36.03 | 0.78x | 2197.8 | 8.7 | 100% |
 
-On Pascal, the trade-off is pure compute for memory: no tensor cores means slower matmuls, but the O(N) memory footprint is the same as on Volta.
+On Pascal, the trade-off is pure compute for memory: no tensor cores means slower matmuls, but the O(N) memory footprint is the same as on Volta. The speed gap narrows at longer sequences (0.78x at N=4096 vs 0.45x at N=256).
 
-### V100 — Variable-length (packed sequences)
+### Variable-length (packed sequences)
 
-Compares padded batching (all sequences padded to max length) vs packed batching (`flash_attn_varlen_func`, single kernel launch). Measured on **Tesla V100-SXM2-32GB**, H=8, d=64, FP16, causal.
+Compares padded batching (all sequences padded to max length) vs packed batching (`flash_attn_varlen_func`, single kernel launch). H=8, d=64, FP16, causal.
+
+**V100 (Tesla V100-SXM2-32GB):**
 
 | Scenario | Seqs | Max len | Padding waste | Memory saved | Speedup |
 |---|---|---|---|---|---|
@@ -242,7 +263,18 @@ Compares padded batching (all sequences padded to max length) vs packed batching
 | one_long + rest_short | 16 | 1024 | 91% | **91%** | **6.78x** |
 | all_long | 4 | 1024 | 0% | 0% | 0.97x |
 
-When sequences have very different lengths (common in training), packing avoids wasting compute and memory on padding tokens. The `one_long_rest_short` scenario (1×1024 + 15×32) shows **6.78x speedup** and **91% memory savings** — padded would compute attention on 16×1024 = 16K tokens, packed only processes 1504 actual tokens.
+**P100 (Tesla P100-PCIE-16GB):**
+
+| Scenario | Seqs | Max len | Padding waste | Memory saved | Speedup |
+|---|---|---|---|---|---|
+| uniform_short | 16 | 64 | 0% | 0% | 0.92x |
+| uniform_medium | 8 | 256 | 0% | 0% | 0.97x |
+| mixed_short | 8 | 128 | 52% | **52%** | **1.51x** |
+| mixed_heavy | 8 | 512 | 61% | **61%** | **2.17x** |
+| one_long + rest_short | 16 | 1024 | 91% | **91%** | **8.39x** |
+| all_long | 4 | 1024 | 0% | 0% | 0.99x |
+
+When sequences have very different lengths (common in training), packing avoids wasting compute and memory on padding tokens. The `one_long_rest_short` scenario (1x1024 + 15x32) shows **6.78-8.39x speedup** and **91% memory savings** — padded would compute attention on 16x1024 = 16K tokens, packed only processes 1504 actual tokens.
 
 ### V100 — Training with TinyLlama 1.1B
 
