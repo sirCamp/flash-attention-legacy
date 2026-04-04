@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Check CUDA availability
@@ -110,7 +110,7 @@ setup(
     ],
     extras_require={
         "test": ["pytest", "numpy"],
-        "bench": ["tabulate", "matplotlib"],
+        "bench": ["tabulate", "matplotlib", "sentence-transformers", "datasets"],
         "transformers": ["transformers>=4.34.0", "accelerate", "sentencepiece"],
     },
     classifiers=[

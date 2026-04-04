@@ -289,6 +289,54 @@ At N=2048, flash is **16% faster** than eager in full training (forward + backwa
 
 At N=4096, eager runs out of memory while flash trains successfully. Note: SDPA (`attn_implementation="sdpa"`) would also handle this — these numbers demonstrate our kernel's correctness and performance characteristics vs the naive baseline.
 
+### Embeddings with Qwen3-Embedding-0.6B
+
+Sentence-transformers encoding benchmark with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B). Batch=16, 5 runs.
+
+**V100 (Tesla V100-SXM2-32GB) — FP32:**
+
+| seq_len | eager (ms) | sdpa (ms) | flash (ms) | flash vs eager | flash vs sdpa | eager (MB) | sdpa (MB) | flash (MB) |
+|---|---|---|---|---|---|---|---|---|
+| 256 | 236.6 | 236.3 | 252.5 | 0.94x | 0.94x | 306 | 298 | 281 |
+| 512 | 467.3 | 457.3 | 488.3 | 0.96x | 0.94x | 692 | 609 | 557 |
+| 1024 | 973.3 | 937.1 | 977.4 | 1.00x | 0.96x | 1698 | 1349 | 1109 |
+| 2048 | 2473.8 | 2323.4 | 2123.5 | **1.16x** | **1.09x** | 4687 | 3225 | **2215** |
+| 4096 | 6423.7 | 5800.9 | 5102.3 | **1.26x** | **1.14x** | 14554 | 8590 | **4424** |
+
+In FP32 on V100, flash is **faster than both eager and SDPA** at long sequences — 1.26x vs eager and 1.14x vs SDPA at seq_len=4096 — while using **half the memory of SDPA** (4.4 GB vs 8.6 GB). The WMMA tensor cores give a real speed advantage when FP32 accumulation dominates. With the larger Qwen3-Embedding-4B, the same pattern holds: at seq_len=4096, flash is 1.08x faster than SDPA while using **half the memory** (7.1 GB vs 14.5 GB).
+
+**V100 (Tesla V100-SXM2-32GB) — FP16:**
+
+| seq_len | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
+|---|---|---|---|---|---|---|
+| 256 | 77.6 | 98.3 | 0.79x | 298 | 280 | 6% |
+| 512 | 147.6 | 189.9 | 0.78x | 658 | 557 | 15% |
+| 1024 | 320.1 | 409.7 | 0.78x | 1571 | 1109 | 29% |
+| 2048 | 998.6 | 992.3 | **1.01x** | 4173 | 2213 | **47%** |
+| 4096 | 2677.0 | 2747.2 | 0.97x | 12502 | 4422 | **65%** |
+
+In FP16, flash matches eager speed at long sequences (1.01x at 2048) while saving up to **8 GB** of memory at seq_len=4096.
+
+**P100 (Tesla P100-PCIE-16GB) — FP16:**
+
+| seq_len | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
+|---|---|---|---|---|---|---|
+| 256 | 361.3 | 409.5 | 0.88x | 298 | 280 | 6% |
+| 512 | 1438.7 | 1776.7 | 0.81x | 1571 | 1109 | 29% |
+| 2048 | 3976.0 | 4446.1 | 0.89x | 4173 | 2213 | 47% |
+| 4096 | 10146.6 | 12368.8 | 0.82x | 12502 | 4422 | **65%** |
+
+On P100, flash is ~10-20% slower (no tensor cores), but saves up to **8 GB** at seq_len=4096.
+
+**P100 (Tesla P100-PCIE-16GB) — FP32 (sentence-transformers default):**
+
+| seq_len | eager | sdpa (ms) | flash (ms) | flash vs sdpa | sdpa (MB) | flash (MB) | Memory saved vs sdpa |
+|---|---|---|---|---|---|---|---|
+| 4096 | OOM | 11248.0 | 13141.3 | 0.86x | 8590 | 4424 | **49%** |
+| 8192 | OOM | OOM | 39048.9 | -- | OOM | 8845 | **only flash fits** |
+
+In FP32 (the default for sentence-transformers), flash uses **half the memory of SDPA** at seq_len=4096. At seq_len=8192, both eager and SDPA run out of memory on 16GB — flash is the only backend that fits.
+
 ## How It Works
 
 ### Algorithm

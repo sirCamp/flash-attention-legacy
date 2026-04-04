@@ -49,6 +49,17 @@ def flash_attn_legacy_forward(
     if scaling is None:
         scaling = 1.0 / math.sqrt(d)
 
+    # Detect causal: use module.is_causal (set by the model's attention layer),
+    # with kwargs override. Matches SDPA behavior.
+    if "is_causal" in kwargs:
+        is_causal = kwargs["is_causal"]
+    elif hasattr(module, 'is_causal'):
+        is_causal = module.is_causal
+    elif attention_mask is None and q_len > 1:
+        is_causal = True
+    else:
+        is_causal = False
+
     if q_len == kv_len and d in (64, 128):
         # Prefill: use our flash kernel (O(N) memory)
         q_fp16 = query.half() if query.dtype != torch.float16 else query
@@ -58,27 +69,36 @@ def flash_attn_legacy_forward(
         attn_output = flash_attention(
             q_fp16, k_fp16, v_fp16,
             softmax_scale=scaling,
-            is_causal=True,
+            is_causal=is_causal,
         )
 
         if query.dtype != torch.float16:
             attn_output = attn_output.to(query.dtype)
     else:
-        # Decode (q_len=1) or unsupported head_dim: standard attention
+        # Decode (q_len=1) or unsupported head_dim (not 64/128):
+        # Fall back to eager attention (matches transformers' default)
         H_kv = key.shape[1]
         if H_kv != H_q:
             rep = H_q // H_kv
             key = key.repeat_interleave(rep, dim=1)
             value = value.repeat_interleave(rep, dim=1)
 
-        s = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scaling
+        s = torch.matmul(query, key.transpose(-2, -1)) * scaling
 
         if attention_mask is not None:
             s = s + attention_mask
 
-        attn_output = torch.matmul(
-            torch.softmax(s, dim=-1), value.float()
-        ).to(query.dtype)
+        if is_causal and q_len > 1:
+            causal_mask = torch.triu(
+                torch.full((q_len, kv_len), float('-inf'), device=query.device, dtype=query.dtype),
+                diagonal=1,
+            )
+            s = s + causal_mask
+
+        attn_output = torch.matmul(torch.softmax(s, dim=-1), value)
+
+    # Transpose from [B, H, N, d] to [B, N, H, d] — matches SDPA output format
+    attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, None
 
@@ -122,8 +142,16 @@ def register():
 
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
-                # Our implementation is already registered and ready — skip
-                # the preload step that would fail looking for hub kernels
+                # Check if model's head_dim is supported by our kernels (64 or 128).
+                # If not, silently fall back to SDPA so mask preprocessing works correctly.
+                head_dim = getattr(self.config, 'head_dim', None)
+                if head_dim is None:
+                    hs = getattr(self.config, 'hidden_size', None)
+                    nh = getattr(self.config, 'num_attention_heads', None)
+                    if hs and nh:
+                        head_dim = hs // nh
+                if head_dim is not None and head_dim not in (64, 128):
+                    return original_check(self, "sdpa", is_init_check, allow_all_kernels)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)
 
