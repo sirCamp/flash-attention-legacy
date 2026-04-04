@@ -62,7 +62,7 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(params=[64, 128], ids=["d64", "d128"])
+@pytest.fixture(params=[32, 64, 96, 128, 256], ids=["d32", "d64", "d96", "d128", "d256"])
 def head_dim(request):
     return request.param
 
@@ -307,7 +307,7 @@ class TestVarlen:
             outputs.append(oi.squeeze(0).permute(1, 0, 2))
         return torch.cat(outputs, dim=0)
 
-    @pytest.mark.parametrize("d", [64, 128])
+    @pytest.mark.parametrize("d", [32, 64, 96, 128, 256])
     @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
     def test_varlen_correctness(self, d, causal):
         """Varlen matches per-sequence reference attention."""
@@ -332,7 +332,7 @@ class TestVarlen:
         assert out.shape == (total, H, d)
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=5e-3)
 
-    @pytest.mark.parametrize("d", [64, 128])
+    @pytest.mark.parametrize("d", [32, 64, 96, 128, 256])
     def test_varlen_gqa(self, d):
         """Varlen with GQA (different Q and KV head counts)."""
         from flash_attn_legacy import flash_attn_varlen_func
@@ -448,6 +448,19 @@ class TestModules:
         x = torch.randn(2, 64, 512, device='cuda', dtype=torch.float16, requires_grad=True)
         mha(x).sum().backward()
         assert x.grad is not None
+
+    @pytest.mark.parametrize("embed_dim,num_heads,head_dim", [
+        (384, 12, 32),   # MiniLM-style
+        (768, 8, 96),    # Phi-3-mini-style
+        (512, 2, 256),   # GPT-J-style
+    ])
+    def test_module_new_head_dims(self, embed_dim, num_heads, head_dim):
+        from flash_attn_legacy import FlashMultiHeadAttention
+        mha = FlashMultiHeadAttention(embed_dim, num_heads=num_heads, causal=True).cuda().half()
+        assert mha.head_dim == head_dim
+        x = torch.randn(2, 64, embed_dim, device='cuda', dtype=torch.float16)
+        out = mha(x)
+        assert out.shape == x.shape
 
 
 # ---------------------------------------------------------------------------

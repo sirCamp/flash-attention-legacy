@@ -60,7 +60,7 @@ def flash_attn_legacy_forward(
     else:
         is_causal = False
 
-    if q_len == kv_len and d in (64, 128):
+    if q_len == kv_len and d in (32, 64, 96, 128, 256):
         # Prefill: use our flash kernel (O(N) memory)
         q_fp16 = query.half() if query.dtype != torch.float16 else query
         k_fp16 = key.half() if key.dtype != torch.float16 else key
@@ -75,7 +75,7 @@ def flash_attn_legacy_forward(
         if query.dtype != torch.float16:
             attn_output = attn_output.to(query.dtype)
     else:
-        # Decode (q_len=1) or unsupported head_dim (not 64/128):
+        # Decode (q_len=1) or unsupported head_dim:
         # Fall back to eager attention (matches transformers' default)
         H_kv = key.shape[1]
         if H_kv != H_q:
@@ -142,7 +142,7 @@ def register():
 
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
-                # Check if model's head_dim is supported by our kernels (64 or 128).
+                # Check if model's head_dim is supported by our kernels.
                 # If not, silently fall back to SDPA so mask preprocessing works correctly.
                 head_dim = getattr(self.config, 'head_dim', None)
                 if head_dim is None:
@@ -150,7 +150,7 @@ def register():
                     nh = getattr(self.config, 'num_attention_heads', None)
                     if hs and nh:
                         head_dim = hs // nh
-                if head_dim is not None and head_dim not in (64, 128):
+                if head_dim is not None and head_dim not in (32, 64, 96, 128, 256):
                     return original_check(self, "sdpa", is_init_check, allow_all_kernels)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)

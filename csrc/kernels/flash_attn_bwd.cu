@@ -673,56 +673,65 @@ void precompute_D(
     );
 }
 
+// Helper macro to launch Volta WMMA backward kernel
+#define VOLTA_BWD_LAUNCH(TileType, params, stream, nbh)                                  \
+    do {                                                                                  \
+        using T = TileType;                                                               \
+        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d)       \
+                                * sizeof(half)                                             \
+                           + (T::Bc*T::d + T::Bc*T::d + T::Br*T::Bc + T::Br*T::Bc)      \
+                                * sizeof(float)                                            \
+                           + T::Br * T::Bc * sizeof(half);                                \
+        dim3 grid(cdiv((params).seq_len, T::Bc), nbh);                                   \
+        dim3 block(T::kNumWarps * 32);                                                    \
+        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                       \
+            flash_attn_bwd_volta_kernel<T>,                                               \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                           \
+        flash_attn_bwd_volta_kernel<T><<<grid, block, smem, stream>>>(params);            \
+    } while (0)
+
 void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
     const int nbh = params.batch_size * params.num_heads_k;
 
-    if (params.head_dim == 64) {
-        using T = TileBwd_d64;
-        // smem: K[Bc,D] + V[Bc,D] + Q[Br,D] + dO[Br,D] (half)
-        //     + dK_acc[Bc,D] + dV_acc[Bc,D] + S[Br,Bc] + dP[Br,Bc] (float)
-        //     + half_buf[Br,Bc] (half)
-        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d) * sizeof(half)
-                           + (T::Bc*T::d + T::Bc*T::d + T::Br*T::Bc + T::Br*T::Bc) * sizeof(float)
-                           + T::Br * T::Bc * sizeof(half);
-        dim3 grid(cdiv(params.seq_len, T::Bc), nbh);
-        dim3 block(T::kNumWarps * 32);
-
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(flash_attn_bwd_volta_kernel<T>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        flash_attn_bwd_volta_kernel<T><<<grid, block, smem, stream>>>(params);
-    } else {
-        using T = TileBwd_d128;
-        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d) * sizeof(half)
-                           + (T::Bc*T::d + T::Bc*T::d + T::Br*T::Bc + T::Br*T::Bc) * sizeof(float)
-                           + T::Br * T::Bc * sizeof(half);
-        dim3 grid(cdiv(params.seq_len, T::Bc), nbh);
-        dim3 block(T::kNumWarps * 32);
-
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(flash_attn_bwd_volta_kernel<T>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        flash_attn_bwd_volta_kernel<T><<<grid, block, smem, stream>>>(params);
+    switch (params.head_dim) {
+        case 32:  VOLTA_BWD_LAUNCH(TileBwd_d32,  params, stream, nbh); break;
+        case 64:  VOLTA_BWD_LAUNCH(TileBwd_d64,  params, stream, nbh); break;
+        case 96:  VOLTA_BWD_LAUNCH(TileBwd_d96,  params, stream, nbh); break;
+        case 128: VOLTA_BWD_LAUNCH(TileBwd_d128, params, stream, nbh); break;
+        case 256: VOLTA_BWD_LAUNCH(TileBwd_d256, params, stream, nbh); break;
+        default:  throw std::runtime_error("Unsupported head_dim for Volta backward");
     }
 }
+
+#undef VOLTA_BWD_LAUNCH
+
+// Helper macro to launch Pascal backward kernel
+#define PASCAL_BWD_LAUNCH(TileType, params, stream, nbh)                                  \
+    do {                                                                                   \
+        using T = TileType;                                                                \
+        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d)        \
+                                * sizeof(half);                                             \
+        dim3 grid(cdiv((params).seq_len, T::Bc), nbh);                                    \
+        dim3 block(T::kNumWarps * 32);                                                     \
+        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                        \
+            flash_attn_bwd_kernel<T>,                                                      \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                            \
+        flash_attn_bwd_kernel<T><<<grid, block, smem, stream>>>(params);                   \
+    } while (0)
 
 void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
     const int nbh = params.batch_size * params.num_heads_k;
 
-    if (params.head_dim == 64) {
-        using T = TileBwd_d64;
-        constexpr int smem = (T::Bc * T::d + T::Bc * T::d + T::Br * T::d + T::Br * T::d) * sizeof(half);
-        dim3 grid(cdiv(params.seq_len, T::Bc), nbh);
-        dim3 block(T::kNumWarps * 32);
-        flash_attn_bwd_kernel<T><<<grid, block, smem, stream>>>(params);
-    } else {
-        using T = TileBwd_d128;
-        constexpr int smem = (T::Bc * T::d + T::Bc * T::d + T::Br * T::d + T::Br * T::d) * sizeof(half);
-        dim3 grid(cdiv(params.seq_len, T::Bc), nbh);
-        dim3 block(T::kNumWarps * 32);
-
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(flash_attn_bwd_kernel<T>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-        flash_attn_bwd_kernel<T><<<grid, block, smem, stream>>>(params);
+    switch (params.head_dim) {
+        case 32:  PASCAL_BWD_LAUNCH(TileBwd_d32,  params, stream, nbh); break;
+        case 64:  PASCAL_BWD_LAUNCH(TileBwd_d64,  params, stream, nbh); break;
+        case 96:  PASCAL_BWD_LAUNCH(TileBwd_d96,  params, stream, nbh); break;
+        case 128: PASCAL_BWD_LAUNCH(TileBwd_d128, params, stream, nbh); break;
+        case 256: PASCAL_BWD_LAUNCH(TileBwd_d256, params, stream, nbh); break;
+        default:  throw std::runtime_error("Unsupported head_dim for Pascal backward");
     }
 }
+
+#undef PASCAL_BWD_LAUNCH
 
 }  // namespace flash_attn_legacy

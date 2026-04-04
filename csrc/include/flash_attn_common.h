@@ -35,7 +35,7 @@ struct FlashAttnParams {
     int num_heads;       // H_q — query heads
     int num_heads_k;     // H_kv — key/value heads (== num_heads for MHA, 1 for MQA)
     int seq_len;
-    int head_dim;        // 64 or 128
+    int head_dim;        // 32, 64, 96, 128, or 256
 
     // Strides (in elements) for Q
     int q_batch_stride;
@@ -87,7 +87,7 @@ struct FlashAttnVarlenParams {
     int num_seqs;
     int num_heads;       // H_q
     int num_heads_k;     // H_kv
-    int head_dim;        // 64 or 128
+    int head_dim;        // 32, 64, 96, 128, or 256
 
     // Strides (in elements) — layout is [total, H, d]
     int q_token_stride;  // H_q * d
@@ -154,12 +154,30 @@ struct FlashAttnBwdParams {
 // Br = NUM_THREADS so every thread owns exactly one Q row →
 // 100% utilization during softmax and P@V phases.
 
+struct TileVolta_d32 {
+    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
+    static constexpr int Bc = 32;    // Must be <= d for PV_CHUNK loop (PV_CHUNK = Bc)
+    static constexpr int d  = 32;
+    // Shared: Q[128,32] + K[32,32] + V[32,32] (half) + S[128,32](float) + P[128,32](half)
+    //       = (128*32 + 2*32*32)*2 + 128*32*4 + 128*32*2 = 12288 + 16384 + 8192 = 36 KB
+    static constexpr int kNumWarps = 4;
+};
+
 struct TileVolta_d64 {
     static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
     static constexpr int Bc = 64;
     static constexpr int d  = 64;
     // Shared: Q[128,64] + K[64,64] + V[64,64] + S[128,64]float
     //       = (128*64 + 2*64*64)*2 + 128*64*4 = 32768 + 32768 = 64 KB
+    static constexpr int kNumWarps = 4;
+};
+
+struct TileVolta_d96 {
+    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
+    static constexpr int Bc = 32;
+    static constexpr int d  = 96;
+    // Shared: Q[128,96] + K[32,96] + V[32,96] (half) + S[128,32](float) + P[128,32](half)
+    //       = (128*96 + 2*32*96)*2 + 128*32*4 + 128*32*2 = 36864 + 16384 + 8192 = 60 KB
     static constexpr int kNumWarps = 4;
 };
 
@@ -172,9 +190,27 @@ struct TileVolta_d128 {
     static constexpr int kNumWarps = 4;
 };
 
+struct TileVolta_d256 {
+    static constexpr int Br = 64;    // = 2 warps × 32
+    static constexpr int Bc = 16;
+    static constexpr int d  = 256;
+    // Shared: Q[64,256] + K[16,256] + V[16,256] (half) + S[64,16](float) + P[64,16](half)
+    //       = (64*256 + 2*16*256)*2 + 64*16*4 + 64*16*2 = 49152 + 4096 + 2048 = 54 KB
+    static constexpr int kNumWarps = 2;
+};
+
 // PASCAL (SM 6.x): no tensor cores, 48 KB shared memory
 // Use half2 packed FP16 on CUDA cores.
 // Br = NUM_THREADS for 100% thread utilization during softmax/P@V.
+
+struct TilePascal_d32 {
+    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
+    static constexpr int Bc = 32;
+    static constexpr int d  = 32;
+    // Shared: Q[128,32] + K[32,32] + V[32,32] + P[128,32]float
+    //       = (128*32 + 2*32*32)*2 + 128*32*4 = 12288 + 16384 = 28 KB
+    static constexpr int kNumWarps = 4;
+};
 
 struct TilePascal_d64 {
     static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
@@ -183,6 +219,15 @@ struct TilePascal_d64 {
     // Shared: Q[128,64] + K[32,64] + V[32,64] + P[128,32]float
     //       = (128*64 + 2*32*64)*2 + 128*32*4 = 24576 + 16384 = 40 KB
     static constexpr int kNumWarps = 4;
+};
+
+struct TilePascal_d96 {
+    static constexpr int Br = 64;    // = 2 warps × 32
+    static constexpr int Bc = 16;
+    static constexpr int d  = 96;
+    // Shared: Q[64,96] + K[16,96] + V[16,96] + P[64,16]float
+    //       = (64*96 + 2*16*96)*2 + 64*16*4 = 18432 + 4096 = 22 KB
+    static constexpr int kNumWarps = 2;
 };
 
 struct TilePascal_d128 {
@@ -194,9 +239,28 @@ struct TilePascal_d128 {
     static constexpr int kNumWarps = 2;  // 64 threads — keeps register pressure manageable
 };
 
+struct TilePascal_d256 {
+    static constexpr int Br = 32;    // = 1 warp × 32
+    static constexpr int Bc = 16;
+    static constexpr int d  = 256;
+    // Shared: Q[32,256] + K[16,256] + V[16,256] + P[32,16]float
+    //       = (32*256 + 2*16*256)*2 + 32*16*4 = 32768 + 2048 = 34 KB
+    static constexpr int kNumWarps = 1;
+};
+
 // ---------------------------------------------------------------------------
 // Backward tile sizes — same for both archs, conservative
+// All dimensions must be multiples of 16 for WMMA compatibility.
+// THREADS_PER_KV = (kNumWarps*32) / Bc must be a power of 2.
 // ---------------------------------------------------------------------------
+struct TileBwd_d32 {
+    static constexpr int Br = 32;
+    static constexpr int Bc = 32;    // Must be <= d for DQ_CHUNK loop (DQ_CHUNK = Bc)
+    static constexpr int d  = 32;
+    static constexpr int kNumWarps = 4;
+    // THREADS_PER_KV = 128/32 = 4
+};
+
 struct TileBwd_d64 {
     static constexpr int Br = 32;
     static constexpr int Bc = 32;
@@ -204,11 +268,27 @@ struct TileBwd_d64 {
     static constexpr int kNumWarps = 4;
 };
 
+struct TileBwd_d96 {
+    static constexpr int Br = 32;
+    static constexpr int Bc = 16;
+    static constexpr int d  = 96;
+    static constexpr int kNumWarps = 4;
+    // THREADS_PER_KV = 128/16 = 8
+};
+
 struct TileBwd_d128 {
     static constexpr int Br = 16;
     static constexpr int Bc = 16;
     static constexpr int d  = 128;
     static constexpr int kNumWarps = 4;
+};
+
+struct TileBwd_d256 {
+    static constexpr int Br = 16;
+    static constexpr int Bc = 16;
+    static constexpr int d  = 256;
+    static constexpr int kNumWarps = 4;
+    // THREADS_PER_KV = 128/16 = 8
 };
 
 // ---------------------------------------------------------------------------

@@ -53,7 +53,8 @@ std::vector<torch::Tensor> flash_attn_forward(
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
 
-    TORCH_CHECK(d == 64 || d == 128, "head_dim must be 64 or 128, got ", d);
+    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
+                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
     TORCH_CHECK(K.size(0) == B && K.size(2) == N && K.size(3) == d, "K shape mismatch");
     TORCH_CHECK(V.size(0) == B && V.size(1) == H_kv && V.size(2) == N && V.size(3) == d, "V shape mismatch");
     TORCH_CHECK(H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
@@ -208,7 +209,8 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     const int total_k = K.size(0), H_kv = K.size(1);
     const int num_seqs = cu_seqlens_q.size(0) - 1;
 
-    TORCH_CHECK(d == 64 || d == 128, "head_dim must be 64 or 128, got ", d);
+    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
+                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
     TORCH_CHECK(K.size(2) == d && V.size(2) == d, "K,V head_dim mismatch");
     TORCH_CHECK(V.size(1) == H_kv, "V num_heads mismatch");
     TORCH_CHECK(H_q % H_kv == 0, "H_q (", H_q, ") must be divisible by H_kv (", H_kv, ")");
@@ -227,12 +229,16 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     auto cu_q_acc = cu_q_cpu.accessor<int, 1>();
 
     int sm = get_sm_version();
-    // Br depends on arch and head_dim
+    // Br depends on arch and head_dim — must match tile configs in flash_attn_common.h
     int Br;
     if (sm >= 70) {
-        Br = 128;  // Volta: Br=128 for both d=64 and d=128
+        // Volta: Br from TileVolta_dN
+        Br = (d <= 128) ? 128 : 64;  // d=32/64/96/128 → 128, d=256 → 64
     } else {
-        Br = (d == 64) ? 128 : 64;  // Pascal: Br=128 for d=64, Br=64 for d=128
+        // Pascal: Br from TilePascal_dN
+        if (d <= 64) Br = 128;       // d=32/64 → 128
+        else if (d <= 128) Br = 64;  // d=96/128 → 64
+        else Br = 32;                // d=256 → 32
     }
 
     std::vector<int> block_offsets_vec(num_seqs + 1);

@@ -388,46 +388,58 @@ flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
 // ---------------------------------------------------------------------------
 // Host launcher
 // ---------------------------------------------------------------------------
+// Helper macro to launch Pascal forward kernel
+#define PASCAL_FWD_LAUNCH(TileType, params, stream, nbh)                          \
+    do {                                                                           \
+        using T = TileType;                                                        \
+        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)    \
+                           + T::Br * T::Bc * sizeof(float);                        \
+        dim3 grid(cdiv((params).seq_len, T::Br), nbh);                            \
+        dim3 block(T::kNumWarps * 32);                                             \
+        flash_attn_fwd_pascal_kernel<T><<<grid, block, smem, stream>>>(params);    \
+    } while (0)
+
 void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream) {
     const int nbh = params.batch_size * params.num_heads;
 
-    if (params.head_dim == 64) {
-        using T = TilePascal_d64;
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
-                           + T::Br * T::Bc * sizeof(float);
-        dim3 grid(cdiv(params.seq_len, T::Br), nbh);
-        dim3 block(T::kNumWarps * 32);
-        flash_attn_fwd_pascal_kernel<T><<<grid, block, smem, stream>>>(params);
-    } else {
-        using T = TilePascal_d128;
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
-                           + T::Br * T::Bc * sizeof(float);
-        dim3 grid(cdiv(params.seq_len, T::Br), nbh);
-        dim3 block(T::kNumWarps * 32);
-        flash_attn_fwd_pascal_kernel<T><<<grid, block, smem, stream>>>(params);
+    switch (params.head_dim) {
+        case 32:  PASCAL_FWD_LAUNCH(TilePascal_d32,  params, stream, nbh); break;
+        case 64:  PASCAL_FWD_LAUNCH(TilePascal_d64,  params, stream, nbh); break;
+        case 96:  PASCAL_FWD_LAUNCH(TilePascal_d96,  params, stream, nbh); break;
+        case 128: PASCAL_FWD_LAUNCH(TilePascal_d128, params, stream, nbh); break;
+        case 256: PASCAL_FWD_LAUNCH(TilePascal_d256, params, stream, nbh); break;
+        default:  throw std::runtime_error("Unsupported head_dim for Pascal forward");
     }
 }
+
+#undef PASCAL_FWD_LAUNCH
 
 // ---------------------------------------------------------------------------
 // Host launcher — variable-length
 // ---------------------------------------------------------------------------
+// Helper macro to launch Pascal varlen forward kernel
+#define PASCAL_FWD_VARLEN_LAUNCH(TileType, params, stream, total_q_blocks)               \
+    do {                                                                                  \
+        using T = TileType;                                                               \
+        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)           \
+                           + T::Br * T::Bc * sizeof(float);                               \
+        dim3 grid(total_q_blocks, (params).num_heads);                                    \
+        dim3 block(T::kNumWarps * 32);                                                    \
+        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);    \
+    } while (0)
+
 void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params,
                                    int total_q_blocks, cudaStream_t stream) {
-    if (params.head_dim == 64) {
-        using T = TilePascal_d64;
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
-                           + T::Br * T::Bc * sizeof(float);
-        dim3 grid(total_q_blocks, params.num_heads);
-        dim3 block(T::kNumWarps * 32);
-        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);
-    } else {
-        using T = TilePascal_d128;
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)
-                           + T::Br * T::Bc * sizeof(float);
-        dim3 grid(total_q_blocks, params.num_heads);
-        dim3 block(T::kNumWarps * 32);
-        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);
+    switch (params.head_dim) {
+        case 32:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d32,  params, stream, total_q_blocks); break;
+        case 64:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d64,  params, stream, total_q_blocks); break;
+        case 96:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d96,  params, stream, total_q_blocks); break;
+        case 128: PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d128, params, stream, total_q_blocks); break;
+        case 256: PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d256, params, stream, total_q_blocks); break;
+        default:  throw std::runtime_error("Unsupported head_dim for Pascal varlen forward");
     }
 }
+
+#undef PASCAL_FWD_VARLEN_LAUNCH
 
 }  // namespace flash_attn_legacy

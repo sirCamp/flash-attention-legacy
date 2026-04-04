@@ -31,7 +31,7 @@ class FlashAttentionFunc(Function):
         assert k.dtype == torch.float16 and v.dtype == torch.float16
         assert q.is_cuda and q.dim() == 4
         d = q.shape[-1]
-        assert d in (64, 128), f"head_dim must be 64 or 128, got {d}"
+        assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
 
         H_q, H_kv = q.shape[1], k.shape[1]
         assert H_q % H_kv == 0, f"H_q ({H_q}) must be divisible by H_kv ({H_kv})"
@@ -100,7 +100,7 @@ class FlashAttnVarlenFunc(Function):
         assert q.dtype == torch.float16, f"Q must be float16, got {q.dtype}"
         assert q.is_cuda and q.dim() == 3
         d = q.shape[-1]
-        assert d in (64, 128), f"head_dim must be 64 or 128, got {d}"
+        assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         cu_seqlens_q = cu_seqlens_q.contiguous().to(torch.int32)
@@ -209,7 +209,7 @@ def flash_attn_varlen_func(
     assert q.dtype == torch.float16, f"Q must be float16, got {q.dtype}"
 
     d = q.shape[-1]
-    assert d in (64, 128), f"head_dim must be 64 or 128, got {d}"
+    assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
@@ -226,7 +226,7 @@ class FlashAttention(nn.Module):
     def __init__(self, head_dim: int = 64, causal: bool = False,
                  softmax_scale: Optional[float] = None):
         super().__init__()
-        assert head_dim in (64, 128)
+        assert head_dim in (32, 64, 96, 128, 256)
         self.head_dim = head_dim
         self.causal = causal
         self.softmax_scale = softmax_scale or (1.0 / math.sqrt(head_dim))
@@ -273,7 +273,7 @@ class FlashMultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = embed_dim // num_heads
-        assert self.head_dim in (64, 128), f"head_dim={self.head_dim}, must be 64 or 128"
+        assert self.head_dim in (32, 64, 96, 128, 256), f"head_dim={self.head_dim}, must be 32, 64, 96, 128, or 256"
 
         self.causal = causal
         self.scale = 1.0 / math.sqrt(self.head_dim)
