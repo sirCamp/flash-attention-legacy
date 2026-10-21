@@ -33,12 +33,50 @@ void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t strea
 // FLASH_ATTN_LEGACY_FORCE_ARCH=pascal|volta forces the kernel family regardless of
 // the GPU (testing only: e.g. run the Pascal CUDA-core kernels on a T4/Ampere card;
 // correctness is checked, performance numbers are not representative).
+// Architectures this build contains (from setup.py: FLASH_ATTN_LEGACY_ARCHS).
+#ifndef FLASH_ATTN_LEGACY_SASS
+#define FLASH_ATTN_LEGACY_SASS 60, 61, 70, 75
+#endif
+#ifndef FLASH_ATTN_LEGACY_PTX
+#define FLASH_ATTN_LEGACY_PTX 75
+#endif
+static constexpr int kCompiledSass[] = {FLASH_ATTN_LEGACY_SASS};
+static constexpr int kCompiledPtx = FLASH_ATTN_LEGACY_PTX;
+
+static std::string compiled_archs_str() {
+    std::string s;
+    for (int a : kCompiledSass) s += (s.empty() ? "" : ", ") + std::to_string(a / 10) + "." + std::to_string(a % 10);
+    if (kCompiledPtx) s += " (+PTX " + std::to_string(kCompiledPtx / 10) + "." + std::to_string(kCompiledPtx % 10) + ")";
+    return s;
+}
+
+// A GPU can run SASS of the same major and lower-or-equal minor, or PTX of a
+// lower-or-equal arch (JIT). Fail with a clear message instead of CUDA's
+// "no kernel image is available for execution on the device".
+static void check_compiled_for(int sm) {
+    for (int a : kCompiledSass) {
+        if (a / 10 == sm / 10 && a <= sm) return;
+    }
+    if (kCompiledPtx && kCompiledPtx <= sm) return;
+    TORCH_CHECK(false, "flash_attn_legacy was built for SM ", compiled_archs_str(),
+                ", this GPU is SM ", sm / 10, ".", sm % 10, ". Rebuild with "
+                "FLASH_ATTN_LEGACY_ARCHS=\"", sm / 10, ".", sm % 10, "\" pip install -e . --no-build-isolation");
+}
+
+std::vector<std::string> compiled_archs() {
+    std::vector<std::string> out;
+    for (int a : kCompiledSass) out.push_back(std::to_string(a / 10) + "." + std::to_string(a % 10));
+    if (kCompiledPtx) out.push_back(std::to_string(kCompiledPtx / 10) + "." + std::to_string(kCompiledPtx % 10) + "+PTX");
+    return out;
+}
+
 static int get_sm_version(int device_id = -1) {
     if (device_id < 0) FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&device_id));
     int major, minor;
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id));
     const int sm = major * 10 + minor;
+    check_compiled_for(sm);
     if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
         const std::string f(force);
         if (f == "pascal") return 60;  // CUDA-core kernels run on any SM >= 6.0
@@ -365,6 +403,8 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
 }  // namespace flash_attn_legacy
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("compiled_archs", &flash_attn_legacy::compiled_archs,
+          "CUDA architectures this build contains, e.g. ['6.0', '7.0', '7.5+PTX']");
     m.def("forward", &flash_attn_legacy::flash_attn_forward,
           "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
