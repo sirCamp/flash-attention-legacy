@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.autograd import Function
 from typing import Optional
 
-from .utils import check_head_dim
+from .utils import check_head_dim, fp16_autocast_active
 
 try:
     import flash_attn_legacy_cuda
@@ -44,11 +44,17 @@ def _check_fp16_range(*tensors):
 
 
 def _to_fp16(q, k, v):
-    """Convert non-fp16 inputs to fp16, range-checked. Gradients through the
-    conversion are not supported: without loss scaling, bf16/fp32 training
-    gradients may underflow in fp16."""
+    """Convert non-fp16 inputs to fp16.
+
+    Under fp16 autocast this is autocast's own semantics (as SDPA there): a plain
+    cast, gradients allowed (the GradScaler that fp16 autocast training needs
+    handles underflow and inf). Otherwise the values are range-checked
+    (FP16RangeError, one host sync) and gradients are not supported: without loss
+    scaling, bf16/fp32 training gradients may underflow in fp16 (docs/PLAN.md P6.2)."""
     if q.dtype == torch.float16:
         return q, k, v
+    if fp16_autocast_active():
+        return q.half(), k.half(), v.half()
     if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError(
             f"flash_attn_legacy: training with {q.dtype} inputs is not supported (the kernels "
@@ -140,8 +146,9 @@ def flash_attention(
       - MQA: same as GQA with H_kv = 1
 
     Args:
-        q: Query [B, H_q, N, d] float16 (bfloat16 / float32 accepted for inference:
-           converted to fp16, range-checked, FP16RangeError if out of range)
+        q: Query [B, H_q, N, d] float16. bfloat16 / float32 are converted to fp16:
+           under fp16 autocast like autocast does (training allowed, no range
+           check); otherwise for inference only, range-checked (FP16RangeError)
         k: Key   [B, H_kv, N, d], same dtype as q
         v: Value [B, H_kv, N, d], same dtype as q
         softmax_scale: default 1/sqrt(d)
@@ -167,7 +174,7 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, softmax_scale, causal):
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal, validate):
         _check_inputs(q, k, v, ndim=3)
         check_head_dim(q.shape[-1])
 
@@ -177,13 +184,14 @@ class FlashAttnVarlenFunc(Function):
 
         o, lse = flash_attn_legacy_cuda.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal, validate,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.max_seqlen_q, ctx.max_seqlen_k = max_seqlen_q, max_seqlen_k
+        ctx.validate = validate
         return o
 
     @staticmethod
@@ -193,9 +201,9 @@ class FlashAttnVarlenFunc(Function):
 
         dq, dk, dv = flash_attn_legacy_cuda.backward_varlen(
             grad_output, q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k,
-            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal,
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal, ctx.validate,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -208,6 +216,7 @@ def flash_attn_varlen_func(
     max_seqlen_k: int,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    validate: bool = True,
 ) -> torch.Tensor:
     """
     Variable-length Flash Attention for packed sequences.
@@ -229,6 +238,11 @@ def flash_attn_varlen_func(
         max_seqlen_k: max sequence length in K/V
         softmax_scale: default 1/sqrt(head_dim)
         causal: apply causal mask
+        validate: check cu_seqlens (start at 0, non-decreasing, end at the totals)
+            on a host copy, one CPU-GPU sync per call. Pass False only for
+            cu_seqlens known to be valid (no sync; e.g. the HuggingFace
+            integration, which builds them): invalid ones then make the kernels
+            read and write out of bounds (memory corruption, illegal address).
 
     Returns:
         [total_q, num_heads, head_dim] in the dtype of q
@@ -250,7 +264,7 @@ def flash_attn_varlen_func(
     _check_inputs(q, k, v, ndim=3)
     out = FlashAttnVarlenFunc.apply(
         *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, validate,
     )
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 

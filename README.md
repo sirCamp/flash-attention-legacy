@@ -42,7 +42,9 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 
 Head dimensions: **d = 32, 64, 72, 80, 96, 128, 256** (72 and 80, as in SigLIP / Qwen2-VL vision towers, run on wider tiles with zero-padded columns).
 
-The kernels compute in **FP16**. BF16 and FP32 inputs are accepted for inference: they are converted to FP16 with a range check (values beyond 65504 raise `FP16RangeError`; through HuggingFace the call falls back to SDPA in the original dtype). Training with BF16/FP32 inputs is not supported by the kernels (FP16 gradients without loss scaling may underflow): use FP16 with a `GradScaler`; through HuggingFace it falls back to SDPA.
+The kernels compute in **FP16**.
+- **Mixed precision** (`torch.autocast("cuda", dtype=torch.float16)` with a `GradScaler`): BF16/FP32 inputs are cast to FP16 exactly as autocast does for SDPA (no range check), training included.
+- **Outside autocast**, BF16 and FP32 inputs are accepted for inference: they are converted to FP16 with a range check (values beyond 65504 raise `FP16RangeError`; through HuggingFace the call falls back to SDPA in the original dtype). Training with BF16/FP32 inputs outside fp16 autocast is not supported by the kernels (FP16 gradients without loss scaling may underflow); through HuggingFace it falls back to SDPA.
 
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 
@@ -106,7 +108,8 @@ The integration decides **per attention call** whether our kernel can run, and n
 | Packed sequences (`position_ids` restarting at 0, or `cu_seq_lens`), VLM vision encoders (Qwen2/2.5/3-VL, Pixtral, ...) | kernel (varlen) |
 | Padded batches (left or right padding, training and generation prefill), encoders and cross-attention with padded inputs | kernel (varlen, unpadded; causal: padded query rows output 0, as FlashAttention-2) |
 | BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
-| Decode (`q_len == 1`), padding with holes inside a row, sliding-window layers, unsupported head_dim, attention dropout, BF16/FP32 training | SDPA fallback |
+| Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
+| Decode (`q_len == 1`), padding with holes inside a row, sliding-window layers, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast | SDPA fallback |
 | Logit softcapping (Gemma 2), attention sinks (gpt-oss) | FP32 eager fallback |
 
 Check what happened in your run:
@@ -118,7 +121,7 @@ model.generate(**inputs, max_new_tokens=32)
 print(flash_attn_legacy.fallback_stats())   # e.g. {'decode': 704} -> only decode steps fell back
 ```
 
-Run inference under `torch.inference_mode()` (or `torch.no_grad()`): with BF16/FP32 weights and gradients enabled, calls fall back to SDPA.
+Run inference under `torch.inference_mode()` (or `torch.no_grad()`): with BF16/FP32 weights and gradients enabled outside FP16 autocast, calls fall back to SDPA.
 
 ### Monkey-patch (transformers < 5.0)
 

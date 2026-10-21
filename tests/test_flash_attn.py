@@ -1104,6 +1104,64 @@ class TestForwardContract:
         ref = ref_attention(q[sl], k[sl[:2]], v[sl[:2]], d ** -0.5)
         torch.testing.assert_close(out[sl], ref, atol=2e-2, rtol=2e-2)
 
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen_without_validation_matches(self, causal):
+        """validate=False (no host sync; the grid is an upper bound whose extra
+        blocks exit at once): same output and gradients as the validated call."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        lens = [3, 0, 200, 17, 1, 64]
+        cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        q, k, v = (torch.randn(sum(lens), 4, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+                   for _ in range(3))
+        go = torch.randn(sum(lens), 4, 64, device="cuda", dtype=torch.float16)
+        results = []
+        for validate in (True, False):
+            out = flash_attn_varlen_func(q, k, v, cu, cu, max(lens), max(lens), causal=causal, validate=validate)
+            grads = torch.autograd.grad(out, (q, k, v), go)
+            results.append((out, *grads))
+        torch.testing.assert_close(results[0][0], results[1][0], atol=0, rtol=0)  # forward: exact
+        for a, b in zip(results[0][1:], results[1][1:]):  # dQ accumulates with atomics: order varies
+            torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen_without_validation_cross_lengths(self, causal):
+        """validate=False with cu_q != cu_k (q shorter than k, a sequence with keys
+        but no queries, one with queries but no keys) and no queries at all."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        lens_q, lens_k = [5, 0, 70, 3], [9, 4, 130, 0]
+        cu_q = torch.tensor([0] + torch.tensor(lens_q).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0] + torch.tensor(lens_k).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        q = torch.randn(sum(lens_q), 4, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+        k, v = (torch.randn(sum(lens_k), 2, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+                for _ in range(2))
+        go = torch.randn(sum(lens_q), 4, 64, device="cuda", dtype=torch.float16)
+        res = []
+        for validate in (True, False):
+            out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k),
+                                         causal=causal, validate=validate)
+            res.append((out, *torch.autograd.grad(out, (q, k, v), go)))
+        torch.testing.assert_close(res[0][0], res[1][0], atol=0, rtol=0)
+        for a, b in zip(res[0][1:], res[1][1:]):
+            torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
+        empty_q = q[:0].detach()
+        cu0 = torch.zeros(5, dtype=torch.int32, device="cuda")
+        out = flash_attn_varlen_func(empty_q, k.detach(), v.detach(), cu0, cu_k, 1, max(lens_k),
+                                     causal=causal, validate=False)
+        assert out.shape == (0, 4, 64)
+
+    def test_fp32_training_under_autocast(self):
+        """The direct API accepts fp32 inputs with gradients under fp16 autocast."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = (torch.randn(1, 2, 40, 64, device="cuda", requires_grad=True) for _ in range(3))
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = flash_attention(q, k, v, causal=True)
+        out.float().sum().backward()
+        ref = ref_attention(q.detach().half(), k.detach().half(), v.detach().half(), 1 / 8, True)
+        torch.testing.assert_close(out.half(), ref, atol=2e-2, rtol=2e-2)
+        assert q.grad.dtype == torch.float32 and torch.isfinite(q.grad).all()
+
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
         import flash_attn_legacy_cuda

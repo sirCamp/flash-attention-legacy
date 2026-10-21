@@ -217,6 +217,71 @@ def test_unpad_fp16_overflow_falls_back_finite():
     assert torch.isfinite(out).all()
 
 
+def test_fp16_autocast_training_runs_on_kernel(monkeypatch):
+    """Mixed precision (fp32 weights, fp16 autocast): HF's rotary makes q / k fp32;
+    the attention still computes in fp16 on the kernel, as SDPA does under
+    autocast. Packed input; loss and gradients vs FP32 eager on the sequences run
+    alone, noise floor: fp16-autocast eager on the sequences alone."""
+    base = tiny_llama(initializer_range=0.1)
+    lengths = [30, 17, 45]
+    seqs, ids, position_ids = _packed_batch(base, lengths)
+    tgt = torch.cat([torch.cat([s_[1:], torch.tensor([-100])]) for s_ in seqs]).cuda()
+
+    def loss_and_grads(impl, packed, autocast):
+        model = load_impl(base, impl, torch.float32).train()
+        with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+            if packed:
+                lg = model(input_ids=ids.cuda(), position_ids=position_ids.cuda()).logits.float()[0]
+            else:
+                lg = torch.cat([model(input_ids=s_[None].cuda()).logits.float()[0] for s_ in seqs])
+            loss = torch.nn.functional.cross_entropy(lg, tgt, ignore_index=-100)
+        loss.backward()
+        return loss.item(), torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+
+    gold_loss, gold_g = loss_and_grads("eager", packed=False, autocast=False)
+    noise_loss, noise_g = loss_and_grads("eager", packed=False, autocast=True)
+    counter = KernelCounter(monkeypatch)
+    loss, g = loss_and_grads("flash_attn_legacy", packed=True, autocast=True)
+    assert counter.varlen_calls and fallback_stats() == {}
+    err = lambda x: 1 - torch.nn.functional.cosine_similarity(x, gold_g, dim=0).item()  # noqa: E731
+    assert abs(loss - gold_loss) <= max(3 * abs(noise_loss - gold_loss), 1e-3), (loss, gold_loss)
+    assert err(g) <= max(3 * err(noise_g), 1e-5), (err(g), err(noise_g))
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_autocast_mixed_dtypes_run_on_kernel(monkeypatch, padded):
+    """Under fp16 autocast q / k may be fp32 (rotary) and v fp16: all cast to fp16
+    and run on the kernel (batched, or unpadded varlen), fp16 output, gradients."""
+    q, k, _ = (t.float().requires_grad_() for t in _qkv(q_len=24, kv_len=24))
+    v = _qkv(q_len=24, kv_len=24)[2].requires_grad_()  # fp16
+    pad = None
+    if padded:
+        pad = torch.ones(1, 24, dtype=torch.bool, device="cuda")
+        pad[0, :5] = False
+    counter = KernelCounter(monkeypatch)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad)
+    out.float().sum().backward()
+    assert len(counter.calls) + len(counter.varlen_calls) == 1 and fallback_stats() == {}
+    assert out.dtype == torch.float16 and q.grad is not None and v.grad is not None
+
+
+def test_autocast_skips_range_check():
+    """fp16 autocast semantics (as SDPA there): values beyond fp16 are cast, not
+    rejected (no FP16RangeError, no fallback); the GradScaler handles inf."""
+    q, k, v = (t.float() for t in _qkv())
+    v[0, 0, 3, 0] = 1e6
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None)
+    assert fallback_stats() == {}
+
+
+def test_fp32_training_without_autocast_still_falls_back():
+    q, k, v = (t.float().requires_grad_() for t in _qkv())
+    integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None)
+    assert fallback_stats() == {"non_fp16_training": 1}
+
+
 def test_attention_mask_reason_for_holes():
     """Padding that is not one contiguous block per row (rare) keeps the fallback."""
     q, k, v = _qkv(q_len=16, kv_len=16)

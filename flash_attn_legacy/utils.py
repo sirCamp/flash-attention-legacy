@@ -10,6 +10,15 @@ from typing import Dict, Optional
 SUPPORTED_HEAD_DIMS = (32, 64, 72, 80, 96, 128, 256)
 
 
+def fp16_autocast_active() -> bool:
+    """CUDA autocast to float16 is on. Attention then computes in fp16, as SDPA does
+    under autocast, and the GradScaler that fp16 autocast training requires covers
+    gradient underflow."""
+    if hasattr(torch, "get_autocast_dtype"):  # torch >= 2.4
+        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+    return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+
+
 def check_head_dim(d: int) -> None:
     """Raise ValueError if `d` is not a supported head dimension."""
     if d not in SUPPORTED_HEAD_DIMS:

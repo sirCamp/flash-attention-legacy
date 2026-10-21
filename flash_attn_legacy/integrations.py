@@ -23,7 +23,7 @@ from typing import Dict, NamedTuple, Optional
 import torch
 import torch.nn as nn
 
-from .utils import SUPPORTED_HEAD_DIMS
+from .utils import SUPPORTED_HEAD_DIMS, fp16_autocast_active
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
     if dropout > 0.0 and module.training:
         return "dropout", ""
     if query.dtype != torch.float16 and torch.is_grad_enabled() and (
-            query.requires_grad or key.requires_grad or value.requires_grad):
+            query.requires_grad or key.requires_grad or value.requires_grad) and not fp16_autocast_active():
         return "non_fp16_training", f" ({query.dtype})"
     return None, ""
 
@@ -343,7 +343,7 @@ def _unpad_plan(key_mask, q_len, causal, device):
         the key mask): every query row, so padded query rows attend the valid
         keys exactly as in SDPA.
     The plan's host sync happens once per mask tensor (cached on it); the varlen
-    kernel itself still validates cu_seqlens with a sync per call (P6.5)."""
+    kernel is called with validate=False (cu_seqlens built here), so no other."""
     def compute():
         B, kv_len = key_mask.shape
         kmask = key_mask.to(device=device, dtype=torch.bool)
@@ -405,8 +405,12 @@ def flash_attn_legacy_forward(
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
-    if key.dtype != query.dtype:
-        # e.g. an fp32 static cache under fp16 autocast: compute in the query dtype
+    if fp16_autocast_active() and query.dtype != torch.float16:
+        # fp16 autocast (e.g. q / k fp32 after HF's rotary, v fp16): attention
+        # computes in fp16, as SDPA does under autocast (no range check)
+        query, key, value = query.half(), key.half(), value.half()
+    elif not key.dtype == value.dtype == query.dtype:
+        # e.g. an fp32 static cache: compute in the query dtype
         key, value = key.to(query.dtype), value.to(query.dtype)
 
     padding_2d = False
@@ -477,8 +481,8 @@ def flash_attn_legacy_forward(
                 def rows(t, idx):
                     return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
                 out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
-                                             cu_q, cu_k, max_q, max_k,
-                                             softmax_scale=scaling, causal=is_causal)
+                                             cu_q, cu_k, max_q, max_k, softmax_scale=scaling,
+                                             causal=is_causal, validate=False)  # built by _unpad_plan
                 attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
                                .view(B, q_len, H_q, -1).transpose(1, 2))
             elif segments is None:
@@ -490,6 +494,7 @@ def flash_attn_legacy_forward(
                 attn_output = flash_attn_varlen_func(
                     *packed, cu_seqlens, cu_seqlens, max_len, max_len,
                     softmax_scale=scaling, causal=is_causal,
+                    validate=False,  # validated / built by _packed_segments
                 ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
         except FP16RangeError:
             reason, detail = "fp16_overflow", f" ({query.dtype})"

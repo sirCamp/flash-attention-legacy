@@ -161,19 +161,25 @@ static std::pair<torch::Tensor, torch::Tensor> validated_cu_seqlens(
 
 // Blocks of `rows` rows per sequence: cumulative counts [0, cdiv(len_0, rows),
 // ...] on the device (int32, no host loop or host-to-device copy) for the
-// kernels' varlen_seq_of_block, and the total for the grid from the validated
-// host copy of the same cu_seqlens.
+// kernels' varlen_seq_of_block, and the number of blocks to launch: exact from
+// the validated host copy of the same cu_seqlens when there is one, else (no
+// host sync) the upper bound cdiv(total_rows, rows) + sequences — blocks past
+// the last sequence exit at once.
 struct VarlenBlocks {
     torch::Tensor offsets;
     int total;
 };
-static VarlenBlocks varlen_blocks(const torch::Tensor& cu_seqlens, const torch::Tensor& cu_host, int rows) {
+static VarlenBlocks varlen_blocks(const torch::Tensor& cu_seqlens, const torch::Tensor& cu_host,
+                                  int rows, int total_rows) {
     const int n = cu_seqlens.size(0) - 1;
     const torch::Tensor blocks = (cu_seqlens.narrow(0, 1, n) - cu_seqlens.narrow(0, 0, n) + (rows - 1))
                                      .div(rows, "floor");
-    auto acc = cu_host.accessor<int, 1>();
-    int total = 0;
-    for (int i = 0; i < n; i++) total += cdiv(acc[i + 1] - acc[i], rows);
+    int total = cdiv(total_rows, rows) + n;
+    if (cu_host.defined()) {
+        auto acc = cu_host.accessor<int, 1>();
+        total = 0;
+        for (int i = 0; i < n; i++) total += cdiv(acc[i + 1] - acc[i], rows);
+    }
     return {torch::cat({torch::zeros({1}, cu_seqlens.options()), blocks.cumsum(0).to(torch::kInt32)}), total};
 }
 
@@ -374,7 +380,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal
+    float softmax_scale, bool is_causal, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
     check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
@@ -390,13 +396,16 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const auto cu_host = validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k);
+    // validate=false: the caller guarantees valid cu_seqlens (no host sync)
+    const auto cu_host = validate ? validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k)
+                                  : std::pair<torch::Tensor, torch::Tensor>();
+    if (total_q == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
 
     int sm = get_sm_version();
     // Br of the tile the launcher will select (same dispatch: they cannot disagree)
     const int Br = (sm >= 70) ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
-    const VarlenBlocks q_blocks = varlen_blocks(cu_seqlens_q, cu_host.first, Br);
-    if (q_blocks.total == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
+    const VarlenBlocks q_blocks = varlen_blocks(cu_seqlens_q, cu_host.first, Br, total_q);
+    if (q_blocks.total == 0) return {O, L};  // only empty sequences: nothing to launch
     const int total_q_blocks = q_blocks.total;
     const torch::Tensor& block_offsets_t = q_blocks.offsets;
 
@@ -445,7 +454,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor O, torch::Tensor L,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal
+    float softmax_scale, bool is_causal, bool validate
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -462,7 +471,8 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
                 "L must be CUDA float32 on the same device as Q");
     L = L.contiguous();
     TORCH_CHECK(L.dim() == 2 && L.size(0) == total_q && L.size(1) == H_q, "L must be [total_q, H_q]");
-    const auto cu_host = validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k);
+    const auto cu_host = validate ? validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k)
+                                  : std::pair<torch::Tensor, torch::Tensor>();
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -472,7 +482,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
 
     const bool wmma = get_sm_version() >= 70;
     const int Bc = flash_attn_bwd_block_cols(d, wmma);  // same selection as the launch
-    const VarlenBlocks k_blocks = varlen_blocks(cu_seqlens_k, cu_host.second, Bc);
+    const VarlenBlocks k_blocks = varlen_blocks(cu_seqlens_k, cu_host.second, Bc, total_k);
 
     torch::Tensor dQ_fp32 = torch::zeros({total_q, H_q, d}, Q.options().dtype(torch::kFloat32));
     // Every key row belongs to one sequence and one key block: written exactly once
@@ -527,14 +537,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false);
+          py::arg("softmax_scale"), py::arg("is_causal") = false, py::arg("validate") = true);
     m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
           "Flash Attention v2 backward — variable-length packed sequences, one launch",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("L"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false);
+          py::arg("softmax_scale"), py::arg("is_causal") = false, py::arg("validate") = true);
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
