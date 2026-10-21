@@ -1,12 +1,13 @@
 // ============================================================================
-// Flash Attention v2 — Forward Kernel for Pascal (SM 6.0/6.1)
-// No tensor cores — uses half2 packed FP16 arithmetic on CUDA cores.
+// Flash Attention v2 — Forward Kernel for Pascal (SM 6.0/6.1), CUDA cores
+// (also runs on newer GPUs with FLASH_ATTN_LEGACY_FORCE_ARCH=pascal).
 //
 // Key design:
-//   - P buffer in shared memory → no recomputation of S for P@V
-//   - 1 thread = 1 Q row (NUM_THREADS >= Br always)
-//   - Vectorized half2 loads/stores for 2× memory bandwidth
-//   - Tiles: Br=32,Bc=32 for d=64; Br=16,Bc=16 for d=128
+//   - fp16 storage, fp32 math (products and sums)
+//   - 1 thread = 1 Q row (Br = threads); P stays in registers (the owner of a
+//     row of P multiplies it by V, whose rows every thread reads at once)
+//   - Q rows padded in shared memory, 128-bit loads (bank-conflict free)
+//   - one block body (pascal_fwd_block) shared by the batched and varlen kernels
 // ============================================================================
 
 #include "flash_attn_common.h"
@@ -16,23 +17,24 @@
 namespace flash_attn_legacy {
 
 // ---------------------------------------------------------------------------
-// Vectorized global → shared memory load using half2 (4-byte transactions)
+// Vectorized global → shared memory load using half2 (4-byte transactions).
+// Destination rows have stride DST_STRIDE (>= COLS, padded to avoid bank
+// conflicts on per-row accesses); rows >= num_valid_rows are zero-filled.
 // ---------------------------------------------------------------------------
-template <int ROWS, int COLS, int NUM_THREADS>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
 __device__ __forceinline__ void load_tile_g2s(
     const half* __restrict__ src,
     int src_row_stride,
     half* __restrict__ dst,
     int num_valid_rows
 ) {
-    static_assert(COLS % 2 == 0, "COLS must be even for half2 loads");
+    static_assert(COLS % 2 == 0 && DST_STRIDE % 2 == 0, "half2 loads need even sizes");
     constexpr int COLS2 = COLS / 2;
     constexpr int TOTAL2 = ROWS * COLS2;
     constexpr int PER_THREAD = (TOTAL2 + NUM_THREADS - 1) / NUM_THREADS;
 
     const int tid = threadIdx.x;
     const half2 zero2 = {__float2half(0.0f), __float2half(0.0f)};
-    half2* dst2 = reinterpret_cast<half2*>(dst);
 
     #pragma unroll
     for (int i = 0; i < PER_THREAD; i++) {
@@ -40,359 +42,240 @@ __device__ __forceinline__ void load_tile_g2s(
         if (idx < TOTAL2) {
             int row = idx / COLS2;
             int col2 = idx % COLS2;
+            half2* dst2 = reinterpret_cast<half2*>(dst + row * DST_STRIDE);
             if (row < num_valid_rows) {
                 const half2* src2 = reinterpret_cast<const half2*>(src + row * src_row_stride);
-                dst2[row * COLS2 + col2] = src2[col2];
+                dst2[col2] = src2[col2];
             } else {
-                dst2[row * COLS2 + col2] = zero2;
+                dst2[col2] = zero2;
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// half2 dot product — fp32 products and accumulation (compile-time length)
+// fp16 dot product with fp32 products and accumulation, 128-bit loads.
 // The products are NOT formed in fp16 (__hmul2): a single |q_i * k_i| > 65504
 // would overflow to inf even with in-range inputs, and on sm_61 fp16 math runs
 // at 1/64 of the fp32 rate.
 // ---------------------------------------------------------------------------
 template <int LEN>
-__device__ __forceinline__ float half2_dot(
+__device__ __forceinline__ float half_dot(
     const half* __restrict__ a,
     const half* __restrict__ b
 ) {
-    static_assert(LEN % 2 == 0, "LEN must be even");
-    constexpr int LEN2 = LEN / 2;
-    const half2* a2 = reinterpret_cast<const half2*>(a);
-    const half2* b2 = reinterpret_cast<const half2*>(b);
-
+    static_assert(LEN % 8 == 0, "LEN must be a multiple of 8 (128-bit loads)");
+    const uint4* a4 = reinterpret_cast<const uint4*>(a);
+    const uint4* b4 = reinterpret_cast<const uint4*>(b);
     float acc = 0.0f;
     #pragma unroll
-    for (int i = 0; i < LEN2; i++) {
-        const float2 x = __half22float2(a2[i]);
-        const float2 y = __half22float2(b2[i]);
-        acc = fmaf(x.x, y.x, acc);
-        acc = fmaf(x.y, y.y, acc);
+    for (int i = 0; i < LEN / 8; i++) {
+        const uint4 x = a4[i], y = b4[i];
+        const half2* xh = reinterpret_cast<const half2*>(&x);
+        const half2* yh = reinterpret_cast<const half2*>(&y);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 xf = __half22float2(xh[j]);
+            const float2 yf = __half22float2(yh[j]);
+            acc = fmaf(xf.x, yf.x, acc);
+            acc = fmaf(xf.y, yf.y, acc);
+        }
     }
     return acc;
 }
 
 // ---------------------------------------------------------------------------
-// Forward kernel — Pascal
+// One Q block of the CUDA-core forward, shared by the batched and varlen
+// kernels (same structure as volta_fwd_block).
+//
+// Shared memory (Tile::smem_bytes()):
+//   smem_Q [Br, LDQ] half (LDQ = d + 8), smem_K [Bc, d] half, smem_V [Bc, d] half
+// Each thread owns one Q row: it reads its own Q row with 128-bit loads (the
+// padded stride makes them bank-conflict free) and K/V rows that every thread
+// reads at the same time (broadcast). P stays in registers: the thread that
+// computes a row of P is the one that multiplies it by V.
+// Returns the row's logsumexp (only meaningful for threads that own a row).
 // ---------------------------------------------------------------------------
 template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_fwd_pascal_kernel(FlashAttnParams params) {
-
+__device__ __forceinline__ float pascal_fwd_block(
+    const half* __restrict__ Q_ptr, int q_stride,
+    const half* __restrict__ K_ptr, int k_stride,
+    const half* __restrict__ V_ptr, int v_stride,
+    half* __restrict__ O_ptr, int o_stride,
+    int q_row_start, int valid_q, int seq_len_q, int seq_len_k,
+    float softmax_scale, bool is_causal
+) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int d  = Tile::d;
     constexpr int NUM_THREADS = Tile::kNumWarps * 32;
+    constexpr int LDQ = Tile::kLdQ;
 
-    const int bh_idx = blockIdx.y;
-    const int b_idx = bh_idx / params.num_heads;
-    const int h_idx = bh_idx % params.num_heads;
-    // GQA: map query head to KV head
-    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
-    const int seq_len_q = params.seq_len_q;
-    const int seq_len_k = params.seq_len_k;
-    const int causal_off = seq_len_k - seq_len_q;
-    const int q_row_start = blockIdx.x * Br;
-    if (q_row_start >= seq_len_q) return;
-
-    const int valid_q = min(Br, seq_len_q - q_row_start);
-
-    // Base pointers
-    const half* Q_ptr = params.Q + b_idx * params.q_batch_stride
-                                 + h_idx * params.q_head_stride
-                                 + q_row_start * params.q_seq_stride;
-    const half* K_ptr = params.K + b_idx * params.k_batch_stride
-                                 + kv_h_idx * params.k_head_stride;
-    const half* V_ptr = params.V + b_idx * params.v_batch_stride
-                                 + kv_h_idx * params.v_head_stride;
-    half* O_ptr = params.O + b_idx * params.o_batch_stride
-                           + h_idx * params.o_head_stride
-                           + q_row_start * params.o_seq_stride;
-    float* L_ptr = params.L + b_idx * params.l_batch_stride
-                            + h_idx * params.l_head_stride
-                            + q_row_start;
-
-    // Shared memory
-    extern __shared__ __align__(128) char smem_raw[];  // aligned for vector (128-bit) accesses
-    half*  smem_Q = reinterpret_cast<half*>(smem_raw);
-    half*  smem_K = smem_Q + Br * d;
-    half*  smem_V = smem_K + Bc * d;
-    float* smem_P = reinterpret_cast<float*>(smem_V + Bc * d);  // [Br, Bc]
+    extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
+    half* smem_Q = reinterpret_cast<half*>(smem_raw);
+    half* smem_K = smem_Q + Br * LDQ;
+    half* smem_V = smem_K + Bc * d;
 
     const int tid = threadIdx.x;
     const bool owns_row = (tid < Br) && (tid < valid_q);
+    const int causal_off = seq_len_k - seq_len_q;
 
-    // Per-row registers (only active threads use these)
     float row_max = -INFINITY;
     float row_sum = 0.0f;
     float my_O[d];
     #pragma unroll
     for (int j = 0; j < d; j++) my_O[j] = 0.0f;
 
-    // Load Q (stays for entire block)
-    load_tile_g2s<Br, d, NUM_THREADS>(Q_ptr, params.q_seq_stride, smem_Q, valid_q);
+    load_tile_g2s<Br, d, NUM_THREADS, LDQ>(Q_ptr, q_stride, smem_Q, valid_q);
     __syncthreads();
 
-    // Main loop over K/V blocks
-    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
-
+    const int kv_limit = fwd_kv_limit(is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
     for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
         const int kv_start = kv_blk * Bc;
         const int valid_kv = min(Bc, seq_len_k - kv_start);
 
-        // Load K
-        load_tile_g2s<Bc, d, NUM_THREADS>(
-            K_ptr + kv_start * params.k_seq_stride,
-            params.k_seq_stride, smem_K, valid_kv);
+        // All threads finished the previous S (they passed the barrier after the
+        // previous V load), so K can be overwritten; P@V does not read K.
+        load_tile_g2s<Bc, d, NUM_THREADS>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
         __syncthreads();
 
-        // Compute S, softmax → P in shared memory
+        float p[Bc];
         if (owns_row) {
             float local_max = -INFINITY;
-
-            // Compute S and find row max
             #pragma unroll
             for (int c = 0; c < Bc; c++) {
                 float s;
                 if ((kv_start + c) >= seq_len_k ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
+                    (is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
                     s = -INFINITY;
                 } else {
-                    s = half2_dot<d>(smem_Q + tid * d, smem_K + c * d) * params.softmax_scale;
+                    s = half_dot<d>(smem_Q + tid * LDQ, smem_K + c * d) * softmax_scale;
                 }
-                smem_P[tid * Bc + c] = s;
+                p[c] = s;
                 local_max = fmaxf(local_max, s);
             }
-
-            // Online softmax rescale
-            float new_max = fmaxf(row_max, local_max);
+            const float new_max = fmaxf(row_max, local_max);
             // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
-            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
+            const float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
             row_max = new_max;
             row_sum *= rescale;
             #pragma unroll
             for (int j = 0; j < d; j++) my_O[j] *= rescale;
-
-            // Compute P = exp(S - max), store in shared, accumulate sum
             float local_sum = 0.0f;
             #pragma unroll
             for (int c = 0; c < Bc; c++) {
-                float s = smem_P[tid * Bc + c];
-                float p = (s == -INFINITY) ? 0.0f : expf(s - new_max);
-                smem_P[tid * Bc + c] = p;
-                local_sum += p;
+                p[c] = (p[c] == -INFINITY) ? 0.0f : expf(p[c] - new_max);
+                local_sum += p[c];
             }
             row_sum += local_sum;
         }
+
+        // All threads finished reading K (S above) before V is written over the
+        // previous V; the barrier also publishes V.
+        load_tile_g2s<Bc, d, NUM_THREADS>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
         __syncthreads();
 
-        // Load V
-        load_tile_g2s<Bc, d, NUM_THREADS>(
-            V_ptr + kv_start * params.v_seq_stride,
-            params.v_seq_stride, smem_V, valid_kv);
-        __syncthreads();
-
-        // O += P @ V (P from shared, V from shared)
+        // O += P @ V: own row of P (registers) x V rows (broadcast reads)
         if (owns_row) {
             #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float p = smem_P[tid * Bc + c];
-                if (p == 0.0f) continue;
+            for (int c = 0; c < Bc; c++) {  // no p == 0 skip: divergent, and 0 * inf must give NaN
                 const half2* v2 = reinterpret_cast<const half2*>(smem_V + c * d);
-                constexpr int d2 = d / 2;
                 #pragma unroll
-                for (int j = 0; j < d2; j++) {
-                    half2 v = v2[j];
-                    my_O[j * 2]     += p * __half2float(v.x);
-                    my_O[j * 2 + 1] += p * __half2float(v.y);
+                for (int j = 0; j < d / 2; j++) {
+                    const float2 v = __half22float2(v2[j]);
+                    my_O[2 * j]     = fmaf(p[c], v.x, my_O[2 * j]);
+                    my_O[2 * j + 1] = fmaf(p[c], v.y, my_O[2 * j + 1]);
                 }
             }
         }
-        __syncthreads();
     }
 
-    // Finalize
     if (owns_row) {
-        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * params.o_seq_stride);
-        constexpr int d2 = d / 2;
+        const float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * o_stride);
         #pragma unroll
-        for (int j = 0; j < d2; j++) {
-            half2 val;
-            val.x = __float2half(my_O[j * 2] * inv_sum);
-            val.y = __float2half(my_O[j * 2 + 1] * inv_sum);
-            o_dst2[j] = val;
+        for (int j = 0; j < d / 2; j++) {
+            o_dst2[j] = __floats2half2_rn(my_O[2 * j] * inv_sum, my_O[2 * j + 1] * inv_sum);
         }
-        L_ptr[tid] = row_max + logf(fmaxf(row_sum, 1e-20f));
+    }
+    return row_max + logf(fmaxf(row_sum, 1e-20f));
+}
+
+// ---------------------------------------------------------------------------
+// Forward kernel — CUDA cores (Pascal), batched [B, H, N, d]
+// ---------------------------------------------------------------------------
+template <typename Tile>
+__global__ void __launch_bounds__(Tile::kNumWarps * 32)
+flash_attn_fwd_pascal_kernel(FlashAttnParams params) {
+    constexpr int Br = Tile::Br;
+    const int bh_idx = blockIdx.y;
+    const int b_idx = bh_idx / params.num_heads;
+    const int h_idx = bh_idx % params.num_heads;
+    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
+    const int q_row_start = blockIdx.x * Br;
+    if (q_row_start >= params.seq_len_q) return;
+    const int valid_q = min(Br, params.seq_len_q - q_row_start);
+
+    const float lse = pascal_fwd_block<Tile>(
+        params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
+                 + q_row_start * params.q_seq_stride, params.q_seq_stride,
+        params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride, params.k_seq_stride,
+        params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride, params.v_seq_stride,
+        params.O + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
+                 + q_row_start * params.o_seq_stride, params.o_seq_stride,
+        q_row_start, valid_q, params.seq_len_q, params.seq_len_k,
+        params.softmax_scale, params.is_causal);
+
+    const int tid = threadIdx.x;
+    if (tid < valid_q) {
+        params.L[b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_row_start + tid] = lse;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Forward kernel — Pascal — Variable-length (packed sequences)
+// Forward kernel — CUDA cores (Pascal), varlen (packed [total, H, d])
 // ---------------------------------------------------------------------------
 template <typename Tile>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
-
     constexpr int Br = Tile::Br;
-    constexpr int Bc = Tile::Bc;
-    constexpr int d  = Tile::d;
-    constexpr int NUM_THREADS = Tile::kNumWarps * 32;
-
     const int h_idx = blockIdx.y;
     const int block_x = blockIdx.x;
 
     // Binary search: find which sequence this block belongs to
-    int seq_idx = 0;
-    {
-        int lo = 0, hi = params.num_seqs;
-        while (lo < hi) {
-            int mid = (lo + hi) / 2;
-            if (params.block_offsets[mid + 1] <= block_x)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        seq_idx = lo;
+    int lo = 0, hi = params.num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (params.block_offsets[mid + 1] <= block_x) lo = mid + 1;
+        else hi = mid;
     }
+    const int seq_idx = lo;
 
     const int local_block = block_x - params.block_offsets[seq_idx];
     const int q_start_tok = params.cu_seqlens_q[seq_idx];
     const int k_start_tok = params.cu_seqlens_k[seq_idx];
     const int seq_len_q = params.cu_seqlens_q[seq_idx + 1] - q_start_tok;
     const int seq_len_k = params.cu_seqlens_k[seq_idx + 1] - k_start_tok;
-    const int causal_off = seq_len_k - seq_len_q;
-
     const int q_row_start = local_block * Br;
     if (q_row_start >= seq_len_q) return;
     const int valid_q = min(Br, seq_len_q - q_row_start);
-
     const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
 
-    // Pointers into packed [total, H, d] tensors
-    const half* Q_ptr = params.Q + (q_start_tok + q_row_start) * params.q_token_stride
-                                 + h_idx * params.q_head_stride;
-    const half* K_ptr = params.K + k_start_tok * params.k_token_stride
-                                 + kv_h_idx * params.k_head_stride;
-    const half* V_ptr = params.V + k_start_tok * params.v_token_stride
-                                 + kv_h_idx * params.v_head_stride;
-    half* O_ptr = params.O + (q_start_tok + q_row_start) * params.o_token_stride
-                           + h_idx * params.o_head_stride;
-
-    // Shared memory
-    extern __shared__ __align__(128) char smem_raw[];  // aligned for vector (128-bit) accesses
-    half*  smem_Q = reinterpret_cast<half*>(smem_raw);
-    half*  smem_K = smem_Q + Br * d;
-    half*  smem_V = smem_K + Bc * d;
-    float* smem_P = reinterpret_cast<float*>(smem_V + Bc * d);
+    const float lse = pascal_fwd_block<Tile>(
+        params.Q + (q_start_tok + q_row_start) * params.q_token_stride + h_idx * params.q_head_stride,
+        params.q_token_stride,
+        params.K + k_start_tok * params.k_token_stride + kv_h_idx * params.k_head_stride,
+        params.k_token_stride,
+        params.V + k_start_tok * params.v_token_stride + kv_h_idx * params.v_head_stride,
+        params.v_token_stride,
+        params.O + (q_start_tok + q_row_start) * params.o_token_stride + h_idx * params.o_head_stride,
+        params.o_token_stride,
+        q_row_start, valid_q, seq_len_q, seq_len_k,
+        params.softmax_scale, params.is_causal);
 
     const int tid = threadIdx.x;
-    const bool owns_row = (tid < Br) && (tid < valid_q);
-
-    float row_max = -INFINITY;
-    float row_sum = 0.0f;
-    float my_O[d];
-    #pragma unroll
-    for (int j = 0; j < d; j++) my_O[j] = 0.0f;
-
-    // Load Q — stride is token_stride
-    load_tile_g2s<Br, d, NUM_THREADS>(Q_ptr, params.q_token_stride, smem_Q, valid_q);
-    __syncthreads();
-
-    // Main loop over K/V blocks (within this sequence)
-    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
-
-    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
-        const int kv_start = kv_blk * Bc;
-        const int valid_kv = min(Bc, seq_len_k - kv_start);
-
-        // Load K
-        load_tile_g2s<Bc, d, NUM_THREADS>(
-            K_ptr + kv_start * params.k_token_stride,
-            params.k_token_stride, smem_K, valid_kv);
-        __syncthreads();
-
-        // Compute S, softmax → P in shared memory
-        if (owns_row) {
-            float local_max = -INFINITY;
-
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s;
-                if ((kv_start + c) >= seq_len_k ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
-                    s = -INFINITY;
-                } else {
-                    s = half2_dot<d>(smem_Q + tid * d, smem_K + c * d) * params.softmax_scale;
-                }
-                smem_P[tid * Bc + c] = s;
-                local_max = fmaxf(local_max, s);
-            }
-
-            float new_max = fmaxf(row_max, local_max);
-            // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
-            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
-            row_max = new_max;
-            row_sum *= rescale;
-            #pragma unroll
-            for (int j = 0; j < d; j++) my_O[j] *= rescale;
-
-            float local_sum = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s = smem_P[tid * Bc + c];
-                float p = (s == -INFINITY) ? 0.0f : expf(s - new_max);
-                smem_P[tid * Bc + c] = p;
-                local_sum += p;
-            }
-            row_sum += local_sum;
-        }
-        __syncthreads();
-
-        // Load V
-        load_tile_g2s<Bc, d, NUM_THREADS>(
-            V_ptr + kv_start * params.v_token_stride,
-            params.v_token_stride, smem_V, valid_kv);
-        __syncthreads();
-
-        // O += P @ V
-        if (owns_row) {
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float p = smem_P[tid * Bc + c];
-                if (p == 0.0f) continue;
-                const half2* v2 = reinterpret_cast<const half2*>(smem_V + c * d);
-                constexpr int d2 = d / 2;
-                #pragma unroll
-                for (int j = 0; j < d2; j++) {
-                    half2 v = v2[j];
-                    my_O[j * 2]     += p * __half2float(v.x);
-                    my_O[j * 2 + 1] += p * __half2float(v.y);
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Finalize — write O and L with packed strides
-    if (owns_row) {
-        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * params.o_token_stride);
-        constexpr int d2 = d / 2;
-        #pragma unroll
-        for (int j = 0; j < d2; j++) {
-            half2 val;
-            val.x = __float2half(my_O[j * 2] * inv_sum);
-            val.y = __float2half(my_O[j * 2 + 1] * inv_sum);
-            o_dst2[j] = val;
-        }
-        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] =
-            row_max + logf(fmaxf(row_sum, 1e-20f));
+    if (tid < valid_q) {
+        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] = lse;
     }
 }
 

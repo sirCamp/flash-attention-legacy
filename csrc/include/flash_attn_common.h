@@ -159,7 +159,9 @@ struct FlashAttnBwdParams {
 // ---------------------------------------------------------------------------
 
 // WMMA forward (Volta SM 7.0, Turing SM 7.5): Q[Br,d] + K[Bc,d] + V[Bc,d] (half),
-// S[Br,Bc] (float, reused for the P@V chunks), P[Br,Bc] (half).
+// S[Br,kLdS] (float, reused for the P@V chunks), P[Br,kLdP] (half).
+// The row strides are padded (+4 floats / +8 halves, still valid WMMA leading
+// dimensions) so that the per-row 128-bit accesses are bank-conflict free.
 // Constraints: Br, Bc multiples of 16; d % Bc == 0 (P@V in chunks of Bc).
 template <int Br_, int Bc_, int d_>
 struct FwdTileWmma {
@@ -167,39 +169,44 @@ struct FwdTileWmma {
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
     static constexpr int kNumWarps = Br_ / 32;
+    static constexpr int kLdS = Bc_ + 4;
+    static constexpr int kLdP = Bc_ + 8;
     static constexpr int smem_bytes() {
-        return (Br * d + 2 * Bc * d) * 2 + Br * Bc * 4 + Br * Bc * 2;
+        return (Br * d + 2 * Bc * d) * 2 + Br * kLdS * 4 + Br * kLdP * 2;
     }
     static_assert(Br_ % 32 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA forward tile");
 };
 
-// CUDA-core forward (Pascal SM 6.x): Q[Br,d] + K[Bc,d] + V[Bc,d] (half), P[Br,Bc] (float).
+// CUDA-core forward (Pascal SM 6.x): Q[Br,kLdQ] + K[Bc,d] + V[Bc,d] (half); P
+// stays in registers. Q rows are padded by 8 halves so that the per-row 128-bit
+// reads are bank-conflict free.
 template <int Br_, int Bc_, int d_>
 struct FwdTileSimt {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
     static constexpr int kNumWarps = Br_ / 32;
+    static constexpr int kLdQ = d_ + 8;
     static constexpr int smem_bytes() {
-        return (Br * d + 2 * Bc * d) * 2 + Br * Bc * 4;
+        return (Br * kLdQ + 2 * Bc * d) * 2;
     }
-    static_assert(Br_ % 32 == 0, "invalid CUDA-core forward tile");
+    static_assert(Br_ % 32 == 0 && d_ % 8 == 0, "invalid CUDA-core forward tile");
 };
 
 // Forward tiles: Bc = 16 for every head_dim, measured fastest on V100 and T4
 // (smaller tiles -> more blocks per SM; see the WMMA launcher). Every WMMA tile
 // fits the 64 KB per block of Turing.
-using TileVolta_d32  = FwdTileWmma<128, 16, 32>;    // 22 KB
-using TileVolta_d64  = FwdTileWmma<128, 16, 64>;    // 32 KB
-using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 43 KB
-using TileVolta_d128 = FwdTileWmma<128, 16, 128>;   // 52 KB
-using TileVolta_d256 = FwdTileWmma<64, 16, 256>;    // 54 KB
+using TileVolta_d32  = FwdTileWmma<128, 16, 32>;    // 26 KB
+using TileVolta_d64  = FwdTileWmma<128, 16, 64>;    // 36 KB
+using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 46 KB
+using TileVolta_d128 = FwdTileWmma<128, 16, 128>;   // 56 KB
+using TileVolta_d256 = FwdTileWmma<64, 16, 256>;    // 56 KB
 
-using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 28 KB
-using TilePascal_d64  = FwdTileSimt<128, 32, 64>;   // 40 KB
-using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 22 KB
-using TilePascal_d128 = FwdTileSimt<64, 16, 128>;   // 28 KB
-using TilePascal_d256 = FwdTileSimt<32, 16, 256>;   // 34 KB
+using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 14 KB
+using TilePascal_d64  = FwdTileSimt<128, 32, 64>;   // 26 KB
+using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 19 KB
+using TilePascal_d128 = FwdTileSimt<64, 16, 128>;   // 25 KB
+using TilePascal_d256 = FwdTileSimt<32, 16, 256>;   // 33 KB
 
 // First tile of the list whose smem_bytes() fits `smem_limit`: calls f(Tile{})
 // and returns true, or returns false if none fits. Shared by every launcher and

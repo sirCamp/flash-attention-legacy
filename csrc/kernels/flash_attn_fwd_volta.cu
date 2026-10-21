@@ -1,13 +1,13 @@
 // ============================================================================
-// Flash Attention v2 — Forward Kernel for Volta (SM 7.0)
+// Flash Attention v2 — Forward Kernel for Volta (SM 7.0) and Turing (SM 7.5)
 // Uses WMMA tensor cores for both Q@K^T and P@V matmuls (16×16×16 FP16)
 //
 // Key design:
-//   - WMMA for S = Q @ K^T  → biggest compute bottleneck
-//   - WMMA for O += P @ V   → second biggest compute bottleneck
-//   - P stored in shared memory (float) for softmax, converted to half for WMMA
-//   - Br = NUM_THREADS → 100% thread utilization during softmax
-//   - 1 thread = 1 Q row for softmax and per-row O accumulation
+//   - WMMA for S = Q @ K^T and O += P @ V
+//   - 1 thread = 1 Q row (Br = threads) for the softmax and the O accumulation;
+//     each thread reads its S row (float) and writes its P row (half) with
+//     128-bit accesses on padded rows (bank-conflict free)
+//   - one block body (volta_fwd_block) shared by the batched and varlen kernels
 //
 // Architecture guard:
 //   WMMA requires SM >= 7.0. This file is compiled for SM 6.x too
@@ -19,6 +19,7 @@
 #include "flash_attn_common.h"
 
 #include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
+#include <cstring>
 
 #include <string>
 
@@ -72,460 +73,313 @@ __device__ __forceinline__ void volta_load_tile(
 // WMMA matmul: C[M,N] = A[M,K] * B^T[N,K]
 // A is [M, K_DIM] row-major in shared, B is [N, K_DIM] row-major in shared.
 // We want A * B^T, so load B as col_major (which transposes it).
-// Result stored to smem_C [M, N] as float.
+// Result stored to smem_C [M, N] as float with row stride LDC.
 // All warps cooperate to cover all 16×16 output tiles.
 // ---------------------------------------------------------------------------
-template <int M, int N, int K_DIM, int NUM_WARPS>
+template <int M, int N, int K_DIM, int NUM_WARPS, int LDC>
 __device__ __forceinline__ void wmma_gemm_ABt(
     const half* __restrict__ smem_A,   // [M, K_DIM]
     const half* __restrict__ smem_B,   // [N, K_DIM]
-    float*      __restrict__ smem_C,   // [M, N]
+    float*      __restrict__ smem_C,   // [M, N], row stride LDC
     int warp_id
 ) {
-    constexpr int TILE_M = 16;
-    constexpr int TILE_N = 16;
-    constexpr int TILE_K = 16;
-    constexpr int ntiles_m = M / TILE_M;
-    constexpr int ntiles_n = N / TILE_N;
-    constexpr int total_tiles = ntiles_m * ntiles_n;
+    constexpr int T = 16;
+    constexpr int ntiles_n = N / T;
+    constexpr int total_tiles = (M / T) * ntiles_n;
     constexpr int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;
 
     #pragma unroll
     for (int t = 0; t < tiles_per_warp; t++) {
         int tile_idx = warp_id + t * NUM_WARPS;
         if (tile_idx >= total_tiles) break;
-
         int tm = tile_idx / ntiles_n;
         int tn = tile_idx % ntiles_n;
 
-        wmma::fragment<wmma::matrix_a, TILE_M, TILE_N, TILE_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, TILE_M, TILE_N, TILE_K, half, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, TILE_M, TILE_N, TILE_K, float> c_frag;
+        wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, T, T, T, float> c_frag;
         wmma::fill_fragment(c_frag, 0.0f);
-
-        // Accumulate over K dimension
         #pragma unroll
-        for (int k = 0; k < K_DIM; k += TILE_K) {
-            wmma::load_matrix_sync(a_frag, smem_A + tm * TILE_M * K_DIM + k, K_DIM);
-            wmma::load_matrix_sync(b_frag, smem_B + tn * TILE_N * K_DIM + k, K_DIM);
+        for (int k = 0; k < K_DIM; k += T) {
+            wmma::load_matrix_sync(a_frag, smem_A + tm * T * K_DIM + k, K_DIM);
+            wmma::load_matrix_sync(b_frag, smem_B + tn * T * K_DIM + k, K_DIM);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
-
-        wmma::store_matrix_sync(smem_C + tm * TILE_M * N + tn * TILE_N, c_frag, N, wmma::mem_row_major);
+        wmma::store_matrix_sync(smem_C + tm * T * LDC + tn * T, c_frag, LDC, wmma::mem_row_major);
     }
 }
 
 // ---------------------------------------------------------------------------
 // WMMA matmul: C[M,N_OUT] = A[M,K] * B[K,N_OUT]  (NOT transposed)
-// A is [M, K_DIM] row-major (stride K_DIM) in shared mem.
+// A is [M, K_DIM] row-major (row stride LDA) in shared mem.
 // B is [K_DIM, N_FULL] row-major (stride B_stride) in shared mem;
 //   pointer is pre-offset to the desired column chunk.
-// Result stored to smem_C [M, N_OUT] as float (stride N_OUT).
-// All warps cooperate to cover all 16×16 output tiles.
+// Result stored to smem_C [M, N_OUT] as float (row stride LDC).
 // ---------------------------------------------------------------------------
-template <int M, int N_OUT, int K_DIM, int NUM_WARPS>
+template <int M, int N_OUT, int K_DIM, int NUM_WARPS, int LDA, int LDC>
 __device__ __forceinline__ void wmma_gemm_AB(
-    const half* __restrict__ smem_A,   // [M, K_DIM] row-major, stride K_DIM
-    const half* __restrict__ smem_B,   // [K_DIM, ...] row-major, stride B_stride, pre-offset
-    int B_stride,                       // leading dim of B (= full N_FULL, e.g. head_dim)
-    float*      __restrict__ smem_C,   // [M, N_OUT] output, stride N_OUT
+    const half* __restrict__ smem_A,
+    const half* __restrict__ smem_B,
+    int B_stride,
+    float*      __restrict__ smem_C,
     int warp_id
 ) {
-    constexpr int TILE_M = 16;
-    constexpr int TILE_N = 16;
-    constexpr int TILE_K = 16;
-    constexpr int ntiles_m = M / TILE_M;
-    constexpr int ntiles_n = N_OUT / TILE_N;
-    constexpr int total_tiles = ntiles_m * ntiles_n;
+    constexpr int T = 16;
+    constexpr int ntiles_n = N_OUT / T;
+    constexpr int total_tiles = (M / T) * ntiles_n;
     constexpr int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;
 
     #pragma unroll
     for (int t = 0; t < tiles_per_warp; t++) {
         int tile_idx = warp_id + t * NUM_WARPS;
         if (tile_idx >= total_tiles) break;
-
         int tm = tile_idx / ntiles_n;
         int tn = tile_idx % ntiles_n;
 
-        wmma::fragment<wmma::matrix_a, TILE_M, TILE_N, TILE_K, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, TILE_M, TILE_N, TILE_K, half, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, TILE_M, TILE_N, TILE_K, float> c_frag;
+        wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, T, T, T, float> c_frag;
         wmma::fill_fragment(c_frag, 0.0f);
-
-        // Accumulate over K dimension
         #pragma unroll
-        for (int k = 0; k < K_DIM; k += TILE_K) {
-            // A tile: rows [tm*16, tm*16+16), cols [k, k+16)
-            wmma::load_matrix_sync(a_frag, smem_A + tm * TILE_M * K_DIM + k, K_DIM);
-            // B tile: rows [k, k+16), cols [tn*16, tn*16+16) of the chunk
-            // smem_B is pre-offset, stride = B_stride (full width of V)
-            wmma::load_matrix_sync(b_frag, smem_B + k * B_stride + tn * TILE_N, B_stride);
+        for (int k = 0; k < K_DIM; k += T) {
+            wmma::load_matrix_sync(a_frag, smem_A + tm * T * LDA + k, LDA);
+            wmma::load_matrix_sync(b_frag, smem_B + k * B_stride + tn * T, B_stride);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
-
-        wmma::store_matrix_sync(smem_C + tm * TILE_M * N_OUT + tn * TILE_N, c_frag, N_OUT, wmma::mem_row_major);
+        wmma::store_matrix_sync(smem_C + tm * T * LDC + tn * T, c_frag, LDC, wmma::mem_row_major);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Forward kernel — Volta
+// One Q block of the WMMA forward, shared by the batched and varlen kernels
+// (they only differ in how they locate Q/K/V/O and where they write L).
+//
+// Shared memory (Tile::smem_bytes()):
+//   smem_Q [Br, d] half, smem_K [Bc, d] half, smem_V [Bc, d] half
+//   smem_S [Br, LDS] float  — S, then reused for the P@V chunks (LDS = Bc + 4)
+//   smem_P [Br, LDP] half   — P for the P@V WMMA (LDP = Bc + 8)
+// Each thread owns one Q row and reads/writes its row of S/P/PV with 128-bit
+// accesses. The padded row strides make those accesses bank-conflict free (a
+// quarter-warp reads 8 rows that start in 8 different 4-bank groups); without
+// padding all 32 threads of a warp hit the same bank (docs/PLAN.md §1b).
+// Returns the row's logsumexp (only meaningful for threads that own a row).
 // ---------------------------------------------------------------------------
 template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_fwd_volta_kernel(FlashAttnParams params) {
-
+__device__ __forceinline__ float volta_fwd_block(
+    const half* __restrict__ Q_ptr, int q_stride,
+    const half* __restrict__ K_ptr, int k_stride,
+    const half* __restrict__ V_ptr, int v_stride,
+    half* __restrict__ O_ptr, int o_stride,
+    int q_row_start, int valid_q, int seq_len_q, int seq_len_k,
+    float softmax_scale, bool is_causal
+) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int d  = Tile::d;
     constexpr int NUM_THREADS = Tile::kNumWarps * 32;
     constexpr int NUM_WARPS = Tile::kNumWarps;
+    constexpr int LDS = Tile::kLdS;
+    constexpr int LDP = Tile::kLdP;
+    constexpr int PV_CHUNK = Bc;  // P@V output in d/Bc chunks of Bc columns
+    static_assert(Bc % 8 == 0, "128-bit row accesses need Bc % 8 == 0");
 
-    // P@V output chunk size: process d in chunks of Bc columns.
-    // smem_PV reuses smem_S space, both are [Br, Bc] in their respective types.
-    // d/Bc passes (Bc = 16: d=64 -> 4, d=128 -> 8).
-    constexpr int PV_CHUNK = Bc;
-
-    const int bh_idx = blockIdx.y;
-    const int b_idx = bh_idx / params.num_heads;
-    const int h_idx = bh_idx % params.num_heads;
-    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
-    const int seq_len_q = params.seq_len_q;
-    const int seq_len_k = params.seq_len_k;
-    const int causal_off = seq_len_k - seq_len_q;
-    const int q_row_start = blockIdx.x * Br;
-    if (q_row_start >= seq_len_q) return;
-
-    const int valid_q = min(Br, seq_len_q - q_row_start);
-
-    // Base pointers
-    const half* Q_ptr = params.Q + b_idx * params.q_batch_stride
-                                 + h_idx * params.q_head_stride
-                                 + q_row_start * params.q_seq_stride;
-    const half* K_ptr = params.K + b_idx * params.k_batch_stride
-                                 + kv_h_idx * params.k_head_stride;
-    const half* V_ptr = params.V + b_idx * params.v_batch_stride
-                                 + kv_h_idx * params.v_head_stride;
-    half* O_ptr = params.O + b_idx * params.o_batch_stride
-                           + h_idx * params.o_head_stride
-                           + q_row_start * params.o_seq_stride;
-    float* L_ptr = params.L + b_idx * params.l_batch_stride
-                            + h_idx * params.l_head_stride
-                            + q_row_start;
-
-    // Shared memory layout:
-    //   smem_Q:  [Br, d]  half
-    //   smem_K:  [Bc, d]  half
-    //   smem_V:  [Bc, d]  half
-    //   smem_S:  [Br, Bc] float  (also reused as smem_PV after P→half conversion)
-    //   smem_P:  [Br, Bc] half   (P converted to half for WMMA P@V)
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
     half*  smem_K = smem_Q + Br * d;
     half*  smem_V = smem_K + Bc * d;
     float* smem_S = reinterpret_cast<float*>(smem_V + Bc * d);
-    half*  smem_P = reinterpret_cast<half*>(smem_S + Br * Bc);
-    // smem_PV overlaps smem_S — safe because smem_S is free after P conversion
-    float* smem_PV = smem_S;
+    half*  smem_P = reinterpret_cast<half*>(smem_S + Br * LDS);
+    float* smem_PV = smem_S;  // free once P is written
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const bool owns_row = (tid < Br) && (tid < valid_q);
+    const int causal_off = seq_len_k - seq_len_q;
 
-    // Per-row state
     float row_max = -INFINITY;
     float row_sum = 0.0f;
     float my_O[d];
     #pragma unroll
     for (int j = 0; j < d; j++) my_O[j] = 0.0f;
 
-    // Load Q
-    volta_load_tile<Br, d, NUM_THREADS>(Q_ptr, params.q_seq_stride, smem_Q, valid_q);
+    volta_load_tile<Br, d, NUM_THREADS>(Q_ptr, q_stride, smem_Q, valid_q);
     __syncthreads();
 
-    // Main loop
-    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
-
+    const int kv_limit = fwd_kv_limit(is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
     for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
         const int kv_start = kv_blk * Bc;
         const int valid_kv = min(Bc, seq_len_k - kv_start);
 
-        // Load K
-        volta_load_tile<Bc, d, NUM_THREADS>(
-            K_ptr + kv_start * params.k_seq_stride,
-            params.k_seq_stride, smem_K, valid_kv);
+        volta_load_tile<Bc, d, NUM_THREADS>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
         __syncthreads();
 
-        // S = Q @ K^T via WMMA (all warps cooperate)
-        wmma_gemm_ABt<Br, Bc, d, NUM_WARPS>(smem_Q, smem_K, smem_S, warp_id);
+        // S = Q @ K^T (tensor cores, all warps)
+        wmma_gemm_ABt<Br, Bc, d, NUM_WARPS, LDS>(smem_Q, smem_K, smem_S, warp_id);
         __syncthreads();
 
-        // Softmax: scale, mask, online update → P stored in smem_S as float
+        // Softmax of the own row (online update), P written straight as half
         if (owns_row) {
+            float sv[Bc];
+            const float4* s4 = reinterpret_cast<const float4*>(smem_S + tid * LDS);
+            #pragma unroll
+            for (int c4 = 0; c4 < Bc / 4; c4++) {
+                const float4 v = s4[c4];
+                sv[4 * c4] = v.x; sv[4 * c4 + 1] = v.y; sv[4 * c4 + 2] = v.z; sv[4 * c4 + 3] = v.w;
+            }
             float local_max = -INFINITY;
-
             #pragma unroll
             for (int c = 0; c < Bc; c++) {
-                float s = smem_S[tid * Bc + c] * params.softmax_scale;
+                float s = sv[c] * softmax_scale;
                 if ((kv_start + c) >= seq_len_k ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
+                    (is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
                     s = -INFINITY;
                 }
-                smem_S[tid * Bc + c] = s;
+                sv[c] = s;
                 local_max = fmaxf(local_max, s);
             }
 
-            float new_max = fmaxf(row_max, local_max);
+            const float new_max = fmaxf(row_max, local_max);
             // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
-            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
+            const float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
             row_max = new_max;
             row_sum *= rescale;
             #pragma unroll
             for (int j = 0; j < d; j++) my_O[j] *= rescale;
 
             float local_sum = 0.0f;
+            uint4* p_dst = reinterpret_cast<uint4*>(smem_P + tid * LDP);
             #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s = smem_S[tid * Bc + c];
-                float p = (s == -INFINITY) ? 0.0f : expf(s - new_max);
-                smem_S[tid * Bc + c] = p;
-                local_sum += p;
+            for (int c8 = 0; c8 < Bc / 8; c8++) {
+                half2 h[4];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const float s0 = sv[8 * c8 + 2 * i], s1 = sv[8 * c8 + 2 * i + 1];
+                    const float p0 = (s0 == -INFINITY) ? 0.0f : expf(s0 - new_max);
+                    const float p1 = (s1 == -INFINITY) ? 0.0f : expf(s1 - new_max);
+                    local_sum += p0 + p1;
+                    h[i] = __floats2half2_rn(p0, p1);
+                }
+                uint4 packed;
+                memcpy(&packed, h, sizeof(packed));
+                p_dst[c8] = packed;
             }
             row_sum += local_sum;
         }
+
+        volta_load_tile<Bc, d, NUM_THREADS>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
         __syncthreads();
 
-        // Load V
-        volta_load_tile<Bc, d, NUM_THREADS>(
-            V_ptr + kv_start * params.v_seq_stride,
-            params.v_seq_stride, smem_V, valid_kv);
-
-        // Convert P from float (smem_S) to half (smem_P) for WMMA
-        {
-            constexpr int total_P = Br * Bc;
-            #pragma unroll
-            for (int idx = tid; idx < total_P; idx += NUM_THREADS) {
-                smem_P[idx] = __float2half(smem_S[idx]);
-            }
-        }
-        __syncthreads();
-
-        // O += P @ V via WMMA
-        // Process d in chunks of PV_CHUNK columns.
-        // smem_PV (= smem_S, now free) holds the [Br, PV_CHUNK] float output.
+        // O += P @ V (tensor cores) in chunks of PV_CHUNK columns, via smem_PV
         #pragma unroll
         for (int dn = 0; dn < d; dn += PV_CHUNK) {
-            wmma_gemm_AB<Br, PV_CHUNK, Bc, NUM_WARPS>(
-                smem_P,              // A = P [Br, Bc] half
-                smem_V + dn,         // B = V[:, dn:dn+PV_CHUNK], stride = d
-                d,                   // B stride (full head_dim)
-                smem_PV,             // C = output [Br, PV_CHUNK] float
-                warp_id
-            );
+            wmma_gemm_AB<Br, PV_CHUNK, Bc, NUM_WARPS, LDP, LDS>(smem_P, smem_V + dn, d, smem_PV, warp_id);
             __syncthreads();
-
-            // Each thread accumulates its row from the WMMA output
             if (owns_row) {
+                const float4* pv4 = reinterpret_cast<const float4*>(smem_PV + tid * LDS);
                 #pragma unroll
-                for (int j = 0; j < PV_CHUNK; j++) {
-                    my_O[dn + j] += smem_PV[tid * PV_CHUNK + j];
+                for (int j4 = 0; j4 < PV_CHUNK / 4; j4++) {
+                    const float4 v = pv4[j4];
+                    my_O[dn + 4 * j4]     += v.x;
+                    my_O[dn + 4 * j4 + 1] += v.y;
+                    my_O[dn + 4 * j4 + 2] += v.z;
+                    my_O[dn + 4 * j4 + 3] += v.w;
                 }
             }
-            __syncthreads();
+            // Before the next chunk overwrites smem_PV. After the last chunk the
+            // barrier following the next K load orders these reads before the
+            // next S store into the same buffer.
+            if (dn + PV_CHUNK < d) __syncthreads();
         }
     }
 
-    // Finalize
+    // Finalize: normalised O row, logsumexp
     if (owns_row) {
-        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * params.o_seq_stride);
-        constexpr int d2 = d / 2;
+        const float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * o_stride);
         #pragma unroll
-        for (int j = 0; j < d2; j++) {
-            half2 val;
-            val.x = __float2half(my_O[j * 2] * inv_sum);
-            val.y = __float2half(my_O[j * 2 + 1] * inv_sum);
-            o_dst2[j] = val;
+        for (int j = 0; j < d / 2; j++) {
+            o_dst2[j] = __floats2half2_rn(my_O[2 * j] * inv_sum, my_O[2 * j + 1] * inv_sum);
         }
-        L_ptr[tid] = row_max + logf(fmaxf(row_sum, 1e-20f));
+    }
+    return row_max + logf(fmaxf(row_sum, 1e-20f));
+}
+
+// ---------------------------------------------------------------------------
+// Forward kernel — WMMA (Volta / Turing), batched [B, H, N, d]
+// ---------------------------------------------------------------------------
+template <typename Tile>
+__global__ void __launch_bounds__(Tile::kNumWarps * 32)
+flash_attn_fwd_volta_kernel(FlashAttnParams params) {
+    constexpr int Br = Tile::Br;
+    const int bh_idx = blockIdx.y;
+    const int b_idx = bh_idx / params.num_heads;
+    const int h_idx = bh_idx % params.num_heads;
+    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
+    const int q_row_start = blockIdx.x * Br;
+    if (q_row_start >= params.seq_len_q) return;
+    const int valid_q = min(Br, params.seq_len_q - q_row_start);
+
+    const float lse = volta_fwd_block<Tile>(
+        params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
+                 + q_row_start * params.q_seq_stride, params.q_seq_stride,
+        params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride, params.k_seq_stride,
+        params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride, params.v_seq_stride,
+        params.O + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
+                 + q_row_start * params.o_seq_stride, params.o_seq_stride,
+        q_row_start, valid_q, params.seq_len_q, params.seq_len_k,
+        params.softmax_scale, params.is_causal);
+
+    const int tid = threadIdx.x;
+    if (tid < valid_q) {
+        params.L[b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_row_start + tid] = lse;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Forward kernel — Volta — Variable-length (packed sequences)
+// Forward kernel — WMMA (Volta / Turing), varlen (packed [total, H, d])
 // ---------------------------------------------------------------------------
 template <typename Tile>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
-
     constexpr int Br = Tile::Br;
-    constexpr int Bc = Tile::Bc;
-    constexpr int d  = Tile::d;
-    constexpr int NUM_THREADS = Tile::kNumWarps * 32;
-    constexpr int NUM_WARPS = Tile::kNumWarps;
-    constexpr int PV_CHUNK = Bc;
-
     const int h_idx = blockIdx.y;
     const int block_x = blockIdx.x;
 
     // Binary search: find which sequence this block belongs to
-    int seq_idx = 0;
-    {
-        int lo = 0, hi = params.num_seqs;
-        while (lo < hi) {
-            int mid = (lo + hi) / 2;
-            if (params.block_offsets[mid + 1] <= block_x)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        seq_idx = lo;
+    int lo = 0, hi = params.num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (params.block_offsets[mid + 1] <= block_x) lo = mid + 1;
+        else hi = mid;
     }
+    const int seq_idx = lo;
 
     const int local_block = block_x - params.block_offsets[seq_idx];
     const int q_start_tok = params.cu_seqlens_q[seq_idx];
     const int k_start_tok = params.cu_seqlens_k[seq_idx];
     const int seq_len_q = params.cu_seqlens_q[seq_idx + 1] - q_start_tok;
     const int seq_len_k = params.cu_seqlens_k[seq_idx + 1] - k_start_tok;
-    const int causal_off = seq_len_k - seq_len_q;
-
     const int q_row_start = local_block * Br;
     if (q_row_start >= seq_len_q) return;
     const int valid_q = min(Br, seq_len_q - q_row_start);
-
     const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
 
-    // Pointers into packed [total, H, d] tensors
-    const half* Q_ptr = params.Q + (q_start_tok + q_row_start) * params.q_token_stride
-                                 + h_idx * params.q_head_stride;
-    const half* K_ptr = params.K + k_start_tok * params.k_token_stride
-                                 + kv_h_idx * params.k_head_stride;
-    const half* V_ptr = params.V + k_start_tok * params.v_token_stride
-                                 + kv_h_idx * params.v_head_stride;
-    half* O_ptr = params.O + (q_start_tok + q_row_start) * params.o_token_stride
-                           + h_idx * params.o_head_stride;
-
-    // Shared memory layout (same as batched kernel)
-    extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
-    half*  smem_Q = reinterpret_cast<half*>(smem_raw);
-    half*  smem_K = smem_Q + Br * d;
-    half*  smem_V = smem_K + Bc * d;
-    float* smem_S = reinterpret_cast<float*>(smem_V + Bc * d);
-    half*  smem_P = reinterpret_cast<half*>(smem_S + Br * Bc);
-    float* smem_PV = smem_S;
+    const float lse = volta_fwd_block<Tile>(
+        params.Q + (q_start_tok + q_row_start) * params.q_token_stride + h_idx * params.q_head_stride,
+        params.q_token_stride,
+        params.K + k_start_tok * params.k_token_stride + kv_h_idx * params.k_head_stride,
+        params.k_token_stride,
+        params.V + k_start_tok * params.v_token_stride + kv_h_idx * params.v_head_stride,
+        params.v_token_stride,
+        params.O + (q_start_tok + q_row_start) * params.o_token_stride + h_idx * params.o_head_stride,
+        params.o_token_stride,
+        q_row_start, valid_q, seq_len_q, seq_len_k,
+        params.softmax_scale, params.is_causal);
 
     const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const bool owns_row = (tid < Br) && (tid < valid_q);
-
-    float row_max = -INFINITY;
-    float row_sum = 0.0f;
-    float my_O[d];
-    #pragma unroll
-    for (int j = 0; j < d; j++) my_O[j] = 0.0f;
-
-    // Load Q — stride is token_stride (H*d between consecutive tokens)
-    volta_load_tile<Br, d, NUM_THREADS>(Q_ptr, params.q_token_stride, smem_Q, valid_q);
-    __syncthreads();
-
-    // Main loop over K/V blocks (within this sequence)
-    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
-
-    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
-        const int kv_start = kv_blk * Bc;
-        const int valid_kv = min(Bc, seq_len_k - kv_start);
-
-        // Load K
-        volta_load_tile<Bc, d, NUM_THREADS>(
-            K_ptr + kv_start * params.k_token_stride,
-            params.k_token_stride, smem_K, valid_kv);
-        __syncthreads();
-
-        // S = Q @ K^T via WMMA
-        wmma_gemm_ABt<Br, Bc, d, NUM_WARPS>(smem_Q, smem_K, smem_S, warp_id);
-        __syncthreads();
-
-        // Softmax
-        if (owns_row) {
-            float local_max = -INFINITY;
-
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s = smem_S[tid * Bc + c] * params.softmax_scale;
-                if ((kv_start + c) >= seq_len_k ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
-                    s = -INFINITY;
-                }
-                smem_S[tid * Bc + c] = s;
-                local_max = fmaxf(local_max, s);
-            }
-
-            float new_max = fmaxf(row_max, local_max);
-            // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
-            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
-            row_max = new_max;
-            row_sum *= rescale;
-            #pragma unroll
-            for (int j = 0; j < d; j++) my_O[j] *= rescale;
-
-            float local_sum = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s = smem_S[tid * Bc + c];
-                float p = (s == -INFINITY) ? 0.0f : expf(s - new_max);
-                smem_S[tid * Bc + c] = p;
-                local_sum += p;
-            }
-            row_sum += local_sum;
-        }
-        __syncthreads();
-
-        // Load V
-        volta_load_tile<Bc, d, NUM_THREADS>(
-            V_ptr + kv_start * params.v_token_stride,
-            params.v_token_stride, smem_V, valid_kv);
-
-        // Convert P float → half for WMMA
-        {
-            constexpr int total_P = Br * Bc;
-            #pragma unroll
-            for (int idx = tid; idx < total_P; idx += NUM_THREADS) {
-                smem_P[idx] = __float2half(smem_S[idx]);
-            }
-        }
-        __syncthreads();
-
-        // O += P @ V via WMMA
-        #pragma unroll
-        for (int dn = 0; dn < d; dn += PV_CHUNK) {
-            wmma_gemm_AB<Br, PV_CHUNK, Bc, NUM_WARPS>(
-                smem_P, smem_V + dn, d, smem_PV, warp_id);
-            __syncthreads();
-
-            if (owns_row) {
-                #pragma unroll
-                for (int j = 0; j < PV_CHUNK; j++) {
-                    my_O[dn + j] += smem_PV[tid * PV_CHUNK + j];
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    // Finalize — write O and L with packed strides
-    if (owns_row) {
-        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * params.o_token_stride);
-        constexpr int d2 = d / 2;
-        #pragma unroll
-        for (int j = 0; j < d2; j++) {
-            half2 val;
-            val.x = __float2half(my_O[j * 2] * inv_sum);
-            val.y = __float2half(my_O[j * 2 + 1] * inv_sum);
-            o_dst2[j] = val;
-        }
-        // L is [total_q, H_q] — stride between tokens is num_heads
-        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] =
-            row_max + logf(fmaxf(row_sum, 1e-20f));
+    if (tid < valid_q) {
+        // L is [total_q, H_q]: stride between tokens is num_heads
+        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] = lse;
     }
 }
 

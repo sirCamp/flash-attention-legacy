@@ -62,12 +62,19 @@ Dimensioni: **S** = qualche ora, **M** = 1–3 giorni, **L** = più di 3 giorni.
 
 Il forward è corretto ma **da circa 6× a 10× più lento di SDPA memory-efficient** di PyTorch, su tutte le architetture (anche dopo le tile Bc=16 di P2.3). I benchmark del README lo mostrano "più veloce" perché confrontano con eager, che materializza la matrice N×N.
 
-| Forward causale, B=2, H=16, N=4096 | nostro (tile iniziali) | nostro (Bc=16, P2.3) | SDPA |
-|---|---|---|---|
-| V100, d=64 | 22.1 ms | 13.4 ms | 2.34 ms |
-| V100, d=128 | 33.0 ms | 29.0 ms | 3.74 ms |
-| T4, d=64 | 53.6 ms | 37.4 ms | 4.59 ms |
-| T4, d=128 | 64.6 ms | 64.5 ms | 10.4 ms |
+| Forward causale, B=2, H=16, N=4096 | nostro (tile iniziali) | nostro (Bc=16, P2.3) | nostro (padding, P5.3) | SDPA |
+|---|---|---|---|---|
+| V100, d=64 | 22.1 ms | 13.4 ms | **10.1 ms** | 2.34 ms |
+| V100, d=128 | 33.0 ms | 29.0 ms | **24.3 ms** | 3.74 ms |
+| T4, d=64 | 53.6 ms | 37.4 ms | **26.1 ms** | 4.59 ms |
+| T4, d=128 | 64.6 ms | 64.5 ms | **48.8 ms** | 10.4 ms |
+| P100, d=64 | 68.1 ms | — | **30.9 ms** | 15.7 ms |
+| P100, d=128 | 127 ms | — | **121 ms** | 28.9 ms |
+| GTX 1080 Ti, d=64 (H=8) | 151 ms | — | **40.8 ms** | — |
+
+Dopo P5.3 (Nsight Compute, T4, d=64): conflitti di banco in lettura da 389 milioni a **0**, forward da 37.4 a 26.1 ms. Restano occupancy al 12.5% (1 blocco per SM) e stalli su shared memory e barriere: è il limite del disegno "un thread per riga", oggetto di P2.8.
+
+**Backward Pascal**: sulla 1080 Ti e sulla P100, d=128 a 4096 token richiede da 3.1 a 3.8 s contro circa 0.1 s di forward (`atomicAdd` per elemento di dQ, voce P5.2). Diventa la priorità su Pascal.
 
 Nsight Compute sulla T4 (d=64, N=4096):
 - tensor core attivi il **2.1%** del picco;
@@ -162,7 +169,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 |---|---|---|---|
 | P5.1 | Percorso FP32 per sm_61. **In parte anticipato in P0.5**: il prodotto Q·K del forward Pascal è in FP32 (FFMA), 2.3–2.9× più veloce sulla 1080 Ti. Resta: K/V in FP32 in shared memory (meno conversioni), P@V, scelta a runtime per sm_60 vs sm_61, misurata anche su P100 | M | 1080 Ti e P100: forward misurato prima e dopo con l'harness |
 | P5.2 | Backward CUDA-core: fette di colonne di dK/dV e dQ ridotto in shared memory. In alternativa, un kernel dQ separato che risolve insieme le atomic Pascal e il determinismo (P6.3) [R15] | M | 1080 Ti: backward misurato; niente spill a d≤128 |
-| P5.3 | **Anticipata come prossimo passo (2026-10-21)**: padding delle righe in shared memory (+4 float / +8 half) e accessi vettoriali a 128 bit nei loop per riga, su Volta, Turing e Pascal: elimina i conflitti di banco misurati in §1b. | S | Nsight Compute: conflitti di banco da circa 92% a circa 0%; tempi prima e dopo su T4, V100 e 1080 Ti. |
+| P5.3 | **Fatto (branch p2-turing)**: forward WMMA con righe di S/P padded (+4 float / +8 half) e accessi a 128 bit per riga, softmax che scrive P direttamente in half; forward CUDA-core con Q padded (+8 half), prodotto scalare a 128 bit e P nei registri (niente buffer P). Corpo del blocco condiviso tra kernel batched e varlen (`volta_fwd_block`, `pascal_fwd_block`, anticipo di P2.1). Br=64 provato: differenze del ±10% di segno opposto tra GPU, tenuto Br=128. | S | Fatto: conflitti in lettura a 0 (Nsight, T4); tempi in §1b. |
 
 ### P6 — Estensioni (da prioritizzare)
 
