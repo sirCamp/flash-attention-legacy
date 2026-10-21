@@ -61,7 +61,8 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
     "decode": FallbackReason("q_len == 1 (decode)", expected=True),
     "attention_mask": FallbackReason(
-        "explicit attention mask (padding, sliding window, packing, ...)", expected=True),
+        "explicit attention mask (sliding window, padding inside a sequence, custom masks, ...)",
+        expected=True),
     "q_longer_than_kv": FallbackReason("q_len > kv_len"),
     "head_dim": FallbackReason(f"head_dim not in {SUPPORTED_HEAD_DIMS}"),
     "v_head_dim": FallbackReason("V head_dim != Q head_dim (e.g. MLA)"),
@@ -239,26 +240,36 @@ def _eager_attention(query, key, value, mask, scaling, dropout_p, softcap=None,
     return out.reshape(B, H, q_len, d_v)
 
 
-# Segments derived from a cu_seq_lens / position_ids tensor are cached on that
-# tensor: transformers passes the same object to every layer, so the host sync
-# needed to read them happens once per forward, not once per layer. The key
-# includes the tensor version (bumped by every in-place write, e.g. a reused
-# buffer) and the device; a copy, or an inference-mode tensor (no version
-# counter), simply recomputes. The attribute is a fast path, never needed for
+# Segments derived from a cu_seq_lens / position_ids tensor, and unpadding plans
+# derived from a padding mask, are cached on that tensor: transformers passes
+# the same object to every layer, so the host sync needed to read them happens
+# once per forward, not once per layer. The key includes the tensor version
+# (bumped by every in-place write, e.g. a reused buffer) and the device. An
+# inference-mode tensor has no version counter: it is cached only when it is a
+# padding mask made by our own mask builder (_PADDING_ATTR: a fresh copy on every
+# builder call, never written), else recomputed. The attribute is a fast path, never needed for
 # correctness.
 _SEGMENTS_ATTR = "_flash_attn_legacy_segments"
+_UNPAD_ATTR = "_flash_attn_legacy_unpad"
+# Set by _flash_attn_legacy_mask on the 2D padding masks it returns (they do
+# contain padding: no per-layer check needed).
+_PADDING_ATTR = "_flash_attn_legacy_padding"
 
 
-def _cached_segments(source, q_len, device, compute):
+def _cached_segments(source, q_len, device, compute, attr=_SEGMENTS_ATTR):
     if source.is_inference():
-        return compute()  # inference tensors have no version counter: no caching
-    key = (q_len, source._version, device)
-    cached = getattr(source, _SEGMENTS_ATTR, None)
+        if not getattr(source, _PADDING_ATTR, False):
+            return compute()  # no version counter: no caching
+        version = 0  # our own padding mask: never modified
+    else:
+        version = source._version
+    key = (q_len, version, device)
+    cached = getattr(source, attr, None)
     if cached is not None and cached[0] == key:
         return cached[1]
     result = compute()
     try:
-        setattr(source, _SEGMENTS_ATTR, (key, result))
+        setattr(source, attr, (key, result))
     except (AttributeError, RuntimeError):
         pass
     return result
@@ -318,6 +329,49 @@ def _packed_segments(query, key, attention_mask, padding_2d, kwargs):
     return _cached_segments(position_ids, q_len, query.device, from_positions)
 
 
+def _unpad_plan(key_mask, q_len, causal, device):
+    """Native padding (docs/PLAN.md P3.1): rows of the flattened [B * n] batch for
+    the varlen kernel, as (q_idx, k_idx, cu_q, cu_k, max_q, max_k), or None when
+    the key padding of some row is not one contiguous block (fallback).
+
+    Keys: the valid slots of the [B, kv_len] key mask (True = keep). Queries:
+      - causal (self-attention only, the builder never gives a 2D mask
+        otherwise): the valid ones among the last q_len key slots — HF's layout
+        for prefill and chunked prefill; with contiguous key padding they end at
+        the last valid key, so per-sequence bottom-right causality is exact;
+      - bidirectional (encoders, cross-attention, whose queries are unrelated to
+        the key mask): every query row, so padded query rows attend the valid
+        keys exactly as in SDPA.
+    The plan's host sync happens once per mask tensor (cached on it); the varlen
+    kernel itself still validates cu_seqlens with a sync per call (P6.5)."""
+    def compute():
+        B, kv_len = key_mask.shape
+        kmask = key_mask.to(device=device, dtype=torch.bool)
+        pos = torch.arange(kv_len, device=device)
+        nk = kmask.sum(1)
+        first = torch.where(kmask, pos, kv_len).amin(1)
+        last = torch.where(kmask, pos, -1).amax(1)
+        qmask = kmask[:, kv_len - q_len:]
+        nq = qmask.sum(1)
+        n_k, f_k, l_k, n_q = torch.stack([nk, first, last, nq]).tolist()  # the host sync
+        if any(n and l - f + 1 != n for n, f, l in zip(n_k, f_k, l_k)):
+            return None  # padding inside a row
+
+        def cu(n):
+            return torch.nn.functional.pad(n.cumsum(0, dtype=torch.int32), (1, 0))
+        keys = (kmask.reshape(-1).nonzero().flatten(), cu(nk), max(max(n_k), 1))
+        causal_q = (qmask.reshape(-1).nonzero().flatten(), cu(nq), max(max(n_q), 1))
+        all_q = (torch.arange(B * q_len, device=device),
+                 torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=device), q_len)
+        return keys, causal_q, all_q
+
+    cached = _cached_segments(key_mask, q_len, device, compute, attr=_UNPAD_ATTR)
+    if cached is None:
+        return None
+    (k_idx, cu_k, max_k), (q_idx, cu_q, max_q) = cached[0], cached[1 if causal else 2]
+    return q_idx, k_idx, cu_q, cu_k, max_q, max_k
+
+
 def _segment_mask(cu_seqlens, n, causal, device) -> torch.Tensor:
     """[1, 1, n, n] boolean mask (True = keep) of a packing: tokens attend within
     their own segment only (and causally within it when `causal`)."""
@@ -343,7 +397,8 @@ def flash_attn_legacy_forward(
 
     Signature matches what ALL_ATTENTION_FUNCTIONS expects.
     Runs the flash_attn_legacy kernel when _kernel_fallback_reason allows it
-    (no mask, 1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
+    (no mask other than padding, packing or a static cache's valid prefix,
+    1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
     Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
     and the call runs on PyTorch SDPA, on _eager_attention (features SDPA would
     ignore: softcap, sinks, position_bias) or raises NotImplementedError.
@@ -355,6 +410,7 @@ def flash_attn_legacy_forward(
         key, value = key.to(query.dtype), value.to(query.dtype)
 
     padding_2d = False
+    key_mask_2d = None  # [B, kv] padding mask (True = keep) when padding_2d
     if attention_mask is not None and attention_mask.dim() == 2:
         # [B, n] mask (see _N_VALID_ATTR): keep the first n key slots only.
         n_valid = attention_mask.shape[-1]
@@ -362,11 +418,13 @@ def flash_attn_legacy_forward(
             raise RuntimeError(f"flash_attn_legacy: 2D mask covers {n_valid} keys, "
                                f"but only {key.shape[2]} keys were passed")
         key, value = key[:, :, :n_valid], value[:, :, :n_valid]
-        if getattr(attention_mask, _N_VALID_ATTR, None) == n_valid or bool(attention_mask.all()):
+        if getattr(attention_mask, _N_VALID_ATTR, None) == n_valid or (
+                not getattr(attention_mask, _PADDING_ATTR, False) and bool(attention_mask.all())):
             attention_mask = None  # no padding
         else:
-            # Padding (1 = keep): broadcastable boolean mask; causality is added in
-            # the fallback (native unpadding comes with docs/PLAN.md P3.1).
+            # Padding (1 = keep): unpadded onto the varlen kernel (_unpad_plan), or a
+            # broadcastable boolean mask for the fallbacks (causality added there).
+            key_mask_2d = attention_mask
             attention_mask = attention_mask[:, None, None, :].bool()
             padding_2d = True
 
@@ -393,10 +451,16 @@ def flash_attn_legacy_forward(
     segments = _packed_segments(query, key, attention_mask, padding_2d, kwargs)
 
     # The flash kernel knows "plain causal (bottom-right aligned) / no mask",
-    # including q_len < kv_len (chunked prefill with a KV cache). Everything
-    # else goes to SDPA, with the reason recorded in the fallback registry.
-    reason, detail = _kernel_fallback_reason(module, query, key, value, attention_mask,
-                                             dropout, kwargs)
+    # including q_len < kv_len (chunked prefill with a KV cache), and padding via
+    # unpadding onto the varlen kernel. Everything else goes to SDPA, with the
+    # reason recorded in the fallback registry.
+    reason, detail = _kernel_fallback_reason(module, query, key, value,
+                                             None if padding_2d else attention_mask, dropout, kwargs)
+    unpad = None
+    if reason is None and padding_2d:  # the plan's host sync only when the kernel can run
+        unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
+        if unpad is None:
+            reason, detail = "attention_mask", " (padding inside a sequence)"
 
     attn_output = None
     if reason is None:
@@ -405,7 +469,19 @@ def flash_attn_legacy_forward(
         from .flash_attn import FP16RangeError, flash_attention, flash_attn_varlen_func
 
         try:
-            if segments is None:
+            if unpad is not None:
+                # [B, H, n, d] -> rows [B * n, H, d] for the varlen kernel; query rows
+                # left out of the plan (causal padding) get 0 (index_copy keeps autograd)
+                q_idx, k_idx, cu_q, cu_k, max_q, max_k = unpad
+
+                def rows(t, idx):
+                    return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
+                out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
+                                             cu_q, cu_k, max_q, max_k,
+                                             softmax_scale=scaling, causal=is_causal)
+                attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
+                               .view(B, q_len, H_q, -1).transpose(1, 2))
+            elif segments is None:
                 attn_output = flash_attention(query, key, value,
                                               softmax_scale=scaling, causal=is_causal)
             else:
@@ -435,6 +511,11 @@ def flash_attn_legacy_forward(
             mask = mask[..., :kv_len]
             if padding_2d and is_causal and q_len > 1:
                 mask = mask & _causal_mask(q_len, kv_len, query.device)
+            if padding_2d:
+                # Query rows that see no key (left padding) attend everything instead,
+                # as HF's SDPA mask does: fully masked rows give NaN on torch < 2.5,
+                # and NaN in padded rows can reach valid ones in the next layer.
+                mask = mask | ~mask.any(-1, keepdim=True)
         elif is_causal and q_len == kv_len:
             causal_only = True  # no N x N mask materialised for SDPA
         elif is_causal and q_len > 1:
@@ -481,12 +562,14 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
                             **kwargs):
     """Mask builder for transformers' ALL_MASK_ATTENTION_FUNCTIONS.
 
-    For plain causal / bidirectional attention with no padding and no sliding
-    window (and when transformers allows skipping the mask) it returns:
+    For plain causal / bidirectional attention with no sliding window (and when
+    transformers allows skipping the mask) it returns:
       - None when every key slot is attended (-> kernel), or
       - causal only: a [batch, n_valid] mask tagged with _N_VALID_ATTR when only
         the first n_valid key slots hold tokens (pre-allocated static caches) ->
-        flash_attn_legacy_forward slices K/V to n_valid and runs the kernel.
+        flash_attn_legacy_forward slices K/V to n_valid and runs the kernel;
+      - with padding: the [batch, n_valid] padding mask (untagged) -> unpadded
+        onto the varlen kernel when the padding is contiguous per row.
     Anything else gets the SDPA builder's boolean 4D mask (-> SDPA fallback).
     The SDPA builder is always called with both skips disabled: an SDPA `None`
     means "slice K/V to q_len" (causal, top-left) or "no mask at all", which is
@@ -525,7 +608,15 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
     if attention_mask is not None:
         pad = attention_mask[:, kv_off:kv_off + n_valid]
         if not bool(pad.all()):
-            return sdpa_mask()  # padding
+            if pad.shape[-1] != n_valid:
+                return sdpa_mask()  # mask shorter than the key slots: SDPA's builder pads it
+            # Padding: a copy of the [batch, n_valid] mask (FA2's 2D convention),
+            # marked as padded -> unpadded onto the varlen kernel (_unpad_plan), or
+            # the fallback. Models that index the mask as 4D (e.g. Doge) do not
+            # follow this convention: see README "Known integration corner cases".
+            pad = pad.to(torch.bool, copy=True)
+            setattr(pad, _PADDING_ATTR, True)
+            return pad
     if n_valid == kv_length:
         return None
     device = kwargs.get("device", "cpu")

@@ -216,7 +216,6 @@ def flash_attn_varlen_func(
     concatenated along the token dimension and cu_seqlens marks the
     boundaries. This avoids wasting compute/memory on padding tokens.
 
-    Forward uses a native CUDA kernel (single launch for all sequences).
     Forward and backward each run as one kernel launch for all sequences.
 
     Args:

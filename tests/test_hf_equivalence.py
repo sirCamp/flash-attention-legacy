@@ -58,6 +58,11 @@ def model_and_tok(request):
 
 
 def _num_layers(model):
+    """Layers whose attention runs on the kernel: all of them, except sliding-window
+    layers (e.g. Gemma 3, 5 of every 6), which fall back until docs/PLAN.md P4.1."""
+    types = getattr(model.config, "layer_types", None)
+    if types:
+        return sum(t == "full_attention" for t in types)
     return model.config.num_hidden_layers
 
 
@@ -119,7 +124,8 @@ def test_greedy_generation_matches_sdpa(model_and_tok, monkeypatch):
 
 
 def test_left_padded_batch(model_and_tok, monkeypatch):
-    """Padded batches carry an attention_mask -> must match SDPA and the unpadded run."""
+    """Padded batches run unpadded on the varlen kernel -> must match SDPA and the
+    single-prompt run."""
     name, model, tok = model_and_tok
     counter = KernelCounter(monkeypatch)
     prompts = [PROMPT, "The capital of France is"]
@@ -132,8 +138,8 @@ def test_left_padded_batch(model_and_tok, monkeypatch):
     counter.reset()
     set_impl(model, "flash_attn_legacy")
     out = model.generate(**batch, **gen)
-    print(f"\n  [{name}] padded batch: kernel calls={len(counter.calls)} "
-          f"(shapes: {sorted(set(counter.calls))[:4]})")
+    print(f"\n  [{name}] padded batch: varlen (unpadded) kernel calls={len(counter.varlen_calls)}")
+    assert counter.varlen_calls, "the padded prefill must run unpadded on the kernel (P3.1)"
 
     L = batch.input_ids.shape[1]
     for i in range(len(prompts)):

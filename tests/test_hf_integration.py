@@ -90,15 +90,185 @@ def test_decode_reason():
     assert fallback_stats() == {"decode": 3 * base.config.num_hidden_layers}
 
 
-def test_attention_mask_reason():
-    base = tiny_llama()
-    model = load_impl(base, "flash_attn_legacy")
-    ids = torch.randint(0, base.config.vocab_size, (2, 24), device="cuda")
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
+    """P3.1: a padded batch is unpadded onto the varlen kernel in every layer;
+    logits of the real tokens within the noise of FP32 eager."""
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    ids = torch.randint(0, base.config.vocab_size, (3, 40), device="cuda")
     mask = torch.ones_like(ids)
-    mask[1, :10] = 0  # left padding on the second row
+    if side == "left":
+        mask[1, :10] = 0
+        mask[2, :25] = 0
+    else:
+        mask[1, 30:] = 0
+        mask[2, 12:] = 0
+
+    def run(impl, dtype=torch.float16):
+        with torch.no_grad():
+            return load_impl(base, impl, dtype)(input_ids=ids, attention_mask=mask).logits.float()
+
+    gold, noise = run("eager", torch.float32), run("eager")
+    counter = KernelCounter(monkeypatch)
+    out = run("flash_attn_legacy")
+    full_layers = sum(t == "full_attention" for t in getattr(
+        base.config, "layer_types", None) or ["full_attention"] * base.config.num_hidden_layers)
+    assert len(counter.varlen_calls) == full_layers
+    keep = mask.bool()
+    assert_close_to_gold(out[keep], gold[keep], noise[keep], f"{arch} {side} padding")
+
+
+@pytest.mark.parametrize("cache_implementation", ["dynamic", "static"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation):
+    """Batched generation with left padding: the prefill runs unpadded on the
+    kernel; every step's logits of every row within the noise of FP32 eager."""
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    ids = torch.randint(0, base.config.vocab_size, (2, 30), device="cuda")
+    mask = torch.ones_like(ids)
+    mask[0, :12] = 0
+    kw = dict(attention_mask=mask, max_new_tokens=8, min_new_tokens=8, do_sample=False,
+              return_dict_in_generate=True, output_logits=True, pad_token_id=0,
+              cache_implementation=cache_implementation, disable_compile=True)
+
+    def gen(impl, dtype=torch.float16):
+        return torch.stack(load_impl(base, impl, dtype).generate(ids, **kw).logits).float()
+
+    gold, noise = gen("eager", torch.float32), gen("eager")
+    counter = KernelCounter(monkeypatch)
+    out = gen("flash_attn_legacy")
+    assert counter.varlen_calls  # the padded prefill ran on the kernel
+    assert_close_to_gold(out, gold, noise, f"{arch} left-padded generate ({cache_implementation})")
+
+
+def test_cross_attention_with_padded_encoder(monkeypatch):
+    """Bidirectional 2D mask over the keys only (cross-attention: decoder queries
+    unrelated to the encoder padding): every decoder row must match SDPA."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 8, 64, device="cuda", dtype=torch.float16)  # 8 decoder tokens
+    k, v = (torch.randn(2, 4, 24, 64, device="cuda", dtype=torch.float16) for _ in range(2))
+    pad = torch.ones(2, 24, dtype=torch.bool, device="cuda")
+    pad[1, 15:] = False  # encoder padding on row 1
+    counter = KernelCounter(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, pad)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=pad[:, None, None, :])
+    assert len(counter.varlen_calls) == 1 and fallback_stats() == {}
+    torch.testing.assert_close(out.transpose(1, 2), ref, atol=2e-3, rtol=2e-3)
+
+
+def test_bart_padded_encoder_teacher_forcing(monkeypatch):
+    """Encoder-decoder (BART) with a padded encoder batch and q_len > 1 in the
+    decoder: encoder and cross-attention unpadded on the kernel, logits of every
+    decoder position within the noise of FP32 eager."""
+    from transformers import BartConfig, BartForConditionalGeneration
+
+    torch.manual_seed(0)
+    cfg = BartConfig(vocab_size=256, d_model=256, encoder_layers=2, decoder_layers=2,
+                     encoder_attention_heads=4, decoder_attention_heads=4,
+                     encoder_ffn_dim=512, decoder_ffn_dim=512, max_position_embeddings=128,
+                     init_std=0.1)
+    base = BartForConditionalGeneration(cfg).eval()
+    src = torch.randint(3, 256, (2, 30), device="cuda")
+    src_mask = torch.ones_like(src)
+    src_mask[1, 18:] = 0
+    tgt = torch.randint(3, 256, (2, 12), device="cuda")
+
+    def run(impl, dtype=torch.float16):
+        with torch.no_grad():
+            return load_impl(base, impl, dtype)(input_ids=src, attention_mask=src_mask,
+                                                decoder_input_ids=tgt).logits.float()
+
+    gold, noise = run("eager", torch.float32), run("eager")
+    counter = KernelCounter(monkeypatch)
+    out = run("flash_attn_legacy")
+    assert counter.varlen_calls  # encoder self-attention and cross-attention
+    assert_close_to_gold(out, gold, noise, "bart padded encoder")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_unpad_non_fp16_inference(monkeypatch, dtype):
+    """bf16 / fp32 padded inference: unpadded onto the kernel (fp16 compute)."""
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 4, 20, 64, device="cuda", dtype=dtype) for _ in range(3))
+    pad = torch.ones(2, 20, dtype=torch.bool, device="cuda")
+    pad[0, :7] = False
+    counter = KernelCounter(monkeypatch)
     with torch.no_grad():
-        model(input_ids=ids, attention_mask=mask)
-    assert fallback_stats() == {"attention_mask": base.config.num_hidden_layers}
+        out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad)
+    mask = pad[:, None, None, :] & torch.ones(20, 20, dtype=torch.bool, device="cuda").tril()
+    ref = torch.nan_to_num(torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float(), v.float(), attn_mask=mask)).transpose(1, 2)
+    assert len(counter.varlen_calls) == 1 and out.dtype == dtype
+    real = pad.clone()  # left padding: padded rows see no key
+    torch.testing.assert_close(out.float()[real], ref[real], atol=2e-2, rtol=2e-2)
+
+
+def test_unpad_fp16_overflow_falls_back_finite():
+    """fp32 padded inputs beyond the fp16 range: SDPA fallback with the padding and
+    causal mask; left-padded query rows (no visible key) stay finite."""
+    q, k, v = (torch.randn(2, 4, 16, 64, device="cuda", dtype=torch.float32) for _ in range(3))
+    v[0, 0, 10, 0] = 1e6
+    pad = torch.ones(2, 16, dtype=torch.bool, device="cuda")
+    pad[1, :5] = False
+    with torch.no_grad():
+        out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad)
+    assert fallback_stats() == {"fp16_overflow": 1}
+    assert torch.isfinite(out).all()
+
+
+def test_attention_mask_reason_for_holes():
+    """Padding that is not one contiguous block per row (rare) keeps the fallback."""
+    q, k, v = _qkv(q_len=16, kv_len=16)
+    q, k, v = (t.expand(2, -1, -1, -1).contiguous() for t in (q, k, v))
+    pad = torch.ones(2, 16, dtype=torch.bool, device="cuda")
+    pad[1, 4:7] = False  # a hole in the middle of row 1
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, pad)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=pad[:, None, None, :])
+    assert fallback_stats() == {"attention_mask": 1}
+    torch.testing.assert_close(out.transpose(1, 2), ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+# right padding only without a cache prefix (q_len == kv_len): the layouts HF produces
+@pytest.mark.parametrize("side,q_len,kv_len", [("left", 24, 24), ("right", 24, 24), ("left", 8, 24)])
+def test_unpad_matches_masked_reference(monkeypatch, causal, side, q_len, kv_len):
+    """Unpadded varlen vs the masked SDPA reference on every row that sees a key,
+    forward and gradients; GQA; chunked prefill (q_len < kv_len)."""
+    torch.manual_seed(0)
+    B, H, H_kv, d = 3, 4, 2, 64
+    q = torch.randn(B, H, q_len, d, device="cuda", dtype=torch.float16, requires_grad=True)
+    k, v = (torch.randn(B, H_kv, kv_len, d, device="cuda", dtype=torch.float16, requires_grad=True)
+            for _ in range(2))
+    pad = torch.ones(B, kv_len, dtype=torch.bool, device="cuda")
+    if side == "left":
+        pad[1, :5] = False
+        pad[2, :20] = False
+    else:
+        pad[1, 19:] = False
+        pad[2, 6:] = False
+    counter = KernelCounter(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=causal), q, k, v, pad)
+    assert len(counter.varlen_calls) == 1 and fallback_stats() == {}
+
+    mask = pad[:, None, None, :]
+    if causal:
+        mask = mask & torch.ones(q_len, kv_len, dtype=torch.bool, device="cuda").tril(kv_len - q_len)
+    rep = lambda t: t.repeat_interleave(H // H_kv, dim=1)  # noqa: E731
+    qr, kr, vr = (t.detach().float().requires_grad_() for t in (q, k, v))
+    ref = torch.nn.functional.scaled_dot_product_attention(qr, rep(kr), rep(vr), attn_mask=mask)
+    ref = torch.nan_to_num(ref).transpose(1, 2)  # rows that see no key: 0, like the kernel
+    # Query rows that see at least one key; causal: real rows only (padded rows
+    # are 0 by design, as in FA2's unpadding); bidirectional: every row
+    sees = mask.expand(B, 1, q_len, kv_len).any(-1)[:, 0]
+    if causal:
+        sees &= pad[:, kv_len - q_len:]
+    torch.testing.assert_close(out.float()[sees], ref[sees], atol=2e-2, rtol=2e-2)
+    go = torch.randn_like(out) * sees[:, :, None, None]
+    out.backward(go)
+    ref.backward(go.float())
+    for g, r in ((q.grad, qr.grad), (k.grad, kr.grad), (v.grad, vr.grad)):
+        torch.testing.assert_close(g.float(), r, atol=5e-2, rtol=5e-2)
 
 
 def test_dropout_reason():
@@ -302,7 +472,7 @@ def test_builder_dynamic_cache_and_padding():
     pad = torch.ones(2, 25, dtype=torch.bool, device="cuda")  # HF passes it as bool
     pad[1, :3] = False
     m = _build(kv_length=25, attention_mask=pad)
-    assert m.dim() == 4 and m.dtype == torch.bool  # SDPA's mask -> fallback
+    assert m.shape == (2, 25) and m.dtype == torch.bool  # padding mask -> unpad
 
 
 def test_builder_never_returns_sdpa_none_for_causal_skip_disabled():
@@ -324,7 +494,7 @@ def test_builder_bidirectional_never_slices():
 
 def test_foreign_2d_padding_mask_is_honoured():
     """Some models pass HF's raw [B, kv] padding mask straight to 'flash' backends:
-    it must be applied (SDPA fallback), never treated as 'first n keys valid'."""
+    it must be applied (unpadded onto the kernel), never treated as 'first n keys valid'."""
     q, k, v = _qkv(q_len=16, kv_len=16)
     q, k, v = (t.expand(2, -1, -1, -1).contiguous() for t in (q, k, v))
     pad = torch.ones(2, 16, dtype=torch.long, device="cuda")
@@ -333,7 +503,7 @@ def test_foreign_2d_padding_mask_is_honoured():
     causal = torch.ones(16, 16, dtype=torch.bool, device="cuda").tril()
     ref_mask = pad[:, None, None, :].bool() & causal
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=ref_mask)
-    assert fallback_stats() == {"attention_mask": 1}
+    assert fallback_stats() == {}  # contiguous padding: unpadded onto the kernel
     assert torch.isfinite(out).all()  # also fully padded query rows: no NaN
     # rows of the padded sequence that see at least one key must match the reference
     torch.testing.assert_close(out.transpose(1, 2)[:, :, 6:], ref[:, :, 6:], atol=2e-3, rtol=2e-3)

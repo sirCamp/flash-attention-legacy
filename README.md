@@ -104,8 +104,9 @@ The integration decides **per attention call** whether our kernel can run, and n
 |---|---|
 | Prefill, chunked prefill with a KV cache, static/offloaded caches | kernel |
 | Packed sequences (`position_ids` restarting at 0, or `cu_seq_lens`), VLM vision encoders (Qwen2/2.5/3-VL, Pixtral, ...) | kernel (varlen) |
+| Padded batches (left or right padding, training and generation prefill), encoders and cross-attention with padded inputs | kernel (varlen, unpadded; causal: padded query rows output 0, as FlashAttention-2) |
 | BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
-| Decode (`q_len == 1`), padded batches, sliding-window layers, unsupported head_dim, attention dropout, BF16/FP32 training | SDPA fallback |
+| Decode (`q_len == 1`), padding with holes inside a row, sliding-window layers, unsupported head_dim, attention dropout, BF16/FP32 training | SDPA fallback |
 | Logit softcapping (Gemma 2), attention sinks (gpt-oss) | FP32 eager fallback |
 
 Check what happened in your run:
@@ -423,7 +424,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 6. Known integration corner cases:
    - Pascal + `generate(cache_implementation="static")`: transformers compiles the decoding step with `torch.compile`, and Triton needs SM >= 7.0. Pass `disable_compile=True`
    - decoders with bidirectional attention (`is_causal=False`) and a static cache attend to the empty cache slots, exactly as HF's SDPA does
-   - Doge with a static cache indexes the attention mask as 4D and fails with our 2D cache mask
+   - padded batches and static caches get FlashAttention-2's 2D `[batch, keys]` mask; models that index the attention mask as 4D (e.g. Doge) fail with it
    - Llama 4 (chunked attention) is not supported yet: transformers refuses chunked attention for backends whose name contains "flash"
 
 ## Roadmap

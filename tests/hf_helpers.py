@@ -58,7 +58,13 @@ def assert_within_noise(flash_cos, eager_cos, top1, label, top1_noise=None, near
     of 1 - cos computed in FP32 (~1e-7), relevant only for tiny models."""
     err_flash, err_eager = 1.0 - flash_cos, 1.0 - eager_cos
     print(f"  {label}: 1-cos flash={err_flash:.2e} eager(noise floor)={err_eager:.2e} top1={top1:.4f}")
-    assert err_flash <= max(3.0 * err_eager, 1e-6), f"{label}: flash error above FP16 noise floor"
+    if err_eager != err_eager:
+        # FP16 eager is not finite (e.g. Qwen2.5: its activations overflow FP16 in
+        # HF's eager attention): no noise floor, fixed bound instead (FP16 logits of
+        # two correct backends differ by ~1e-6 in 1 - cos)
+        assert err_flash <= 1e-5, f"{label}: flash error {err_flash:.2e} (FP16 eager not finite)"
+    else:
+        assert err_flash <= max(3.0 * err_eager, 1e-6), f"{label}: flash error above FP16 noise floor"
     # top-1 agreement: relative to the noise reference when known, else absolute.
     # Slack 1%; with near_tie_positions=n (opt-in, short sequences of random
     # models with FP16 near-ties) at least 1.5 positions: one extra near-tie flip
