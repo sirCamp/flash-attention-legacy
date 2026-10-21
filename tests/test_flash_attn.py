@@ -893,3 +893,72 @@ class TestValidation:
             old = flash_attention(q, k, v, is_causal=True)
         new = flash_attention(q, k, v, causal=True)
         assert torch.equal(old, new)
+
+
+# ---------------------------------------------------------------------------
+# Forward contract (docs/PLAN.md P2.8, step 0e): what any forward kernel must
+# keep — the logsumexp the backward consumes, ragged tile edges, bands of rows
+# that see no key, short varlen segments.
+# ---------------------------------------------------------------------------
+
+def ref_lse(q, k, scale, causal):
+    """FP32 logsumexp per row [B, H_q, N_q]; -inf for rows that see no key."""
+    reps = q.shape[1] // k.shape[1]
+    s = q.float() @ k.float().repeat_interleave(reps, dim=1).transpose(-2, -1) * scale
+    if causal:
+        n_q, n_k = q.shape[-2], k.shape[-2]
+        s.masked_fill_(torch.ones(n_q, n_k, device=q.device, dtype=torch.bool)
+                       .triu(1 + n_k - n_q), float("-inf"))
+    return torch.logsumexp(s, dim=-1)
+
+
+def assert_lse_close(lse, ref):
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(lse), finite), "rows with no visible key must give lse = -inf"
+    assert (lse[~finite] == float("-inf")).all()
+    torch.testing.assert_close(lse[finite], ref[finite], atol=2e-3, rtol=1e-3)
+
+
+class TestForwardContract:
+
+    @pytest.mark.parametrize("n_q,n_k", [(15, 15), (17, 17), (63, 63), (65, 65), (127, 127),
+                                         (200, 5), (5, 200), (130, 17)])
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_output_and_lse(self, head_dim, n_q, n_k, causal):
+        """Output and raw logsumexp vs FP32 at ragged lengths; (200, 5) causal
+        leaves whole tiles of rows with no visible key (O = 0, lse = -inf)."""
+        import flash_attn_legacy_cuda
+        torch.manual_seed(0)
+        scale = 1.0 / math.sqrt(head_dim)
+        q = torch.randn(2, 4, n_q, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(2, 2, n_k, head_dim, device="cuda", dtype=torch.float16)
+        v = torch.randn(2, 2, n_k, head_dim, device="cuda", dtype=torch.float16)
+        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, causal)
+        torch.testing.assert_close(out, ref_attention(q, k, v, scale, causal), atol=2e-2, rtol=2e-2)
+        assert_lse_close(lse, ref_lse(q, k, scale, causal))
+
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen_short_segments(self, head_dim, causal):
+        """Segments shorter than, equal to and just above a tile, mixed in one pack."""
+        import flash_attn_legacy_cuda
+        torch.manual_seed(0)
+        scale = 1.0 / math.sqrt(head_dim)
+        lens = [1, 15, 17, 65, 16, 64, 2]
+        cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        q, k, v = (torch.randn(sum(lens), 4, head_dim, device="cuda", dtype=torch.float16) for _ in range(3))
+        out, lse = flash_attn_legacy_cuda.forward_varlen(q, k, v, cu, cu, max(lens), max(lens), scale, causal)
+        for s, e in zip(cu[:-1].tolist(), cu[1:].tolist()):
+            qi, ki, vi = (t[s:e].transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+            ref = ref_attention(qi, ki, vi, scale, causal)[0].transpose(0, 1)
+            torch.testing.assert_close(out[s:e], ref, atol=2e-2, rtol=2e-2)
+            assert_lse_close(lse[s:e].transpose(0, 1), ref_lse(qi, ki, scale, causal)[0])
+
+    def test_long_d256(self):
+        """d=256 at 4096 tokens: the largest register / smem footprint."""
+        import flash_attn_legacy_cuda
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(1, 2, 4096, 256, device="cuda", dtype=torch.float16) for _ in range(3))
+        scale = 1.0 / 16
+        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, True)
+        torch.testing.assert_close(out, ref_attention(q, k, v, scale, True), atol=2e-2, rtol=2e-2)
+        assert_lse_close(lse, ref_lse(q, k, scale, True))
