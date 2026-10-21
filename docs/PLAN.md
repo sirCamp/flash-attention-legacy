@@ -163,7 +163,9 @@ Soluzioni provvisorie introdotte durante P0, ciascuna con la voce che la sostitu
 | Fallback eager per i sink `s_aux` | P0.3 | P4.3 sink nel kernel, più P4.1 window (gpt-oss alterna strati sliding) | gpt-oss sul kernel in tutti gli strati; il motivo `s_aux` sparisce dal registro |
 | Fallback eager per `position_bias` (nessun modello HF 5.x lo passa oggi: copertura difensiva) | P0.3 | da decidere: kernel con bias additivo, oppure errore esplicito | Il motivo `position_bias` sparisce dal registro |
 | `_eager_attention` stessa | P0.3 | — | Si rimuove solo quando nessun motivo del registro ha più l'azione `eager` |
-| `cu_seq_lens` solleva `NotImplementedError` | P0.1 | P0.4 (varlen o fallback a segmenti), poi P3.2/P3.3 nativo | Nessun motivo con azione `raise` per `cu_seq_lens` |
+| ~~`cu_seq_lens` solleva `NotImplementedError`~~ | P0.1 | P0.4 | **Chiuso in P0.4**: varlen nel kernel o maschera a segmenti nei fallback; resta `raise` solo per `cu_seq_lens` incoerenti |
+| Backward varlen come loop Python per segmento (packing in training, encoder di visione in training) | prima di P0, usato da P0.4 | P2.4 varlen backward nativo | Un solo lancio del kernel, nessuna sincronizzazione host per segmento. Già oggi più veloce del fallback SDPA a blocchi: V100 7.6–15.9 ms contro 24, 1080 Ti 36–267 ms contro 5260, a 8192 token |
+| Encoder di visione con head_dim 72/80 (Qwen2-VL, SigLIP) → fallback a segmenti | P0.4 | P2.7 nuovi head_dim | Encoder di visione di Qwen2-VL e SigLIP sul kernel varlen |
 | Padding (maschera 2D con zeri o maschera 4D) → fallback SDPA | prima di P0 | P3.1 padding nativo | Batch con padding sul kernel in tutti gli strati |
 | Sliding window → fallback SDPA | prima di P0 | P4.1 window nel kernel | Gemma 3, Mistral v0.1 e Phi-3 senza motivo `attention_mask` dovuto alla window |
 | Guardia sulla T4 (tile che non entrano → fallback) | P0.6 | P2.2/P2.3 tile a runtime | Nessun fallback per shared memory su T4 |

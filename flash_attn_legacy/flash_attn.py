@@ -155,12 +155,14 @@ class FlashAttnVarlenFunc(Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        # Per-sequence backward using the batched backward kernel
+        # Per-sequence backward using the batched backward kernel (one host sync
+        # for the boundaries; native varlen backward: docs/PLAN.md P2.4)
+        cu_q, cu_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
         for i in range(batch_size):
-            qs = cu_seqlens_q[i].item()
-            qe = cu_seqlens_q[i + 1].item()
-            ks = cu_seqlens_k[i].item()
-            ke = cu_seqlens_k[i + 1].item()
+            qs, qe = cu_q[i], cu_q[i + 1]
+            ks, ke = cu_k[i], cu_k[i + 1]
+            if qe == qs:
+                continue
 
             # Extract per-sequence tensors: [seq, H, d] → [1, H, seq, d]
             qi = q[qs:qe].permute(1, 0, 2).unsqueeze(0).contiguous()

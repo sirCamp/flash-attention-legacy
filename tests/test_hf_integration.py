@@ -21,6 +21,7 @@ transformers = pytest.importorskip("transformers")
 from flash_attn_legacy import fallback_stats, integrations, reset_fallback_stats  # noqa: E402
 from .hf_helpers import (  # noqa: E402
     TINY_MODELS, KernelCounter, assert_close_to_gold, compare, load_impl, logits, tiny_llama,
+    tiny_vision_tower,
 )
 
 
@@ -126,8 +127,8 @@ def test_v_head_dim_reason():
 
 @pytest.mark.parametrize("kwarg", ["cu_seq_lens_q", "cu_seq_lens_k"])
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
-def test_unsupported_kwargs_raise(kwarg, q_len):
-    """cu_seq_lens: no correct path exists yet (SDPA would silently ignore it):
+def test_cu_seq_lens_one_sided_raises(kwarg, q_len):
+    """cu_seq_lens given for queries only or keys only (no consistent segments):
     must raise, on the kernel path and on the fallback path alike."""
     value, reason = torch.tensor([0, 8, 16], dtype=torch.int32), "cu_seq_lens"
     q, k, v = _qkv(q_len=q_len)
@@ -456,3 +457,236 @@ def test_eager_kwargs_routed_and_applied(kwarg, reason, q_len):
                      bias=value if kwarg == "position_bias" else None)
     assert fallback_stats() == {reason: 1}
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# P0.4 — packed segments: cu_seq_lens (VLM vision encoders) and position_ids
+# restarting inside a sequence (packing, B4)
+# ---------------------------------------------------------------------------
+
+_CU = [0, 7, 40, 41, 90]  # uneven segments, one of length 1
+
+
+def _per_segment_reference(q, k, v, scaling, causal):
+    outs = []
+    for a, b in zip(_CU[:-1], _CU[1:]):
+        outs.append(_reference(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], scaling,
+                               integrations._causal_mask(b - a, b - a, "cuda") if causal else None))
+    return torch.cat(outs, dim=2)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize("head_dim,path", [(64, "varlen"), (80, "sdpa")])
+def test_cu_seq_lens_direct(monkeypatch, causal, kv_heads, head_dim, path):
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1], d=head_dim)
+    k, v = k[:, :kv_heads].contiguous(), v[:, :kv_heads].contiguous()
+    cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    counter = KernelCounter(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(
+        _Attn(is_causal=causal), q, k, v, None, scaling=0.125,
+        cu_seq_lens_q=cu, cu_seq_lens_k=cu, is_causal=causal)
+    ref = _per_segment_reference(q, k, v, 0.125, causal)
+    if path == "varlen":
+        assert counter.varlen_calls == [(_CU[-1], len(_CU) - 1)] and fallback_stats() == {}
+    else:
+        assert counter.varlen_calls == [] and fallback_stats() == {"head_dim": 1}
+    torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+
+
+def test_cu_seq_lens_with_softcap_uses_segment_mask_in_eager():
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1])
+    cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    out, _ = integrations.flash_attn_legacy_forward(
+        _Attn(is_causal=True), q, k, v, None, scaling=0.5, softcap=2.0,
+        cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+    outs = []
+    for a, b in zip(_CU[:-1], _CU[1:]):
+        outs.append(_reference(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], 0.5,
+                               integrations._causal_mask(b - a, b - a, "cuda"), softcap=2.0))
+    assert fallback_stats() == {"softcap": 1}
+    torch.testing.assert_close(out.transpose(1, 2).float(), torch.cat(outs, dim=2), atol=2e-3, rtol=2e-3)
+
+
+def test_cu_seq_lens_mismatch_raises():
+    q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1])
+    cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, None,
+                                               cu_seq_lens_q=cu, cu_seq_lens_k=cu.flip(0))
+
+
+def _packed_batch(base, lengths, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    seqs = [torch.randint(0, base.config.vocab_size, (n,), generator=g) for n in lengths]
+    ids = torch.cat(seqs)[None]
+    position_ids = torch.cat([torch.arange(n) for n in lengths])[None]
+    return seqs, ids, position_ids
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])  # gemma3: sliding-window layers
+def test_packed_position_ids_forward(monkeypatch, arch, use_cache):
+    """B4: with a cache transformers builds no packing mask (and only the window
+    on sliding layers); our forward must still keep the segments apart (varlen
+    kernel, or the segment mask intersected with the window). Without a cache it
+    builds a block mask (-> SDPA fallback). All must equal each sequence alone."""
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    lengths = [30, 17, 45]
+    seqs, ids, position_ids = _packed_batch(base, lengths)
+    gold = torch.cat([logits(load_impl(base, "eager", torch.float32), s_[None]) for s_ in seqs])
+    noise = torch.cat([logits(load_impl(base, "eager"), s_[None]) for s_ in seqs])
+    counter = KernelCounter(monkeypatch)
+    out = logits(load_impl(base, "flash_attn_legacy"), ids,
+                 position_ids=position_ids.cuda(), use_cache=use_cache)
+    n_layers = base.config.num_hidden_layers
+    full = sum(t == "full_attention" for t in getattr(base.config, "layer_types", None)
+               or ["full_attention"] * n_layers)
+    if use_cache:
+        assert counter.varlen_calls == [(sum(lengths), 3)] * full
+        assert fallback_stats() == ({"attention_mask": n_layers - full} if full < n_layers else {})
+    else:
+        assert counter.varlen_calls == [] and fallback_stats() == {"attention_mask": n_layers}
+    assert counter.calls == []
+    assert_close_to_gold(out, gold, noise, f"{arch} packed use_cache={use_cache}",
+                         near_tie_slack=True)
+
+
+@pytest.mark.parametrize("positions,why", [
+    (lambda n: torch.arange(10, 10 + n), "offset arange: a plain sequence"),
+    (lambda n: torch.cat([torch.arange(20), torch.arange(25, 25 + n - 20)]), "PoSE-style jump"),
+])
+def test_position_ids_not_a_packing(monkeypatch, caplog, positions, why):
+    """Only restarts at the initial position split; anything else is one sequence."""
+    base = tiny_llama()
+    ids = torch.randint(0, base.config.vocab_size, (1, 48))
+    counter = KernelCounter(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=integrations.__name__):
+        logits(load_impl(base, "flash_attn_legacy"), ids,
+               position_ids=positions(48)[None].cuda(), use_cache=True)
+    assert counter.varlen_calls == [], why
+    assert counter.calls == [(48, 48)] * base.config.num_hidden_layers, why
+    jump_warnings = [r for r in caplog.records if "jump" in r.getMessage()]
+    assert len(jump_warnings) == (1 if "jump" in why else 0)
+
+
+def test_packing_first_segment_mid_document(monkeypatch):
+    """A first piece starting at position 37 (document split by the collator),
+    then segments restarting at 0: still a packing of 3 segments."""
+    q, k, v = _qkv(q_len=60, kv_len=60)
+    pos = torch.cat([torch.arange(37, 57), torch.arange(25), torch.arange(15)])[None].cuda()
+    counter = KernelCounter(monkeypatch)
+    integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None, position_ids=pos)
+    assert counter.varlen_calls == [(60, 3)]
+
+
+def test_segment_cache_follows_in_place_writes(monkeypatch):
+    """A reused position_ids buffer refilled in place must not reuse old segments."""
+    q, k, v = _qkv(q_len=40, kv_len=40)
+    pos = torch.cat([torch.arange(20), torch.arange(20)])[None].cuda()
+    counter = KernelCounter(monkeypatch)
+    integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None, position_ids=pos)
+    pos.copy_(torch.arange(40)[None])  # same object, same length, no packing anymore
+    integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None, position_ids=pos)
+    assert counter.varlen_calls == [(40, 2)] and counter.calls == [(40, 40)]
+
+
+def test_cu_seq_lens_cached_but_kv_len_checked_every_call():
+    q, k, v = _qkv(q_len=90, kv_len=90)
+    cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, None,
+                                           cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+    _, k2, v2 = _qkv(q_len=90, kv_len=120)
+    with pytest.raises(NotImplementedError):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k2, v2, None,
+                                               cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+
+
+def test_segments_intersect_broadcast_additive_mask():
+    q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1])
+    cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    additive = torch.zeros(1, 1, 1, _CU[-1], device="cuda", dtype=torch.float16)
+    out, _ = integrations.flash_attn_legacy_forward(
+        _Attn(is_causal=False), q, k, v, additive, scaling=0.125,
+        cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+    torch.testing.assert_close(out.transpose(1, 2).float(),
+                               _per_segment_reference(q, k, v, 0.125, False), atol=2e-3, rtol=2e-3)
+
+
+def test_padded_batch1_no_ambiguous_positions_warning(caplog):
+    q, k, v = _qkv(q_len=5, kv_len=5)
+    pad = torch.tensor([[0, 0, 1, 1, 1]], device="cuda")
+    pos = torch.tensor([[1, 1, 0, 1, 2]], device="cuda")  # HF: cumsum - 1, pads filled with 1
+    with caplog.at_level(logging.WARNING, logger=integrations.__name__):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad, position_ids=pos)
+    assert not [r for r in caplog.records if "jump" in r.getMessage()]
+
+
+@pytest.mark.parametrize("edges,why", [([0, 7, 40, 80], "does not reach the end"),
+                                       ([0, 7, 7, 90], "zero-length segment"),
+                                       ([3, 40, 90], "does not start at 0")])
+def test_cu_seq_lens_invalid_raises(edges, why):
+    q, k, v = _qkv(q_len=90, kv_len=90)
+    cu = torch.tensor(edges, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, None,
+                                               cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+
+
+def test_packed_position_ids_training_grads():
+    """Packed training (DataCollatorWithFlattening layout, use_cache=True as in a
+    custom loop): loss and gradients vs FP32 eager on the sequences run alone."""
+    base = tiny_llama(initializer_range=0.1)
+    lengths = [30, 17, 45]
+    seqs, ids, position_ids = _packed_batch(base, lengths)
+
+    def loss_and_grads(model, packed):
+        model.train()
+        if packed:
+            out = model(input_ids=ids.cuda(), position_ids=position_ids.cuda(), use_cache=True)
+            lg = out.logits.float()[0]
+        else:
+            lg = torch.cat([model(input_ids=s_[None].cuda()).logits.float()[0] for s_ in seqs])
+        # next-token loss inside each segment only (no cross-boundary targets)
+        tgt = torch.cat([torch.cat([s_[1:], torch.tensor([-100])]) for s_ in seqs]).cuda()
+        loss = torch.nn.functional.cross_entropy(lg, tgt, ignore_index=-100)
+        loss.backward()
+        g = torch.cat([getattr(layer.self_attn, proj).weight.grad.float().flatten()
+                       for layer in (model.model.layers[0], model.model.layers[-1])
+                       for proj in ("q_proj", "k_proj", "v_proj")])
+        return loss.item(), g
+
+    gold_loss, gold_g = loss_and_grads(load_impl(base, "eager", torch.float32), packed=False)
+    noise_loss, noise_g = loss_and_grads(load_impl(base, "eager"), packed=False)
+    loss, g = loss_and_grads(load_impl(base, "flash_attn_legacy"), packed=True)
+    err = lambda x: 1 - torch.nn.functional.cosine_similarity(x, gold_g, dim=0).item()  # noqa: E731
+    assert abs(loss - gold_loss) <= max(3 * abs(noise_loss - gold_loss), 1e-3), (loss, gold_loss)
+    assert err(g) <= max(3 * err(noise_g), 1e-5), (err(g), err(noise_g))
+
+
+@pytest.mark.parametrize("kind,head_dim,expect_varlen", [
+    ("qwen2_vl", 64, True), ("qwen2_vl", 80, False), ("qwen2_5_vl", 64, True)])
+def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen):
+    """VLM vision encoders: patches of several images attend within their image
+    (and window, Qwen2.5-VL) via cu_seq_lens."""
+    tower = tiny_vision_tower(kind, head_dim=head_dim)
+    cfg = tower.config
+    grid = torch.tensor([[1, 8, 8], [1, 12, 8], [1, 4, 4]])
+    patch = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size ** 2
+    x = torch.randn(int(grid.prod(-1).sum()), patch, generator=torch.Generator().manual_seed(0))
+
+    def run(impl, dtype=torch.float16):
+        m = load_impl(tower, impl, dtype)
+        with torch.no_grad():
+            return m(x.to("cuda", dtype), grid_thw=grid.cuda()).last_hidden_state.float()
+
+    gold, noise = run("eager", torch.float32), run("eager")
+    counter = KernelCounter(monkeypatch)
+    out = run("flash_attn_legacy")
+    if expect_varlen:
+        assert len(counter.varlen_calls) == cfg.depth and fallback_stats() == {}
+    else:
+        assert counter.varlen_calls == [] and fallback_stats() == {"head_dim": cfg.depth}
+    assert_close_to_gold(out, gold, noise, f"{kind} d={head_dim}")

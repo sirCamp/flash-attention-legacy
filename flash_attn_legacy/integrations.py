@@ -49,11 +49,11 @@ class FallbackReason(NamedTuple):
 
 
 FALLBACK_REASONS: Dict[str, FallbackReason] = {
-    # -- not supported anywhere yet: SDPA would silently ignore them ----------
+    # -- no correct interpretation: explicit error --------------------------
     "cu_seq_lens": FallbackReason(
-        "packed/segmented attention via cu_seq_lens_q/k (e.g. VLM vision encoders)", "raise",
-        hint="attn_implementation='sdpa' handles it (for a VLM it can be set for the vision "
-             "sub-model only)"),
+        "inconsistent cu_seq_lens (q/k differ, batch > 1, or not 0 < ... < q_len == kv_len)",
+        "raise", hint="segments must be the same for queries and keys, in a batch of 1, "
+                      "strictly increasing from 0 to the sequence length"),
     # -- SDPA would ignore them: eager fallback (temporary, docs/PLAN.md §3b) --
     "softcap": FallbackReason("attention logit softcapping (e.g. Gemma 2)", "eager"),
     "s_aux": FallbackReason("attention sinks s_aux (e.g. gpt-oss)", "eager"),
@@ -81,6 +81,13 @@ _fallback_counts: Counter = Counter()
 _warned_reasons: set = set()
 
 
+def _warn_once(key: str, message: str, *args) -> None:
+    """Log a warning once per key (reset by reset_fallback_stats)."""
+    if key not in _warned_reasons:
+        _warned_reasons.add(key)
+        logger.warning(message, *args)
+
+
 def _record_fallback(reason: str, detail: str = "") -> str:
     """Count a fallback; warn once per reason (unless expected); raise if the
     reason has no correct fallback. Returns the action ("sdpa" or "eager")."""
@@ -92,10 +99,9 @@ def _record_fallback(reason: str, detail: str = "") -> str:
         raise NotImplementedError(
             f"flash_attn_legacy: {info.message}{detail} is not supported yet, and the SDPA "
             f"fallback would silently ignore it: {info.hint}.")
-    if not info.expected and reason not in _warned_reasons:
-        _warned_reasons.add(reason)
-        logger.warning("flash_attn_legacy: falling back to %s attention: %s%s",
-                       info.action, info.message, detail)
+    if not info.expected:
+        _warn_once(reason, "flash_attn_legacy: falling back to %s attention: %s%s",
+                   info.action, info.message, detail)
     return info.action
 
 
@@ -114,9 +120,6 @@ def reset_fallback_stats() -> None:
 def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, kwargs):
     """Decide per call (on the real tensors and kwargs, never on the model
     config) whether the kernel can run. Returns (reason, detail) or (None, "")."""
-    for name in ("cu_seq_lens_q", "cu_seq_lens_k"):
-        if kwargs.get(name) is not None:
-            return "cu_seq_lens", ""
     softcap = kwargs.get("softcap")
     if softcap is not None and float(softcap) != 0.0:  # None or 0.0: no softcapping
         return "softcap", f" (softcap={softcap})"
@@ -228,6 +231,93 @@ def _eager_attention(query, key, value, mask, scaling, dropout_p, softcap=None,
     return out.reshape(B, H, q_len, d_v)
 
 
+# Segments derived from a cu_seq_lens / position_ids tensor are cached on that
+# tensor: transformers passes the same object to every layer, so the host sync
+# needed to read them happens once per forward, not once per layer. The key
+# includes the tensor version (bumped by every in-place write, e.g. a reused
+# buffer) and the device; a copy simply recomputes. The attribute is a fast
+# path, never needed for correctness.
+_SEGMENTS_ATTR = "_flash_attn_legacy_segments"
+
+
+def _cached_segments(source, q_len, device, compute):
+    key = (q_len, source._version, device)
+    cached = getattr(source, _SEGMENTS_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    result = compute()
+    try:
+        setattr(source, _SEGMENTS_ATTR, (key, result))
+    except (AttributeError, RuntimeError):
+        pass
+    return result
+
+
+def _packed_segments(query, key, attention_mask, padding_2d, kwargs):
+    """(cu_seqlens int32 [n_segments + 1], max_seqlen) when the batch-1 sequence is
+    a packing of independent segments, else None.
+
+    Segments come from cu_seq_lens_q/k (VLM vision encoders, explicit packing),
+    validated, or — as in HF flash_attention_2 — from position_ids returning to
+    their minimum inside the sequence (DataCollatorWithFlattening; the first
+    segment may start anywhere, e.g. a document split mid-way): with a cache in
+    use transformers builds no packing mask at all (B4), and on sliding-window
+    layers its mask carries the window only. Other position jumps (e.g.
+    PoSE-style skipped positions) are not a packing: no split, warn once."""
+    q_len, kv_len = query.shape[2], key.shape[2]
+    cu_q, cu_k = kwargs.get("cu_seq_lens_q"), kwargs.get("cu_seq_lens_k")
+    if cu_q is not None or cu_k is not None:
+        if cu_q is None or cu_k is None or query.shape[0] != 1 or (
+                cu_q is not cu_k and not torch.equal(cu_q, cu_k)):
+            _record_fallback("cu_seq_lens")  # raises
+
+        if q_len != kv_len:
+            _record_fallback("cu_seq_lens", f" (q_len={q_len}, kv_len={kv_len})")  # raises
+
+        def from_cu():
+            edges = cu_q.tolist()
+            if (edges[0] != 0 or edges[-1] != q_len
+                    or any(b <= a for a, b in zip(edges, edges[1:]))):
+                _record_fallback("cu_seq_lens", f" (cu_seq_lens={edges[:6]}..., "
+                                                f"q_len={q_len}, kv_len={kv_len})")  # raises
+            return (cu_q.to(device=query.device, dtype=torch.int32),
+                    max(b - a for a, b in zip(edges, edges[1:])))
+        return _cached_segments(cu_q, q_len, query.device, from_cu)
+
+    position_ids = kwargs.get("position_ids")
+    batch1_mask = attention_mask is None or (attention_mask.dim() == 4 and attention_mask.shape[0] == 1)
+    if (position_ids is None or padding_2d or not batch1_mask or query.shape[0] != 1
+            or q_len != kv_len or q_len < 2 or position_ids.numel() != q_len):
+        return None  # (padded rows carry filler positions: not a packing)
+
+    def from_positions():
+        pos = position_ids.reshape(-1)
+        jumps = pos[1:] != pos[:-1] + 1
+        restarts = jumps & (pos[1:] == pos.min())
+        n_jumps, n_restarts = torch.stack([jumps.sum(), restarts.sum()]).tolist()
+        if n_restarts == 0 or n_jumps != n_restarts:
+            if n_jumps:
+                _warn_once("ambiguous_positions",
+                           "flash_attn_legacy: position_ids jump without restarting at their "
+                           "initial value; treated as one sequence (not a packing)")
+            return None
+        edges = [0] + (restarts.nonzero().flatten() + 1).tolist() + [q_len]
+        cu = torch.tensor(edges, dtype=torch.int32, device=query.device)
+        return cu, max(b - a for a, b in zip(edges, edges[1:]))
+    return _cached_segments(position_ids, q_len, query.device, from_positions)
+
+
+def _segment_mask(cu_seqlens, n, causal, device) -> torch.Tensor:
+    """[1, 1, n, n] boolean mask (True = keep) of a packing: tokens attend within
+    their own segment only (and causally within it when `causal`)."""
+    seg = torch.searchsorted(cu_seqlens[1:].to(device=device, dtype=torch.long),
+                             torch.arange(n, device=device), right=True)
+    mask = seg[:, None] == seg[None, :]
+    if causal:
+        mask = mask & _causal_mask(n, n, device)
+    return mask[None, None]
+
+
 def flash_attn_legacy_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -285,6 +375,10 @@ def flash_attn_legacy_forward(
     else:
         is_causal = False
 
+    # Packed independent segments (batch of 1): varlen kernel, or a block-diagonal
+    # mask in the fallbacks.
+    segments = _packed_segments(query, key, attention_mask, padding_2d, kwargs)
+
     # The flash kernel knows "plain causal (bottom-right aligned) / no mask",
     # including q_len < kv_len (chunked prefill with a KV cache). Everything
     # else goes to SDPA, with the reason recorded in the fallback registry.
@@ -292,16 +386,23 @@ def flash_attn_legacy_forward(
                                              dropout, kwargs)
 
     if reason is None:
-        # Prefill: use our flash kernel (O(N) memory)
+        # Our flash kernel (O(N) memory), batched or varlen
         q_fp16 = query.half() if query.dtype != torch.float16 else query
         k_fp16 = key.half() if key.dtype != torch.float16 else key
         v_fp16 = value.half() if value.dtype != torch.float16 else value
 
-        attn_output = flash_attention(
-            q_fp16, k_fp16, v_fp16,
-            softmax_scale=scaling,
-            causal=is_causal,
-        )
+        if segments is None:
+            attn_output = flash_attention(q_fp16, k_fp16, v_fp16,
+                                          softmax_scale=scaling, causal=is_causal)
+        else:
+            from .flash_attn import flash_attn_varlen_func
+
+            cu_seqlens, max_len = segments
+            packed = [t[0].transpose(0, 1) for t in (q_fp16, k_fp16, v_fp16)]  # [N, H, d]
+            attn_output = flash_attn_varlen_func(
+                *packed, cu_seqlens, cu_seqlens, max_len, max_len,
+                softmax_scale=scaling, causal=is_causal,
+            ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
 
         if query.dtype != torch.float16:
             attn_output = attn_output.to(query.dtype)
@@ -319,6 +420,15 @@ def flash_attn_legacy_forward(
             causal_only = True  # no N x N mask materialised for SDPA
         elif is_causal and q_len > 1:
             mask = _causal_mask(q_len, kv_len, query.device)
+        if segments is not None:
+            # Intersect, never replace: the existing mask may carry a sliding window.
+            seg = _segment_mask(segments[0], q_len, is_causal, query.device)
+            if mask is None:
+                mask, causal_only = seg, False
+            elif mask.dtype == torch.bool:
+                mask = mask & seg
+            else:  # additive (possibly broadcast-shaped): where() broadcasts both
+                mask = torch.where(seg, mask, torch.finfo(mask.dtype).min)
 
         dropout_p = dropout if module.training else 0.0
         if action == "eager":
