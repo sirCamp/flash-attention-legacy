@@ -228,16 +228,17 @@ def _beam_rows_error(x, y, ignore_worst=0):
     return errors[-1]
 
 
+# Assisted decoding manages its own (dynamic) cache: only that combination exists.
+_GENERATE_CASES = [(c, m) for c in ("static", "offloaded_static", "dynamic")
+                   for m in ("greedy", "beam", "assisted")
+                   if m != "assisted" or c == "dynamic"]
 
 
 @pytest.mark.parametrize("arch", list(_INIT))
-@pytest.mark.parametrize("cache_implementation", ["static", "offloaded_static", "dynamic"])
-@pytest.mark.parametrize("mode", ["greedy", "beam", "assisted"])
+@pytest.mark.parametrize("cache_implementation,mode", _GENERATE_CASES)
 def test_generate_matches_gold(arch, cache_implementation, mode):
     """End-to-end generate vs FP32 eager (gold), FP16 eager as noise floor:
     every step's logits (all beams) and the final sequences."""
-    if mode == "assisted" and cache_implementation != "dynamic":
-        pytest.skip("assisted decoding needs a dynamic cache")
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, 24), device="cuda")
     # disable_compile: HF auto-compiles static-cache generation and Triton does not
