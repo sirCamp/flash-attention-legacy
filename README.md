@@ -37,9 +37,12 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 | Architecture | GPUs | SM | Tensor Cores | Kernel |
 |---|---|---|---|---|
 | **Volta** | V100, Titan V | 7.0 | 1st gen | WMMA 16x16x16 |
-| **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | half2 packed FP16 |
+| **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | CUDA cores (fp16 storage, fp32 math) |
+| **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | *not yet*: the Volta tiles for d=64/128 need more than the 64 KB of shared memory per block of SM 7.5 (planned) |
 
-Head dimensions: **d = 32, 64, 96, 128, 256**. FP16 only (Pascal/Volta lack native BF16).
+Head dimensions: **d = 32, 64, 96, 128, 256**.
+
+The kernels compute in **FP16**. BF16 and FP32 inputs are accepted for inference: they are converted to FP16 with a range check (values beyond 65504 raise `FP16RangeError`; through HuggingFace the call falls back to SDPA in the original dtype). Training with BF16/FP32 inputs is not supported by the kernels (FP16 gradients without loss scaling may underflow): use FP16 with a `GradScaler`; through HuggingFace it falls back to SDPA.
 
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 
@@ -92,6 +95,29 @@ print(tokenizer.decode(outputs[0]))
 ```
 
 The integration uses our flash kernel for unmasked **prefill** (where memory savings matter) and falls back to PyTorch SDPA for decode (q_len=1) and padded/masked batches.
+
+### What runs on the kernel
+
+The integration decides **per attention call** whether our kernel can run, and never returns a silently wrong result: anything the kernel cannot do runs on a correct fallback (PyTorch SDPA, or an FP32 eager implementation for features SDPA ignores), or raises an explicit error.
+
+| Case | Path |
+|---|---|
+| Prefill, chunked prefill with a KV cache, static/offloaded caches | kernel |
+| Packed sequences (`position_ids` restarting at 0, or `cu_seq_lens`), VLM vision encoders (Qwen2/2.5/3-VL, Pixtral, ...) | kernel (varlen) |
+| BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
+| Decode (`q_len == 1`), padded batches, sliding-window layers, unsupported head_dim, attention dropout, BF16/FP32 training | SDPA fallback |
+| Logit softcapping (Gemma 2), attention sinks (gpt-oss) | FP32 eager fallback |
+
+Check what happened in your run:
+
+```python
+import flash_attn_legacy
+flash_attn_legacy.reset_fallback_stats()
+model.generate(**inputs, max_new_tokens=32)
+print(flash_attn_legacy.fallback_stats())   # e.g. {'decode': 704} -> only decode steps fell back
+```
+
+Run inference under `torch.inference_mode()` (or `torch.no_grad()`): with BF16/FP32 weights and gradients enabled, calls fall back to SDPA.
 
 ### Monkey-patch (transformers < 5.0)
 
@@ -235,6 +261,8 @@ Raw kernel (B=2, H=8, d=64):
 
 ### Pascal (P100) — Kernel-level comparison
 
+> Measured before the FP32 dot-product change of the Pascal forward (which made the GTX 1080 Ti forward 2.3–2.9x faster); P100 numbers to be re-measured.
+
 Raw kernel on **Tesla P100-PCIE-16GB** (B=2, H=8, d=64):
 
 | N | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
@@ -352,7 +380,7 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 - Tiles: Br=128, Bc=64 (d=64) / Br=128, Bc=32 (d=128)
 
 **Pascal (SM 6.0/6.1):**
-- S = Q @ K^T via `half2` packed multiply-add (2x throughput vs scalar)
+- S = Q @ K^T: `half2` vectorized loads, products and sums in FP32 (`fmaf`). FP16 products could overflow (|q_i k_i| > 65504) and FP16 math runs at 1/64 rate on SM 6.1 (GTX 1080/Ti)
 - Same shared-memory P buffer strategy as Volta
 - Tiles: Br=128, Bc=32 (d=64) / Br=64, Bc=16 (d=128)
 - Vectorized `half2` loads/stores throughout
@@ -367,7 +395,7 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 - **dQ** accumulated in global FP32 buffer with `atomicAdd`
 
 **Pascal (SM 6.0/6.1):**
-- Same algorithm with `half2` packed multiply-add (no tensor cores)
+- Same algorithm on CUDA cores (FP32 math, no tensor cores)
 - **dQ** accumulated in FP32 with `atomicAdd`
 - **dK, dV** accumulated in per-thread FP32 registers, converted to FP16 on writeback
 - Multi-thread per KV row with warp shuffle reduction
@@ -392,15 +420,31 @@ pytest tests/test_performance.py::TestComparisonTable -v -s
 
 # Prefill memory benchmark with real models
 pytest tests/test_generation_benchmark.py -v -s -k "prefill"
+
+# HuggingFace integration on tiny random models (no download), vs an FP32 eager reference
+pytest tests/test_hf_integration.py -v
+
+# Real models (downloads), vs SDPA / FP32 eager
+FA_HF_MODELS="TinyLlama/TinyLlama-1.1B-Chat-v1.0,Qwen/Qwen3-0.6B" pytest tests/test_hf_equivalence.py -v -s
+
+# Run the Pascal (CUDA-core) kernels on any GPU (correctness only, not performance)
+FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 ```
 
 ## Limitations
 
-1. **Head dimensions**: only d = 32, 64, 96, 128, 256
-2. **FP16 only**: no BF16 (Pascal/Volta lack native BF16)
-3. **No dropout, no arbitrary attention mask** in the kernel (causal or none). With HuggingFace, an explicit `attention_mask` (padding), attention dropout in training and decode (q_len=1) fall back to PyTorch SDPA
+1. **Head dimensions**: only d = 32, 64, 96, 128, 256 (other sizes, e.g. 72/80 in SigLIP / Qwen2-VL vision towers, run on the SDPA fallback)
+2. **FP16 compute**: BF16/FP32 for inference only (see above); no native BF16
+3. **Kernel features**: causal (bottom-right aligned) or no mask, packed segments. No sliding window, softcap, sinks or dropout in the kernel yet: those layers run on the fallbacks
 4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
 5. **Non-deterministic dQ**: the backward accumulates dQ with FP32 `atomicAdd`
+6. **Varlen backward** runs one kernel launch per sequence (still faster than the SDPA fallback with a block mask)
+7. **Turing (SM 7.5)** is not supported yet (shared memory limit, see Supported Hardware)
+8. Known integration corner cases:
+   - Pascal + `generate(cache_implementation="static")`: transformers compiles the decoding step with `torch.compile`, and Triton needs SM >= 7.0. Pass `disable_compile=True`
+   - decoders with bidirectional attention (`is_causal=False`) and a static cache attend to the empty cache slots, exactly as HF's SDPA does
+   - Doge with a static cache indexes the attention mask as 4D and fails with our 2D cache mask
+   - Llama 4 (chunked attention) is not supported yet: transformers refuses chunked attention for backends whose name contains "flash"
 
 ## Roadmap
 

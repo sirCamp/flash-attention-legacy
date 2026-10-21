@@ -90,11 +90,11 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P0.3 | **B2, B3, MLA**: con `softcap` o `s_aux` si usa un fallback che li applica (eager con maschera). Con head_dim di V diverso da quello di Q si usa SDPA, che lo supporta [R16]. | S | Gemma 2 e gpt-oss ridotto entro il rumore rispetto a eager FP32. |
 | P0.4 | **B4 e B5**: con `cu_seq_lens_q/k` si usa `flash_attn_varlen_func` se l'head_dim è supportato. Altrimenti un fallback che **rispetta i segmenti** (maschera a blocchi diagonali o loop per segmento) [R1]. Il packing ricavato da `position_ids` con `use_cache=False` resta sul fallback SDPA di oggi, che è già corretto, finché P1.3 non lo rende veloce [R8]. | S–M | Batch impacchettato: loss uguale a quella delle sequenze eseguite singolarmente. Encoder di visione di Qwen2-VL-2B, Qwen3-VL e Pixtral (2 e 8 immagini) entro il rumore. Gradiente dei q/k proj (1-cos rispetto all'oro) non peggiore di SDPA FP16 mem-efficient [R7]. |
 | P0.5 | **B7, dtype** (fatto): BF16/FP32 in inferenza girano sul kernel dopo una conversione in FP16 controllata nell'API (`FP16RangeError` se un valore supera 65504 → fallback `fp16_overflow` nel dtype originale). In training (gradienti richiesti) vanno su SDPA (`non_fp16_training`): senza loss scaling i gradienti FP16 andrebbero in underflow. FP32 in inferenza: avviso una tantum che il calcolo è in FP16. In più: il prodotto scalare del forward Pascal non si forma più in FP16 (overflow con prodotti > 65504; anche 2.3–2.9× più veloce sulla 1080 Ti). | S | Fatto: test di overflow, training BF16 e prodotti grandi falliscono sul codice precedente. |
-| P0.6 | **B8, guardia sulle architetture**: prima del lancio si controlla se la tile entra nella shared memory del device; se non entra, il fallback è registrato (P0.1). È temporaneo: P2.3 lo rende inutile. | S | Sulla T4 BERT e Llama girano (su fallback) e i test non sollevano eccezioni. |
+| P0.6 | **Rimandata e unita a P2.2/P2.3** (decisione 2026-10-21: nessuna T4 disponibile, quindi la guardia non sarebbe verificabile). Fino ad allora su Turing il forward d=64/128 solleva un errore esplicito (`cudaFuncSetAttribute`), non dà risultati sbagliati. | — | Vedi P2.2/P2.3. |
 | P0.7 | **Casi limite**: `is_causal=None` nei kwargs si interpreta come attributo del modulo, come fa SDPA. Validazione di `cu_seqlens` (monotonia, ultimo valore uguale al totale). Sequenze di lunghezza 0 senza lanci con griglia 0. | S | Test dedicati. |
 | P0.8 | **Documentazione dei limiti noti emersi in P0.1–P0.2** (README):<br>• Pascal + `cache_implementation="static"`: HF compila da solo e Triton non supporta sm<7, quindi serve `disable_compile=True`.<br>• Decoder bidirezionale (`is_causal=False`) con cache statica: le chiavi vuote vengono incluse, come fa SDPA di HF.<br>• Doge con cache statica: indicizza la maschera come 4D e solleva un errore. | S | Sezione "Known limitations" aggiornata. |
 | P0.8b | **Test riscritti contro eager FP32**: matrice di modelli come test lento opzionale; ogni bug B1–B8 diventa un test di regressione che **fallisce sul codice attuale**. Test parametrizzati con `FLASH_ATTN_LEGACY_FORCE_ARCH`. Training: confronto della loss su 50 step e della 1-cos dei gradienti con SDPA mem-efficient FP16. | M | I test falliscono prima di P0 e passano dopo, su V100, T4 e 1080 Ti. |
-| P0.9 | **Nome del backend**: vedi la decisione 1 in §5. | S | Secondo la scelta. |
+| P0.9 | **Nome del backend: deciso di tenere `flash_attn_legacy`** (2026-10-21). Con P0.4 il nome "flash" fa arrivare a noi `cu_seq_lens` dei VLM, quindi un'unica chiamata varlen sul kernel invece del loop Python per immagine. Il monkey-patch di `_check_and_adjust_attn_implementation` resta, e Llama 4 (che solleva per i nomi "flash") arriva con P6.7. | — | Nessuna modifica. |
 
 ### P1 — Infrastruttura di benchmark e host varlen — **M**
 
@@ -112,7 +112,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P2.3 | **Tile Turing** (d=64 e d=128: `128×16`; buffer K/V condiviso). Backward d=256 con accumulatori dK/dV in frammenti WMMA. Includere anche le voci dimenticate del report [R15]: tile V100 d=64 a 48 KB (2 blocchi per SM), load a 128 bit, spill del forward d=256 su sm_70. | M | `test_flash_attn.py` completo su T4 e V100; tempi con l'harness. |
 | P2.4 | **Native varlen backward** in un solo lancio, sopra il kernel unificato di P2.1 [R6]. | M | Gradienti come il riferimento; nessuna sync; tempo misurato. |
 | P2.5 | **int64 e griglia**: offset a int64, B·H fuori da `gridDim.y`, `#include <mma.h>` fuori dal namespace. | S | Test con B·H > 65535 e, dove la memoria basta, oltre 2^31 elementi. |
-| P2.6 | **Build**: file divisi per (famiglia, head_dim). Il build di release compila Pascal solo per sm_60/61; un **build di test** mantiene Pascal anche per sm_70/75, così il percorso forzato resta testabile [R5]. | S–M | Build di release sotto i 3 minuti; i test con il Pascal forzato girano nel build di test. |
+| P2.6 | **Build** — *architetture configurabili anticipata (richiesta utente 2026-10-21)*: `TORCH_CUDA_ARCH_LIST` / `FLASH_ATTN_LEGACY_ARCHS` per scegliere le architetture; di default solo quelle supportate dal `nvcc` installato (`nvcc --list-gpu-arch`), con un avviso per quelle escluse (CUDA 13 non compila più sm_60/61/70). Poi: file divisi per (famiglia, head_dim); il build di release compila Pascal solo per sm_60/61, un **build di test** mantiene Pascal anche per sm_70/75 così il percorso forzato resta testabile [R5]. | S–M | CUDA 13 compila per la sola T4 senza errori; con `TORCH_CUDA_ARCH_LIST="7.5"` build in pochi minuti; build di release sotto i 3 minuti; test con Pascal forzato nel build di test. |
 | P2.7 | **head_dim 72 e 80** (verificati sulle config). d=80 è già multiplo di 16 (Bc=16); d=72 si porta a 80 con zeri in shared memory per WMMA. Su Pascal servono multipli di 8 per i load vettoriali [R14]. Il costo in tempo di build va misurato. | M | Test unitari per d=72 e d=80; encoder di visione di Qwen2-VL e SigLIP sul kernel. |
 
 ### P3 — Padding, packing e VLM nativi (dopo P2) — **M–L**
@@ -150,6 +150,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P6.4 | Dropout con Philox | L |
 | P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sincronizzazioni host: nel builder della maschera `bool(pad.all())` e `int(q_offset)`; nella funzione di attention `bool(mask.all())` quando il marcatore della maschera 2D si perde (una sync per strato, es. Gemma 3 con cache statica); il controllo di range FP16 per input BF16/FP32 (`amax`, una sync per chiamata nel percorso kernel); la lettura dei segmenti (una sync per forward) [R10] | M |
 | P6.6 | `mma.sync` su sm_75, solo se l'harness lo giustifica | L |
+| P6.7 | **Llama 4: chunked attention** (attention locale a blocchi; transformers solleva un errore per i backend con "flash" nel nome, quindi serve anche un adattamento nel registro HF), dopo P4.1 window nel kernel | M |
 
 ---
 
@@ -200,7 +201,7 @@ Il P100 (sm_60, FP16 veloce) è supportato, ma lo testa l'utente manualmente: pe
 
 Testo originale delle proposte:
 
-1. **Nome del backend.** La review propone di rinominare subito (es. `legacy_attn`), perché finché non arrivano d=72 e d=80 (P2.7) i VLM principali non possono comunque usare il kernel. Il rename porta:
+1. **Nome del backend.** *Superata: deciso di tenere il nome "flash" (vedi P0.9).* La review propone di rinominare subito (es. `legacy_attn`), perché finché non arrivano d=72 e d=80 (P2.7) i VLM principali non possono comunque usare il kernel. Il rename porta:
    - niente monkey-patch;
    - B5 chiuso gratis, perché i VLM passano al loop per immagine di HF;
    - Llama 4 sbloccato;
