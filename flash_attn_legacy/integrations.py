@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 # threads may at worst lose a count or log a warning twice. Under torch.compile
 # they only run at trace time (see docs/PLAN.md, P6.5).
 # ---------------------------------------------------------------------------
+
+
 class FallbackReason(NamedTuple):
     message: str
     action: str = "sdpa"     # "sdpa": run SDPA instead; "raise": NotImplementedError
@@ -65,6 +67,15 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "v_head_dim": FallbackReason("V head_dim != Q head_dim (e.g. MLA)"),
     "dropout": FallbackReason("attention dropout in training mode"),
 }
+
+# 2D masks follow HF's flash_attention_2 convention: a [B, n] mask means only the
+# first n key slots hold tokens (the rest are empty slots of a pre-allocated
+# cache) and zeros inside it are padding. They come from _flash_attn_legacy_mask
+# or straight from models that pass HF's padding mask to "flash" backends.
+# _flash_attn_legacy_mask tags its all-True masks with this attribute so the
+# forward can skip a device sync; the attribute is only a fast path (it is lost
+# if transformers copies the mask), never needed for correctness.
+_N_VALID_ATTR = "_flash_attn_legacy_n_valid"
 
 _fallback_counts: Counter = Counter()
 _warned_reasons: set = set()
@@ -150,6 +161,22 @@ def flash_attn_legacy_forward(
     """
     from .flash_attn import flash_attention
 
+    padding_2d = False
+    if attention_mask is not None and attention_mask.dim() == 2:
+        # [B, n] mask (see _N_VALID_ATTR): keep the first n key slots only.
+        n_valid = attention_mask.shape[-1]
+        if n_valid > key.shape[2]:
+            raise RuntimeError(f"flash_attn_legacy: 2D mask covers {n_valid} keys, "
+                               f"but only {key.shape[2]} keys were passed")
+        key, value = key[:, :, :n_valid], value[:, :, :n_valid]
+        if getattr(attention_mask, _N_VALID_ATTR, None) == n_valid or bool(attention_mask.all()):
+            attention_mask = None  # no padding
+        else:
+            # Padding (1 = keep): broadcastable boolean mask; causality is added in
+            # the fallback (native unpadding comes with docs/PLAN.md P3.1).
+            attention_mask = attention_mask[:, None, None, :].bool()
+            padding_2d = True
+
     # query/key/value come in as [B, H, N, d] from the model's attention layer
     B, H_q, q_len, d = query.shape
     kv_len = key.shape[2]
@@ -202,6 +229,9 @@ def flash_attn_legacy_forward(
         mask, sdpa_causal = attention_mask, False
         if mask is not None:
             mask = mask[..., :kv_len]
+            if padding_2d and is_causal and q_len > 1:
+                mask = mask & torch.ones(q_len, kv_len, dtype=torch.bool,
+                                         device=query.device).tril(diagonal=kv_len - q_len)
         elif is_causal and q_len == kv_len:
             sdpa_causal = True  # no N x N mask materialised
         elif is_causal and q_len > 1:
@@ -226,39 +256,61 @@ def flash_attn_legacy_forward(
 
 def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offset=0,
                             mask_function=None, attention_mask=None, local_size=None,
-                            allow_is_causal_skip=True, **kwargs):
+                            allow_is_causal_skip=True, allow_is_bidirectional_skip=False,
+                            **kwargs):
     """Mask builder for transformers' ALL_MASK_ATTENTION_FUNCTIONS.
 
-    Returns None (-> flash kernel) when the mask is plain causal or plain
-    bidirectional with no padding, no sliding window, and queries aligned to the
-    end of the keys (this covers chunked prefill with a KV cache). Otherwise it
-    delegates to the SDPA builder, whose boolean mask makes
-    flash_attn_legacy_forward fall back to SDPA.
+    For plain causal / bidirectional attention with no padding and no sliding
+    window (and when transformers allows skipping the mask) it returns:
+      - None when every key slot is attended (-> kernel), or
+      - causal only: a [batch, n_valid] mask tagged with _N_VALID_ATTR when only
+        the first n_valid key slots hold tokens (pre-allocated static caches) ->
+        flash_attn_legacy_forward slices K/V to n_valid and runs the kernel.
+    Anything else gets the SDPA builder's boolean 4D mask (-> SDPA fallback).
+    The SDPA builder is always called with both skips disabled: an SDPA `None`
+    means "slice K/V to q_len" (causal, top-left) or "no mask at all", which is
+    not what our kernel does with a pre-allocated cache (B1).
     """
     from transformers import masking_utils as mu
 
-    sdpa_mask = mu.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
     if mask_function is None:
         mask_function = mu.causal_mask_function
-    call = dict(batch_size=batch_size, q_length=q_length, kv_length=kv_length,
-                q_offset=q_offset, kv_offset=kv_offset, mask_function=mask_function,
-                attention_mask=attention_mask, local_size=local_size,
-                allow_is_causal_skip=allow_is_causal_skip, **kwargs)
 
-    plain = mask_function in (mu.causal_mask_function,
-                              getattr(mu, "bidirectional_mask_function", None))
-    ints = all(isinstance(x, int) for x in (q_length, kv_length, q_offset, kv_offset))
-    if not (allow_is_causal_skip and plain and ints and q_length <= kv_length):
-        return sdpa_mask(**call)
+    def sdpa_mask():
+        return mu.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"](
+            batch_size=batch_size, q_length=q_length, kv_length=kv_length,
+            q_offset=q_offset, kv_offset=kv_offset, mask_function=mask_function,
+            attention_mask=attention_mask, local_size=local_size,
+            allow_is_causal_skip=False, allow_is_bidirectional_skip=False, **kwargs)
+
+    causal = mask_function is mu.causal_mask_function
+    bidirectional = mask_function is mu.bidirectional_mask_function
+    skip_allowed = (causal and allow_is_causal_skip) or (bidirectional and allow_is_bidirectional_skip)
+    if not skip_allowed:
+        return sdpa_mask()  # sliding window, packing, overlays, custom mask functions
     if local_size is not None and kv_length >= local_size:
-        return sdpa_mask(**call)  # sliding window
-    if q_offset + q_length != kv_offset + kv_length:
-        return sdpa_mask(**call)  # queries not at the end of the keys
+        return sdpa_mask()  # sliding window
+    # Static caches may pass offsets as 0-d tensors; reading them syncs (see P6.5).
+    q_off, kv_off = int(q_offset), int(kv_offset)
+    if causal:
+        # Self-attention: key slots [kv_off, q_off + q_length) hold tokens.
+        n_valid = q_off + q_length - kv_off
+        if not (q_length <= n_valid <= kv_length):
+            return sdpa_mask()  # unexpected layout: let SDPA's mask decide
+    else:
+        # Bidirectional (encoders, cross-attention): all keys count, exactly as
+        # SDPA's "no mask"; never slice K/V to q_length here.
+        n_valid = kv_length
     if attention_mask is not None:
-        pad = attention_mask[:, kv_offset:kv_offset + kv_length]
+        pad = attention_mask[:, kv_off:kv_off + n_valid]
         if not bool(pad.all()):
-            return sdpa_mask(**call)  # padding
-    return None
+            return sdpa_mask()  # padding
+    if n_valid == kv_length:
+        return None
+    device = kwargs.get("device", "cpu")
+    valid = torch.ones(1, 1, dtype=torch.bool, device=device).expand(batch_size, n_valid)
+    setattr(valid, _N_VALID_ATTR, n_valid)
+    return valid
 
 
 def register():

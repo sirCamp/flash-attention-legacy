@@ -92,7 +92,8 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P0.5 | **B7, dtype**: BF16 va sul fallback (finché non c'è P5.2). Il downcast da FP32 a FP16 si documenta, con un controllo opzionale di overflow (`amax`). | S | Test con input BF16 vicini al limite FP16: nessun overflow silenzioso. |
 | P0.6 | **B8, guardia sulle architetture**: prima del lancio si controlla se la tile entra nella shared memory del device; se non entra, il fallback è registrato (P0.1). È temporaneo: P2.3 lo rende inutile. | S | Sulla T4 BERT e Llama girano (su fallback) e i test non sollevano eccezioni. |
 | P0.7 | **Casi limite**: `is_causal=None` nei kwargs si interpreta come attributo del modulo, come fa SDPA. Validazione di `cu_seqlens` (monotonia, ultimo valore uguale al totale). Sequenze di lunghezza 0 senza lanci con griglia 0. | S | Test dedicati. |
-| P0.8 | **Test riscritti contro eager FP32**: matrice di modelli come test lento opzionale; ogni bug B1–B8 diventa un test di regressione che **fallisce sul codice attuale**. Test parametrizzati con `FLASH_ATTN_LEGACY_FORCE_ARCH`. Training: confronto della loss su 50 step e della 1-cos dei gradienti con SDPA mem-efficient FP16. | M | I test falliscono prima di P0 e passano dopo, su V100, T4 e 1080 Ti. |
+| P0.8 | **Documentazione dei limiti noti emersi in P0.1–P0.2** (README):<br>• Pascal + `cache_implementation="static"`: HF compila da solo e Triton non supporta sm<7, quindi serve `disable_compile=True`.<br>• Decoder bidirezionale (`is_causal=False`) con cache statica: le chiavi vuote vengono incluse, come fa SDPA di HF.<br>• Doge con cache statica: indicizza la maschera come 4D e solleva un errore. | S | Sezione "Known limitations" aggiornata. |
+| P0.8b | **Test riscritti contro eager FP32**: matrice di modelli come test lento opzionale; ogni bug B1–B8 diventa un test di regressione che **fallisce sul codice attuale**. Test parametrizzati con `FLASH_ATTN_LEGACY_FORCE_ARCH`. Training: confronto della loss su 50 step e della 1-cos dei gradienti con SDPA mem-efficient FP16. | M | I test falliscono prima di P0 e passano dopo, su V100, T4 e 1080 Ti. |
 | P0.9 | **Nome del backend**: vedi la decisione 1 in §5. | S | Secondo la scelta. |
 
 ### P1 — Infrastruttura di benchmark e host varlen — **M**
@@ -147,7 +148,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P6.2 | BF16 nativo (conversione in FP16 con saturazione, o FP32 su Pascal) | M |
 | P6.3 | dQ deterministico (kernel dQ separato, vedi P5.2) | M |
 | P6.4 | Dropout con Philox | L |
-| P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sync dal builder della maschera (`bool(pad.all())`) [R10] | M |
+| P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sincronizzazioni host: nel builder della maschera `bool(pad.all())` e `int(q_offset)`; nella funzione di attention `bool(mask.all())` quando il marcatore della maschera 2D si perde (una sync per strato, es. Gemma 3 con cache statica) [R10] | M |
 | P6.6 | `mma.sync` su sm_75, solo se l'harness lo giustifica | L |
 
 ---

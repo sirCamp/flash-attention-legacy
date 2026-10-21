@@ -85,6 +85,26 @@ def tiny_llama(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, vocab=512, seed
     return LlamaForCausalLM(cfg).eval()
 
 
+def tiny_gemma3(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_window=8, vocab=512,
+                seed=0, **extra):
+    """Random-weight Gemma 3 text model alternating sliding / full attention layers."""
+    from transformers import Gemma3ForCausalLM, Gemma3TextConfig
+
+    torch.manual_seed(seed)
+    cfg = Gemma3TextConfig(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads, head_dim=head_dim, query_pre_attn_scalar=head_dim,
+        intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
+        vocab_size=vocab, max_position_embeddings=4096, sliding_window=sliding_window,
+        layer_types=["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(n_layers)],
+        **extra,
+    )
+    return Gemma3ForCausalLM(cfg).eval()
+
+
+TINY_MODELS = {"llama": tiny_llama, "gemma3": tiny_gemma3}
+
+
 def load_impl(model, impl, dtype=torch.float16):
     """Copy of `model` on CUDA with the given attention implementation and dtype."""
     import copy

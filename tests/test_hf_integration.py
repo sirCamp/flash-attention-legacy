@@ -20,7 +20,7 @@ transformers = pytest.importorskip("transformers")
 
 from flash_attn_legacy import fallback_stats, integrations, reset_fallback_stats  # noqa: E402
 from .hf_helpers import (  # noqa: E402
-    KernelCounter, assert_close_to_gold, load_impl, logits, tiny_llama,
+    TINY_MODELS, KernelCounter, assert_close_to_gold, load_impl, logits, tiny_llama,
 )
 
 
@@ -156,3 +156,182 @@ def test_warn_once_per_reason_and_not_for_expected(caplog):
     # Reasons are checked in order: decode steps count as "decode", prefills as "head_dim".
     n_layers = base.config.num_hidden_layers
     assert fallback_stats() == {"head_dim": 2 * n_layers, "decode": 2 * 2 * n_layers}
+
+
+# ---------------------------------------------------------------------------
+# P0.2 — caches whose kv_len is not "all tokens so far" (B1: StaticCache)
+# ---------------------------------------------------------------------------
+
+# prefill, a multi-token chunk with an offset (as in assisted decoding),
+# two decode steps, a longer chunk
+_STEPS = [20, 5, 1, 1, 13]
+
+
+@torch.no_grad()
+def _stepwise_logits(model, ids, cache):
+    out, pos = [], 0
+    for n in _STEPS:
+        res = model(input_ids=ids[:, pos:pos + n], past_key_values=cache, use_cache=True,
+                    cache_position=torch.arange(pos, pos + n, device="cuda"))
+        out.append(res.logits.float()[0])
+        pos += n
+    return torch.cat(out)
+
+
+@pytest.mark.parametrize("offloading", [False, True], ids=["static", "offloaded_static"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])  # gemma3: sliding + full layers (hybrid)
+def test_static_cache_stepwise(monkeypatch, arch, offloading):
+    from transformers import StaticCache
+
+    base = TINY_MODELS[arch]()
+    ids = torch.randint(0, base.config.vocab_size, (1, sum(_STEPS)), device="cuda")
+    gold = logits(load_impl(base, "eager", torch.float32), ids)
+
+    def run(impl):
+        model = load_impl(base, impl)
+        cache = StaticCache(config=model.config, max_cache_len=64, offloading=offloading)
+        return _stepwise_logits(model, ids, cache)
+
+    noise = run("eager")
+    counter = KernelCounter(monkeypatch)
+    out = run("flash_attn_legacy")
+    assert_close_to_gold(out, gold, noise, f"{arch} static")
+
+    # The kernel must run on the multi-token steps of every full-attention layer,
+    # on K/V sliced to the filled part of the cache (kv == tokens so far).
+    full_layers = sum(t == "full_attention" for t in getattr(
+        base.config, "layer_types", None) or ["full_attention"] * base.config.num_hidden_layers)
+    ends = [sum(_STEPS[:i + 1]) for i in range(len(_STEPS))]
+    expected = [(n, end) for n, end in zip(_STEPS, ends) if n > 1 for _ in range(full_layers)]
+    assert sorted(counter.calls) == sorted(expected)
+
+
+def _beam_rows_error(x, y):
+    """Worst 1-cos between each row of x and its closest row of y: beams with
+    near-equal scores can swap order between backends. The matching must be
+    one-to-one (a duplicated beam is an error, reported as 1-cos = 1)."""
+    x = torch.nn.functional.normalize(x.float(), dim=-1)
+    y = torch.nn.functional.normalize(y.float(), dim=-1)
+    best = (x @ y.T).max(dim=1)
+    if best.indices.unique().numel() != x.shape[0]:
+        return 1.0
+    return 1.0 - best.values.min().item()
+
+
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+@pytest.mark.parametrize("cache_implementation", ["static", "offloaded_static", "dynamic"])
+@pytest.mark.parametrize("mode", ["greedy", "beam", "assisted"])
+def test_generate_matches_gold(arch, cache_implementation, mode):
+    """End-to-end generate vs FP32 eager (gold), FP16 eager as noise floor:
+    every step's logits (all beams) and the final sequences."""
+    if mode == "assisted" and cache_implementation != "dynamic":
+        pytest.skip("assisted decoding needs a dynamic cache")
+    # Peaked but not saturated logits (Gemma scales embeddings by sqrt(hidden)).
+    base = TINY_MODELS[arch](initializer_range={"llama": 0.5, "gemma3": 0.05}[arch])
+    ids = torch.randint(0, base.config.vocab_size, (1, 24), device="cuda")
+    # disable_compile: HF auto-compiles static-cache generation and Triton does not
+    # support sm < 7.0; torch.compile is covered separately (docs/PLAN.md, P6.5).
+    kw = dict(max_new_tokens=16, min_new_tokens=16, do_sample=False,
+              cache_implementation=cache_implementation, disable_compile=True,
+              return_dict_in_generate=True, output_logits=True)
+    if mode == "beam":
+        kw["num_beams"] = 3
+
+    def gen(impl, dtype=torch.float16):
+        extra = {}
+        if mode == "assisted":
+            extra["assistant_model"] = load_impl(base, "sdpa", dtype)
+            extra["cache_implementation"] = None  # assisted decoding manages its own cache
+        return load_impl(base, impl, dtype).generate(ids, **{**kw, **extra})
+
+    gold, noise, out = gen("eager", torch.float32), gen("eager"), gen("flash_attn_legacy")
+    label = f"{arch}/{cache_implementation}/{mode}"
+    for step, (o, n, g) in enumerate(zip(out.logits, noise.logits, gold.logits)):
+        assert torch.isfinite(g).all(), f"{label}: non-finite reference logits"
+        err, err_noise = _beam_rows_error(o, g), _beam_rows_error(n, g)
+        # same rule as hf_helpers.assert_within_noise; 1e-3 floor for tiny models
+        assert err <= max(3.0 * err_noise, 1e-3), \
+            f"{label}: step {step} 1-cos={err:.2e} (noise {err_noise:.2e})"
+    if torch.equal(noise.sequences, gold.sequences):
+        assert torch.equal(out.sequences, gold.sequences), label
+
+
+# -- mask builder unit tests --------------------------------------------------
+
+def _build(**kw):
+    from transformers import masking_utils as mu
+
+    args = dict(batch_size=2, q_length=5, kv_length=64, q_offset=20, kv_offset=0,
+                mask_function=mu.causal_mask_function, attention_mask=None,
+                allow_is_causal_skip=True, device="cuda")
+    args.update(kw)
+    return integrations._flash_attn_legacy_mask(**args)
+
+
+def test_builder_static_cache_tags_valid_keys():
+    m = _build()
+    assert m.shape == (2, 25) and getattr(m, integrations._N_VALID_ATTR) == 25
+    # padding mask zeros beyond the filled part of the cache are irrelevant
+    pad = torch.ones(2, 64, dtype=torch.bool, device="cuda")
+    pad[:, 40:] = False
+    assert getattr(_build(attention_mask=pad), integrations._N_VALID_ATTR) == 25
+
+
+def test_builder_dynamic_cache_and_padding():
+    assert _build(kv_length=25) is None
+    pad = torch.ones(2, 25, dtype=torch.bool, device="cuda")  # HF passes it as bool
+    pad[1, :3] = False
+    m = _build(kv_length=25, attention_mask=pad)
+    assert m.dim() == 4 and m.dtype == torch.bool  # SDPA's mask -> fallback
+
+
+def test_builder_never_returns_sdpa_none_for_causal_skip_disabled():
+    """With skipping disabled the SDPA builder must not return None (B1)."""
+    m = _build(allow_is_causal_skip=False)
+    assert m is not None and m.dim() == 4
+
+
+def test_builder_bidirectional_never_slices():
+    """Encoders / cross-attention: all keys count (q_length != kv_length is normal)."""
+    from transformers import masking_utils as mu
+
+    kw = dict(mask_function=mu.bidirectional_mask_function, q_length=5, kv_length=12,
+              q_offset=0, allow_is_causal_skip=False)
+    assert _build(allow_is_bidirectional_skip=True, **kw) is None
+    m = _build(allow_is_bidirectional_skip=False, **kw)
+    assert m is not None and m.dim() == 4
+
+
+def test_foreign_2d_padding_mask_is_honoured():
+    """Some models pass HF's raw [B, kv] padding mask straight to 'flash' backends:
+    it must be applied (SDPA fallback), never treated as 'first n keys valid'."""
+    q, k, v = _qkv(q_len=16, kv_len=16)
+    q, k, v = (t.expand(2, -1, -1, -1).contiguous() for t in (q, k, v))
+    pad = torch.ones(2, 16, dtype=torch.long, device="cuda")
+    pad[1, :6] = 0  # left padding on row 1
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad)
+    causal = torch.ones(16, 16, dtype=torch.bool, device="cuda").tril()
+    ref_mask = pad[:, None, None, :].bool() & causal
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=ref_mask)
+    assert fallback_stats() == {"attention_mask": 1}
+    assert torch.isfinite(out).all()  # also fully padded query rows: no NaN
+    # rows of the padded sequence that see at least one key must match the reference
+    torch.testing.assert_close(out.transpose(1, 2)[:, :, 6:], ref[:, :, 6:], atol=2e-3, rtol=2e-3)
+
+
+def test_untagged_copy_of_builder_mask_still_runs_kernel(monkeypatch):
+    """The tag is only a fast path: a copy (tag lost) must give the same result."""
+    q, k, v = _qkv(q_len=5, kv_len=64)
+    m = _build(batch_size=1, q_length=5, q_offset=20)
+    counter = KernelCounter(monkeypatch)
+    out_tagged, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
+    out_copy, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m.clone())
+    assert counter.calls == [(5, 25), (5, 25)] and fallback_stats() == {}
+    torch.testing.assert_close(out_tagged, out_copy, atol=0, rtol=0)
+
+
+def test_tagged_mask_longer_than_keys_raises():
+    q, k, v = _qkv(q_len=4, kv_len=8)
+    m = _build(q_length=4, q_offset=6)  # tags 10 valid keys, only 8 passed
+    with pytest.raises(RuntimeError):
+        integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
