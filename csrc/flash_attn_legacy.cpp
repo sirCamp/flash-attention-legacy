@@ -331,9 +331,9 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Compute block_offsets on CPU: cumulative number of Q blocks per sequence.
-    // The CPU copies are also used to validate the boundaries (a wrong cu_seqlens
-    // would otherwise read out of bounds or leave rows uncomputed).
+    // Validate the boundaries on one host copy (a wrong cu_seqlens would
+    // otherwise read out of bounds or leave rows uncomputed). Removing this sync
+    // (CUDA graphs, torch.compile) is docs/PLAN.md P6.5.
     TORCH_CHECK(num_seqs >= 1, "cu_seqlens must have at least 2 entries");
     auto cu_cpu = torch::cat({cu_seqlens_q, cu_seqlens_k}).to(torch::kCPU);  // one host sync
     auto cu_q_cpu = cu_cpu.narrow(0, 0, num_seqs + 1);
@@ -354,19 +354,16 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     // Br of the tile the launcher will select (same dispatch: they cannot disagree)
     const int Br = (sm >= 70) ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
 
-    std::vector<int> block_offsets_vec(num_seqs + 1);
-    block_offsets_vec[0] = 0;
-    for (int i = 0; i < num_seqs; i++) {
-        int seq_len = cu_q_acc[i + 1] - cu_q_acc[i];
-        block_offsets_vec[i + 1] = block_offsets_vec[i] + cdiv(seq_len, Br);
-    }
-    int total_q_blocks = block_offsets_vec[num_seqs];
+    // Cumulative Q blocks per sequence, computed on the device (no host loop, no
+    // synchronous host-to-device copy); the total for the grid comes from the
+    // host copy already made for the validation.
+    int total_q_blocks = 0;
+    for (int i = 0; i < num_seqs; i++) total_q_blocks += cdiv(cu_q_acc[i + 1] - cu_q_acc[i], Br);
     if (total_q_blocks == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
-
-    // Copy block_offsets to GPU
-    torch::Tensor block_offsets_t = torch::from_blob(
-        block_offsets_vec.data(), {num_seqs + 1}, torch::kInt32
-    ).to(Q.device());
+    const torch::Tensor q_blocks = (cu_seqlens_q.narrow(0, 1, num_seqs) - cu_seqlens_q.narrow(0, 0, num_seqs)
+                                    + (Br - 1)).div(Br, "floor");
+    const torch::Tensor block_offsets_t = torch::cat(
+        {torch::zeros({1}, cu_seqlens_q.options()), q_blocks.cumsum(0).to(torch::kInt32)});
 
     FlashAttnVarlenParams p = {};
     p.Q = reinterpret_cast<const half*>(Q.data_ptr<at::Half>());
