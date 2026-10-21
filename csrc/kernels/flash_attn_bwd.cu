@@ -9,8 +9,8 @@
 // ============================================================================
 
 #include "flash_attn_common.h"
+#include "flash_attn_wmma.h"
 
-#include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
 
 #include <string>
 
@@ -228,127 +228,6 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 // ============================================================================
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 
-using namespace nvcuda;
-
-// ---------------------------------------------------------------------------
-// WMMA templates (duplicated from forward — needed in this compilation unit)
-// ---------------------------------------------------------------------------
-
-// C[M,N] = A[M,K] @ B^T[N,K]  (B loaded as col_major)
-template <int M, int N, int K_DIM, int NUM_WARPS>
-__device__ __forceinline__ void bwd_wmma_gemm_ABt(
-    const half* smem_A, const half* smem_B,
-    float* smem_C, int warp_id
-) {
-    constexpr int T = 16;
-    constexpr int ntm = M / T, ntn = N / T, total = ntm * ntn;
-    constexpr int per_warp = (total + NUM_WARPS - 1) / NUM_WARPS;
-    #pragma unroll
-    for (int t = 0; t < per_warp; t++) {
-        int idx = warp_id + t * NUM_WARPS;
-        if (idx >= total) break;
-        int tm = idx / ntn, tn = idx % ntn;
-        wmma::fragment<wmma::matrix_a, T,T,T, half, wmma::row_major> a;
-        wmma::fragment<wmma::matrix_b, T,T,T, half, wmma::col_major> b;
-        wmma::fragment<wmma::accumulator, T,T,T, float> c;
-        wmma::fill_fragment(c, 0.0f);
-        #pragma unroll
-        for (int k = 0; k < K_DIM; k += T) {
-            wmma::load_matrix_sync(a, smem_A + tm*T*K_DIM + k, K_DIM);
-            wmma::load_matrix_sync(b, smem_B + tn*T*K_DIM + k, K_DIM);
-            wmma::mma_sync(c, a, b, c);
-        }
-        wmma::store_matrix_sync(smem_C + tm*T*N + tn*T, c, N, wmma::mem_row_major);
-    }
-}
-
-// C[M,N_OUT] = A[M,K] @ B[K,N_FULL] (B row-major, pre-offset to column chunk)
-template <int M, int N_OUT, int K_DIM, int NUM_WARPS>
-__device__ __forceinline__ void bwd_wmma_gemm_AB(
-    const half* smem_A, const half* smem_B, int B_stride,
-    float* smem_C, int warp_id
-) {
-    constexpr int T = 16;
-    constexpr int ntm = M / T, ntn = N_OUT / T, total = ntm * ntn;
-    constexpr int per_warp = (total + NUM_WARPS - 1) / NUM_WARPS;
-    #pragma unroll
-    for (int t = 0; t < per_warp; t++) {
-        int idx = warp_id + t * NUM_WARPS;
-        if (idx >= total) break;
-        int tm = idx / ntn, tn = idx % ntn;
-        wmma::fragment<wmma::matrix_a, T,T,T, half, wmma::row_major> a;
-        wmma::fragment<wmma::matrix_b, T,T,T, half, wmma::row_major> b;
-        wmma::fragment<wmma::accumulator, T,T,T, float> c;
-        wmma::fill_fragment(c, 0.0f);
-        #pragma unroll
-        for (int k = 0; k < K_DIM; k += T) {
-            wmma::load_matrix_sync(a, smem_A + tm*T*K_DIM + k, K_DIM);
-            wmma::load_matrix_sync(b, smem_B + k*B_stride + tn*T, B_stride);
-            wmma::mma_sync(c, a, b, c);
-        }
-        wmma::store_matrix_sync(smem_C + tm*T*N_OUT + tn*T, c, N_OUT, wmma::mem_row_major);
-    }
-}
-
-// Accumulator fragments of a [OUT_R, OUT_C] float matrix spread over the warps
-// of a block: tile idx = warp_id + t * NUM_WARPS (t < PER_WARP), row-major tiles.
-template <int OUT_R, int OUT_C, int NUM_WARPS>
-struct WarpAccum {
-    static constexpr int T = 16;
-    static constexpr int kCols = OUT_C / T;
-    static constexpr int kTiles = (OUT_R / T) * kCols;
-    static constexpr int kPerWarp = (kTiles + NUM_WARPS - 1) / NUM_WARPS;
-    wmma::fragment<wmma::accumulator, T, T, T, float> frag[kPerWarp];
-
-    __device__ __forceinline__ void zero() {
-        #pragma unroll
-        for (int t = 0; t < kPerWarp; t++) wmma::fill_fragment(frag[t], 0.0f);
-    }
-
-    // frag += A^T @ B, A [M, OUT_R] row-major (stride A_stride, loaded col_major
-    // to transpose), B [M, OUT_C] row-major (stride B_stride).
-    template <int M>
-    __device__ __forceinline__ void add_AtB(const half* smem_A, int A_stride,
-                                            const half* smem_B, int B_stride, int warp_id) {
-        #pragma unroll
-        for (int t = 0; t < kPerWarp; t++) {
-            const int idx = warp_id + t * NUM_WARPS;
-            if (idx >= kTiles) break;  // warp-uniform
-            const int tr = idx / kCols, tc = idx % kCols;
-            wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::col_major> a;
-            wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::row_major> b;
-            #pragma unroll
-            for (int m = 0; m < M; m += T) {
-                wmma::load_matrix_sync(a, smem_A + m * A_stride + tr * T, A_stride);
-                wmma::load_matrix_sync(b, smem_B + m * B_stride + tc * T, B_stride);
-                wmma::mma_sync(frag[t], a, b, frag[t]);
-            }
-        }
-    }
-
-    // Write the first `valid_rows` rows as half to out (row stride out_stride),
-    // through a per-warp 16x16 float staging tile in shared memory.
-    __device__ __forceinline__ void store_half(half* out, int out_stride, int valid_rows,
-                                               float* warp_staging, int warp_id, int lane) {
-        #pragma unroll
-        for (int t = 0; t < kPerWarp; t++) {
-            const int idx = warp_id + t * NUM_WARPS;
-            if (idx >= kTiles) break;
-            const int tr = idx / kCols, tc = idx % kCols;
-            wmma::store_matrix_sync(warp_staging, frag[t], T, wmma::mem_row_major);
-            __syncwarp();
-            #pragma unroll
-            for (int e = lane; e < T * T; e += 32) {
-                const int row = tr * T + e / T;
-                if (row < valid_rows) {
-                    out[row * out_stride + tc * T + e % T] = __float2half(warp_staging[e]);
-                }
-            }
-            __syncwarp();
-        }
-    }
-};
-
 // ---------------------------------------------------------------------------
 // Backward kernel — Volta WMMA
 // ---------------------------------------------------------------------------
@@ -443,7 +322,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                                       + h_idx * params.l_head_stride + q_start;
 
         // ---- Step 1: S = Q @ K^T via WMMA ----
-        bwd_wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_Q, smem_K, smem_S, warp_id);
+        wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_Q, smem_K, smem_S, warp_id);
         __syncthreads();
 
         // ---- Step 2: P = exp(S * scale - L), with masking ----
@@ -480,7 +359,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         __syncthreads();
 
         // ---- Step 5: dP = dO @ V^T via WMMA ----
-        bwd_wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_dO, smem_V, smem_dP, warp_id);
+        wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_dO, smem_V, smem_dP, warp_id);
         __syncthreads();
 
         // ---- Step 6: dS_scaled = P * (dP - D) * scale ----
@@ -523,7 +402,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         #pragma unroll
         for (int dn = 0; dn < D; dn += DQ_CHUNK) {
             // dQ_chunk[Br, DQ_CHUNK] = dS_half[Br, Bc] @ K[Bc, dn:dn+DQ_CHUNK]
-            bwd_wmma_gemm_AB<Br, DQ_CHUNK, Bc, NUM_WARPS>(
+            wmma_gemm_AB<Br, DQ_CHUNK, Bc, NUM_WARPS>(
                 smem_half,          // A = dS_half [Br, Bc]
                 smem_K + dn, D,     // B = K[:, dn:], stride D
                 smem_S,             // C = reuse smem_S [Br, DQ_CHUNK]

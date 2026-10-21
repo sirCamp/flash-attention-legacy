@@ -17,8 +17,8 @@
 // ============================================================================
 
 #include "flash_attn_common.h"
+#include "flash_attn_wmma.h"
 
-#include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
 #include <cstring>
 
 #include <string>
@@ -30,90 +30,6 @@ namespace flash_attn_legacy {
 // SM 6.x device compilation: __CUDA_ARCH__ < 700 → stub.
 // SM 7.0 device compilation: __CUDA_ARCH__ >= 700 → real code.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
-
-// WMMA types only available for SM >= 7.0
-using namespace nvcuda;
-
-// ---------------------------------------------------------------------------
-// WMMA matmul: C[M,N] = A[M,K] * B^T[N,K]
-// A is [M, K_DIM] row-major in shared, B is [N, K_DIM] row-major in shared.
-// We want A * B^T, so load B as col_major (which transposes it).
-// Result stored to smem_C [M, N] as float with row stride LDC.
-// All warps cooperate to cover all 16×16 output tiles.
-// ---------------------------------------------------------------------------
-template <int M, int N, int K_DIM, int NUM_WARPS, int LDC>
-__device__ __forceinline__ void wmma_gemm_ABt(
-    const half* __restrict__ smem_A,   // [M, K_DIM]
-    const half* __restrict__ smem_B,   // [N, K_DIM]
-    float*      __restrict__ smem_C,   // [M, N], row stride LDC
-    int warp_id
-) {
-    constexpr int T = 16;
-    constexpr int ntiles_n = N / T;
-    constexpr int total_tiles = (M / T) * ntiles_n;
-    constexpr int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;
-
-    #pragma unroll
-    for (int t = 0; t < tiles_per_warp; t++) {
-        int tile_idx = warp_id + t * NUM_WARPS;
-        if (tile_idx >= total_tiles) break;
-        int tm = tile_idx / ntiles_n;
-        int tn = tile_idx % ntiles_n;
-
-        wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, T, T, T, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        #pragma unroll
-        for (int k = 0; k < K_DIM; k += T) {
-            wmma::load_matrix_sync(a_frag, smem_A + tm * T * K_DIM + k, K_DIM);
-            wmma::load_matrix_sync(b_frag, smem_B + tn * T * K_DIM + k, K_DIM);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-        wmma::store_matrix_sync(smem_C + tm * T * LDC + tn * T, c_frag, LDC, wmma::mem_row_major);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WMMA matmul: C[M,N_OUT] = A[M,K] * B[K,N_OUT]  (NOT transposed)
-// A is [M, K_DIM] row-major (row stride LDA) in shared mem.
-// B is [K_DIM, N_FULL] row-major (stride B_stride) in shared mem;
-//   pointer is pre-offset to the desired column chunk.
-// Result stored to smem_C [M, N_OUT] as float (row stride LDC).
-// ---------------------------------------------------------------------------
-template <int M, int N_OUT, int K_DIM, int NUM_WARPS, int LDA, int LDC>
-__device__ __forceinline__ void wmma_gemm_AB(
-    const half* __restrict__ smem_A,
-    const half* __restrict__ smem_B,
-    int B_stride,
-    float*      __restrict__ smem_C,
-    int warp_id
-) {
-    constexpr int T = 16;
-    constexpr int ntiles_n = N_OUT / T;
-    constexpr int total_tiles = (M / T) * ntiles_n;
-    constexpr int tiles_per_warp = (total_tiles + NUM_WARPS - 1) / NUM_WARPS;
-
-    #pragma unroll
-    for (int t = 0; t < tiles_per_warp; t++) {
-        int tile_idx = warp_id + t * NUM_WARPS;
-        if (tile_idx >= total_tiles) break;
-        int tm = tile_idx / ntiles_n;
-        int tn = tile_idx % ntiles_n;
-
-        wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, T, T, T, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        #pragma unroll
-        for (int k = 0; k < K_DIM; k += T) {
-            wmma::load_matrix_sync(a_frag, smem_A + tm * T * LDA + k, LDA);
-            wmma::load_matrix_sync(b_frag, smem_B + k * B_stride + tn * T, B_stride);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-        wmma::store_matrix_sync(smem_C + tm * T * LDC + tn * T, c_frag, LDC, wmma::mem_row_major);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // One Q block of the WMMA forward, shared by the batched and varlen kernels
