@@ -377,10 +377,10 @@ def flash_attn_legacy_forward(
     if scaling is None:
         scaling = 1.0 / math.sqrt(d)
 
-    # Detect causal: use module.is_causal (set by the model's attention layer),
-    # with kwargs override. Matches SDPA behavior.
-    if "is_causal" in kwargs:
-        is_causal = kwargs["is_causal"]
+    # Detect causal: kwargs override (None means "not given", as in HF's SDPA),
+    # else module.is_causal (set by the model's attention layer).
+    if kwargs.get("is_causal") is not None:
+        is_causal = bool(kwargs["is_causal"])
     elif hasattr(module, 'is_causal'):
         is_causal = module.is_causal
     elif attention_mask is None and q_len > 1:

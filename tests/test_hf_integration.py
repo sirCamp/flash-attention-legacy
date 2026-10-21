@@ -777,3 +777,20 @@ def test_mixed_kv_dtype_computed_in_query_dtype(monkeypatch):
     counter = KernelCounter(monkeypatch)
     out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k.float(), v.float(), None)
     assert out.dtype == torch.float16 and counter.calls == [(16, 16)]
+
+
+# ---------------------------------------------------------------------------
+# P0.7 — edge cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("module_causal,kwarg,expected", [
+    (True, None, True), (False, None, False),   # None: "not given" -> module attribute
+    (True, False, False), (False, True, True),  # explicit kwarg overrides the module
+])
+def test_is_causal_kwarg_vs_module_attribute(module_causal, kwarg, expected):
+    q, k, v = _qkv()
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=module_causal), q, k, v, None,
+                                                    scaling=0.125, is_causal=kwarg)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=expected,
+                                                           scale=0.125).transpose(1, 2)
+    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)

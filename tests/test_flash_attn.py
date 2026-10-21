@@ -782,6 +782,36 @@ class TestValidation:
         with pytest.raises(FP16RangeError):
             flash_attention(q, k, v)
 
+    @pytest.mark.parametrize("n_q,n_k", [(0, 16), (16, 0), (0, 0)])
+    def test_empty_sequences(self, n_q, n_k):
+        """No 0-sized kernel launch: empty output, or zeros when there are no keys."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(n_q=n_q, n_k=n_k, requires_grad=True)
+        out = flash_attention(q, k, v)
+        assert out.shape == (1, 4, n_q, 64) and (out == 0).all()
+        out.sum().backward()
+        for t in (q, k, v):
+            assert t.grad.shape == t.shape and (t.grad == 0).all()
+
+    @pytest.mark.parametrize("bad_k", [False, True], ids=["q_and_k", "k_only"])
+    @pytest.mark.parametrize("edges,total", [([0, 10, 20], 30), ([2, 10, 30], 30), ([0, 20, 10, 30], 30)])
+    def test_varlen_invalid_cu_seqlens_raise(self, edges, total, bad_k):
+        from flash_attn_legacy import flash_attn_varlen_func
+        q = torch.randn(total, 4, 64, device="cuda", dtype=torch.float16)
+        cu = torch.tensor(edges, dtype=torch.int32, device="cuda")
+        good = torch.tensor([0] + [total * (i + 1) // (len(edges) - 1) for i in range(len(edges) - 1)],
+                            dtype=torch.int32, device="cuda")
+        with pytest.raises(RuntimeError, match="cu_seqlens"):
+            flash_attn_varlen_func(q, q, q, good if bad_k else cu, cu, 30, 30)
+
+    def test_varlen_no_query_tokens(self):
+        from flash_attn_legacy import flash_attn_varlen_func
+        q = torch.randn(0, 4, 64, device="cuda", dtype=torch.float16)
+        k = torch.randn(10, 4, 64, device="cuda", dtype=torch.float16)
+        cu_q = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0, 10], dtype=torch.int32, device="cuda")
+        assert flash_attn_varlen_func(q, k, k, cu_q, cu_k, 0, 10).shape == (0, 4, 64)
+
     def test_nan_does_not_hide_overflow(self):
         from flash_attn_legacy import flash_attention
         from flash_attn_legacy.flash_attn import FP16RangeError

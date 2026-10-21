@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include "include/flash_attn_common.h"
@@ -78,12 +79,19 @@ std::vector<torch::Tensor> flash_attn_forward(
                 "head_dim must be 32, 64, 96, 128, or 256, got ", d);
     TORCH_CHECK(K.size(0) == B && K.size(3) == d, "K shape mismatch");
     TORCH_CHECK(V.sizes() == K.sizes(), "V shape must match K");
+    TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
 
     auto opts_half = Q.options();
     auto opts_float = Q.options().dtype(torch::kFloat32);
     torch::Tensor O = torch::empty({B, H_q, N, d}, opts_half);
     torch::Tensor L = torch::empty({B, H_q, N}, opts_float);
+    if (O.numel() == 0) return {O, L};  // nothing to compute (a 0-sized grid is invalid)
+    if (Nk == 0) {                       // no keys: output 0, logsumexp -inf (as masked rows)
+        O.zero_();
+        L.fill_(-INFINITY);
+        return {O, L};
+    }
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -145,6 +153,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     const int H_kv = K.size(1);
     TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
                 "head_dim must be 32, 64, 96, 128, or 256, got ", d);
+    TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv for GQA");
     const int Nk = K.size(2);
     TORCH_CHECK(K.size(0) == B && K.size(3) == d, "K shape mismatch");
@@ -160,6 +169,10 @@ std::vector<torch::Tensor> flash_attn_backward(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // dQ in FP32 (atomicAdd accumulator) → convert to FP16 at end
+    if (Q.numel() == 0 || Nk == 0) {
+        // nothing to propagate: dQ is 0 without keys, dK/dV are 0 without queries
+        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V)};
+    }
     torch::Tensor dQ_fp32 = torch::zeros({B, H_q, N, d}, Q.options().dtype(torch::kFloat32));
     // dK, dV have KV head shape — each element written exactly once (no atomics)
     torch::Tensor dK = torch::empty({B, H_kv, Nk, d}, K.options());
@@ -256,6 +269,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
                 "head_dim must be 32, 64, 96, 128, or 256, got ", d);
     TORCH_CHECK(K.size(2) == d && V.size(2) == d, "K,V head_dim mismatch");
     TORCH_CHECK(V.size(1) == H_kv, "V num_heads mismatch");
+    TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "H_q (", H_q, ") must be divisible by H_kv (", H_kv, ")");
     TORCH_CHECK(cu_seqlens_k.size(0) == num_seqs + 1, "cu_seqlens_k length mismatch");
 
@@ -267,9 +281,24 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Compute block_offsets on CPU: cumulative number of Q blocks per sequence
-    auto cu_q_cpu = cu_seqlens_q.to(torch::kCPU);
+    // Compute block_offsets on CPU: cumulative number of Q blocks per sequence.
+    // The CPU copies are also used to validate the boundaries (a wrong cu_seqlens
+    // would otherwise read out of bounds or leave rows uncomputed).
+    TORCH_CHECK(num_seqs >= 1, "cu_seqlens must have at least 2 entries");
+    auto cu_cpu = torch::cat({cu_seqlens_q, cu_seqlens_k}).to(torch::kCPU);  // one host sync
+    auto cu_q_cpu = cu_cpu.narrow(0, 0, num_seqs + 1);
+    auto cu_k_cpu = cu_cpu.narrow(0, num_seqs + 1, num_seqs + 1);
     auto cu_q_acc = cu_q_cpu.accessor<int, 1>();
+    auto cu_k_acc = cu_k_cpu.accessor<int, 1>();
+    TORCH_CHECK(cu_q_acc[0] == 0 && cu_k_acc[0] == 0, "cu_seqlens must start at 0");
+    TORCH_CHECK(cu_q_acc[num_seqs] == total_q, "cu_seqlens_q must end at total_q (", total_q,
+                "), got ", cu_q_acc[num_seqs]);
+    TORCH_CHECK(cu_k_acc[num_seqs] == total_k, "cu_seqlens_k must end at total_k (", total_k,
+                "), got ", cu_k_acc[num_seqs]);
+    for (int i = 0; i < num_seqs; i++) {
+        TORCH_CHECK(cu_q_acc[i + 1] >= cu_q_acc[i] && cu_k_acc[i + 1] >= cu_k_acc[i],
+                    "cu_seqlens must be non-decreasing (sequence ", i, ")");
+    }
 
     int sm = get_sm_version();
     // Br depends on arch and head_dim — must match tile configs in flash_attn_common.h
@@ -291,6 +320,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
         block_offsets_vec[i + 1] = block_offsets_vec[i] + cdiv(seq_len, Br);
     }
     int total_q_blocks = block_offsets_vec[num_seqs];
+    if (total_q_blocks == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
 
     // Copy block_offsets to GPU
     torch::Tensor block_offsets_t = torch::from_blob(
