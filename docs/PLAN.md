@@ -74,7 +74,7 @@ Il forward è corretto ma **da circa 6× a 10× più lento di SDPA memory-effici
 
 Dopo P5.3 (Nsight Compute, T4, d=64): conflitti di banco in lettura da 389 milioni a **0**, forward da 37.4 a 26.1 ms. Restano occupancy al 12.5% (1 blocco per SM) e stalli su shared memory e barriere: è il limite del disegno "un thread per riga", oggetto di P2.8.
 
-**Backward Pascal**: sulla 1080 Ti e sulla P100, d=128 a 4096 token richiede da 3.1 a 3.8 s contro circa 0.1 s di forward (`atomicAdd` per elemento di dQ, voce P5.2). Diventa la priorità su Pascal.
+**Backward Pascal** (P5.2, fatto): fwd+bwd con d=128 a 4096 token da 3.1–3.8 s a 0.27–0.43 s (P100 / 1080 Ti), cioè da 9 a 11 volte più veloce.
 
 Nsight Compute sulla T4 (d=64, N=4096):
 - tensor core attivi il **2.1%** del picco;
@@ -168,7 +168,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
 | P5.1 | Percorso FP32 per sm_61. **In parte anticipato in P0.5**: il prodotto Q·K del forward Pascal è in FP32 (FFMA), 2.3–2.9× più veloce sulla 1080 Ti. Resta: K/V in FP32 in shared memory (meno conversioni), P@V, scelta a runtime per sm_60 vs sm_61, misurata anche su P100 | M | 1080 Ti e P100: forward misurato prima e dopo con l'harness |
-| P5.2 | Backward CUDA-core: fette di colonne di dK/dV e dQ ridotto in shared memory. In alternativa, un kernel dQ separato che risolve insieme le atomic Pascal e il determinismo (P6.3) [R15] | M | 1080 Ti: backward misurato; niente spill a d≤128 |
+| P5.2 | **Fatto (branch p2-turing)**: backward CUDA-core riscritto a tile come FA2: S/P/dP/dS del tile [Br,Bc] calcolati cooperativamente con prodotti a 128 bit su righe padded, P e dS in shared memory con passo Bc+1 (senza conflitti per righe e per colonne), dK/dV in registri per (riga KV, fetta di colonne), dQ sommato su tutto il blocco KV con **una** `atomicAdd` per elemento e blocco (prima una per coppia q/kv: Bc volte di più). 0 spill su sm_60/61 (prima 2–4,7 KB di stack a d≥96). fwd+bwd causale B=2 H=16 N=4096: P100 d=64 788→93 ms, d=128 3094→270 ms; 1080 Ti d=64 802→187 ms, d=128 3830→431 ms. Loader di tile e prodotto scalare a 128 bit ora unici nell'header (prima tre copie). Da misurare in seguito: `atomicAdd` di dQ con le colonne più veloci (meno settori L2 per istruzione) e trip count costante nello step 1. | M | Fatto: test verdi su P100, 1080 Ti, V100/T4 (Pascal forzato). |
 | P5.3 | **Fatto (branch p2-turing)**: forward WMMA con righe di S/P padded (+4 float / +8 half) e accessi a 128 bit per riga, softmax che scrive P direttamente in half; forward CUDA-core con Q padded (+8 half), prodotto scalare a 128 bit e P nei registri (niente buffer P). Corpo del blocco condiviso tra kernel batched e varlen (`volta_fwd_block`, `pascal_fwd_block`, anticipo di P2.1). Br=64 provato: differenze del ±10% di segno opposto tra GPU, tenuto Br=128. | S | Fatto: conflitti in lettura a 0 (Nsight, T4); tempi in §1b. |
 
 ### P6 — Estensioni (da prioritizzare)

@@ -191,6 +191,7 @@ struct FwdTileSimt {
         return (Br * kLdQ + 2 * Bc * d) * 2;
     }
     static_assert(Br_ % 32 == 0 && d_ % 8 == 0, "invalid CUDA-core forward tile");
+    static_assert(kLdQ % 8 == 0, "128-bit row reads need 16-byte aligned Q rows");
 };
 
 // Forward tiles: Bc = 16 for every head_dim, measured fastest on V100 and T4
@@ -229,8 +230,9 @@ inline bool with_first_fitting_tile(int smem_limit, F& f) {
 
 // ---------------------------------------------------------------------------
 // Backward tile sizes — same template scheme as the forward.
-// Br, Bc, d multiples of 16 (WMMA); d % Bc == 0 (dQ in chunks of Bc);
-// THREADS_PER_KV = (kNumWarps*32) / Bc must be a power of 2 (CUDA-core kernel).
+// WMMA: Br, Bc, d multiples of 16; d % Bc == 0 (dQ in chunks of Bc).
+// CUDA-core: threads % Br == 0 and % Bc == 0, with an even number of columns
+// per thread for dK/dV and dQ (static_asserts in the kernel).
 // ---------------------------------------------------------------------------
 
 // WMMA backward (Volta / Turing): K, V [Bc,d], Q, dO [Br,d] (half); S/P and
@@ -249,14 +251,24 @@ struct BwdTileWmma {
     static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA backward tile");
 };
 
-// CUDA-core backward (Pascal): K, V [Bc,d], Q, dO [Br,d] (half); dK/dV in registers.
+// CUDA-core backward (Pascal): K, V [Bc,kLdH], Q, dO [Br,kLdH] (half, rows padded
+// for conflict-free 128-bit reads); P, dS [Br,kLdF] (float, odd stride: column
+// reads in the dK/dV and dQ steps are conflict free); L, D [Br] (float). dK/dV
+// in registers.
 template <int Br_, int Bc_, int d_, int kNumWarps_ = 4>
 struct BwdTileSimt {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
     static constexpr int kNumWarps = kNumWarps_;
-    static constexpr int smem_bytes() { return (2 * Bc * d + 2 * Br * d) * 2; }
+    static constexpr int kLdH = d_ + 8;
+    static constexpr int kLdF = Bc_ + 1;
+    static constexpr int smem_bytes() {
+        return (2 * Bc * kLdH + 2 * Br * kLdH) * 2 + 2 * Br * kLdF * 4 + 2 * Br * 4;
+    }
+    static_assert(d_ % 8 == 0 && kLdH % 8 == 0, "128-bit row reads need 16-byte aligned rows");
+    static_assert((kNumWarps_ * 32) % Br_ == 0 && (kNumWarps_ * 32) % Bc_ == 0,
+                  "invalid CUDA-core backward tile");
 };
 
 // Backward tile of either family with the same sizes (the sizes per head_dim
@@ -309,6 +321,79 @@ inline int max_dynamic_smem_per_block() {
 __host__ __device__ __forceinline__ int cdiv(int a, int b) {
     return (a + b - 1) / b;
 }
+
+// ---------------------------------------------------------------------------
+// Device helpers shared by every kernel (one implementation each).
+// ---------------------------------------------------------------------------
+#ifdef __CUDACC__
+// ---------------------------------------------------------------------------
+// Vectorized global → shared memory load using half2 (4-byte transactions).
+// Destination rows have stride DST_STRIDE (>= COLS, padded to avoid bank
+// conflicts on per-row accesses); rows >= num_valid_rows are zero-filled.
+// ---------------------------------------------------------------------------
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
+__device__ __forceinline__ void load_tile_g2s(
+    const half* __restrict__ src,
+    int src_row_stride,
+    half* __restrict__ dst,
+    int num_valid_rows
+) {
+    static_assert(COLS % 2 == 0 && DST_STRIDE % 2 == 0, "half2 loads need even sizes");
+    constexpr int COLS2 = COLS / 2;
+    constexpr int TOTAL2 = ROWS * COLS2;
+    constexpr int PER_THREAD = (TOTAL2 + NUM_THREADS - 1) / NUM_THREADS;
+
+    const int tid = threadIdx.x;
+    const half2 zero2 = {__float2half(0.0f), __float2half(0.0f)};
+
+    #pragma unroll
+    for (int i = 0; i < PER_THREAD; i++) {
+        int idx = tid + i * NUM_THREADS;
+        if (idx < TOTAL2) {
+            int row = idx / COLS2;
+            int col2 = idx % COLS2;
+            half2* dst2 = reinterpret_cast<half2*>(dst + row * DST_STRIDE);
+            if (row < num_valid_rows) {
+                const half2* src2 = reinterpret_cast<const half2*>(src + row * src_row_stride);
+                dst2[col2] = src2[col2];
+            } else {
+                dst2[col2] = zero2;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fp16 dot product with fp32 products and accumulation, 128-bit loads.
+// The products are NOT formed in fp16 (__hmul2): a single |q_i * k_i| > 65504
+// would overflow to inf even with in-range inputs, and on sm_61 fp16 math runs
+// at 1/64 of the fp32 rate.
+// ---------------------------------------------------------------------------
+template <int LEN>
+__device__ __forceinline__ float half_dot(
+    const half* __restrict__ a,
+    const half* __restrict__ b
+) {
+    static_assert(LEN % 8 == 0, "LEN must be a multiple of 8 (128-bit loads)");
+    const uint4* a4 = reinterpret_cast<const uint4*>(a);
+    const uint4* b4 = reinterpret_cast<const uint4*>(b);
+    float acc = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < LEN / 8; i++) {
+        const uint4 x = a4[i], y = b4[i];
+        const half2* xh = reinterpret_cast<const half2*>(&x);
+        const half2* yh = reinterpret_cast<const half2*>(&y);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 xf = __half22float2(xh[j]);
+            const float2 yf = __half22float2(yh[j]);
+            acc = fmaf(xf.x, yf.x, acc);
+            acc = fmaf(xf.y, yf.y, acc);
+        }
+    }
+    return acc;
+}
+#endif  // __CUDACC__
 
 // ---------------------------------------------------------------------------
 // Causal masking with N_q != N_kv is bottom-right aligned (same as upstream

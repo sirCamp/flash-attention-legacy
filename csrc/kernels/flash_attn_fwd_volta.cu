@@ -35,41 +35,6 @@ namespace flash_attn_legacy {
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------
-// Vectorized load (same as Pascal)
-// ---------------------------------------------------------------------------
-template <int ROWS, int COLS, int NUM_THREADS>
-__device__ __forceinline__ void volta_load_tile(
-    const half* __restrict__ src,
-    int src_row_stride,
-    half* __restrict__ dst,
-    int num_valid_rows
-) {
-    static_assert(COLS % 2 == 0, "COLS must be even");
-    constexpr int COLS2 = COLS / 2;
-    constexpr int TOTAL2 = ROWS * COLS2;
-    constexpr int PER_THREAD = (TOTAL2 + NUM_THREADS - 1) / NUM_THREADS;
-
-    const int tid = threadIdx.x;
-    const half2 zero2 = {__float2half(0.0f), __float2half(0.0f)};
-    half2* dst2 = reinterpret_cast<half2*>(dst);
-
-    #pragma unroll
-    for (int i = 0; i < PER_THREAD; i++) {
-        int idx = tid + i * NUM_THREADS;
-        if (idx < TOTAL2) {
-            int row = idx / COLS2;
-            int col2 = idx % COLS2;
-            if (row < num_valid_rows) {
-                const half2* src2 = reinterpret_cast<const half2*>(src + row * src_row_stride);
-                dst2[row * COLS2 + col2] = src2[col2];
-            } else {
-                dst2[row * COLS2 + col2] = zero2;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // WMMA matmul: C[M,N] = A[M,K] * B^T[N,K]
 // A is [M, K_DIM] row-major in shared, B is [N, K_DIM] row-major in shared.
 // We want A * B^T, so load B as col_major (which transposes it).
@@ -202,7 +167,7 @@ __device__ __forceinline__ float volta_fwd_block(
     #pragma unroll
     for (int j = 0; j < d; j++) my_O[j] = 0.0f;
 
-    volta_load_tile<Br, d, NUM_THREADS>(Q_ptr, q_stride, smem_Q, valid_q);
+    load_tile_g2s<Br, d, NUM_THREADS>(Q_ptr, q_stride, smem_Q, valid_q);
     __syncthreads();
 
     const int kv_limit = fwd_kv_limit(is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
@@ -210,7 +175,7 @@ __device__ __forceinline__ float volta_fwd_block(
         const int kv_start = kv_blk * Bc;
         const int valid_kv = min(Bc, seq_len_k - kv_start);
 
-        volta_load_tile<Bc, d, NUM_THREADS>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
+        load_tile_g2s<Bc, d, NUM_THREADS>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
         __syncthreads();
 
         // S = Q @ K^T (tensor cores, all warps)
@@ -266,7 +231,7 @@ __device__ __forceinline__ float volta_fwd_block(
             row_sum += local_sum;
         }
 
-        volta_load_tile<Bc, d, NUM_THREADS>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
+        load_tile_g2s<Bc, d, NUM_THREADS>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
         __syncthreads();
 
         // O += P @ V (tensor cores) in chunks of PV_CHUNK columns, via smem_PV
