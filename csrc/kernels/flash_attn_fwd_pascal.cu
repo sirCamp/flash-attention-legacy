@@ -2,218 +2,160 @@
 // Flash Attention v2 — Forward Kernel for Pascal (SM 6.0/6.1), CUDA cores
 // (also runs on newer GPUs with FLASH_ATTN_LEGACY_FORCE_ARCH=pascal).
 //
-// Key design:
-//   - fp16 storage, fp32 math (products and sums)
-//   - 1 thread = 1 Q row (Br = threads); P stays in registers (the owner of a
-//     row of P multiplies it by V, whose rows every thread reads at once)
-//   - Q rows padded in shared memory, 128-bit loads (bank-conflict free)
-//   - one block body (pascal_fwd_block) shared by the batched and varlen kernels
+// Key design (FA2-style, docs/analysis/kernels/p2_8_design.md):
+//   - the band forward of flash_attn_fwd_band.h (K/V loop, masking, online
+//     softmax, batched/varlen kernels), with fp32 FMA register micro-tiles
+//   - each warp owns 16 query rows; lane = 8 * rg + cg holds rows 4rg..4rg+3,
+//     keys cg + 8j (j < Bc/8) and O columns 4cg + 32i..+3 (i < d/32)
+//   - Q, K, V converted to fp32 once, when stored to shared memory: the inner
+//     products run without conversions (on sm_6x a half->float conversion
+//     costs about four FMAs) and without fp16 products (no overflow)
 // ============================================================================
 
-#include "flash_attn_common.h"
+#include "flash_attn_fwd_band.h"
 
-#include <string>
+#include <cstring>
 
 namespace flash_attn_legacy {
 
-// ---------------------------------------------------------------------------
-// One Q block of the CUDA-core forward, shared by the batched and varlen
-// kernels (same structure as volta_fwd_block).
-//
-// Shared memory (Tile::smem_bytes()):
-//   smem_Q [Br, LDQ] half (LDQ = d + 8), smem_K [Bc, d] half, smem_V [Bc, d] half
-// Each thread owns one Q row: it reads its own Q row with 128-bit loads (the
-// padded stride makes them bank-conflict free) and K/V rows that every thread
-// reads at the same time (broadcast). P stays in registers: the thread that
-// computes a row of P is the one that multiplies it by V.
-// Returns the row's logsumexp (only meaningful for threads that own a row).
-// ---------------------------------------------------------------------------
+struct PascalFwd {
 template <typename Tile>
-__device__ __forceinline__ float pascal_fwd_block(
-    const half* __restrict__ Q_ptr, int q_stride,
-    const half* __restrict__ K_ptr, int k_stride,
-    const half* __restrict__ V_ptr, int v_stride,
-    half* __restrict__ O_ptr, int o_stride,
-    int q_row_start, int valid_q, int seq_len_q, int seq_len_k,
-    float softmax_scale, bool is_causal
-) {
+static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int d  = Tile::d;
     constexpr int NUM_THREADS = Tile::kNumWarps * 32;
-    constexpr int LDQ = Tile::kLdQ;
+    constexpr int LDF = Tile::kLdF;
+    constexpr int LDP = Tile::kLdP;
+    constexpr int TN = Bc / 8;   // keys per lane
+    constexpr int TD = d / 32;   // float4 column groups of O per lane
 
     extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
-    half* smem_Q = reinterpret_cast<half*>(smem_raw);
-    half* smem_K = smem_Q + Br * LDQ;
-    half* smem_V = smem_K + Bc * d;
-
+    float* smem_Q = reinterpret_cast<float*>(smem_raw);
+    float* smem_K = smem_Q + Br * LDF;
+    float* smem_V = smem_K + Bc * LDF;
     const int tid = threadIdx.x;
-    const bool owns_row = (tid < Br) && (tid < valid_q);
-    const int causal_off = seq_len_k - seq_len_q;
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    float* smem_Pt = smem_V + Bc * LDF + warp_id * Bc * LDP;  // this warp's P^T [Bc, LDP]
 
-    float row_max = -INFINITY;
-    float row_sum = 0.0f;
-    float my_O[d];
+    const int rg = lane >> 3;                 // row group: rows 4rg..4rg+3 of the band
+    const int cg = lane & 7;                  // column group (keys cg + 8j, O cols 4cg + 32i)
+    const int band_row0 = warp_id * kBandRows;
+    const bool band_active = band_row0 < a.valid_q;
+    const int row0 = band_row0 + 4 * rg;      // first of this lane's rows, within the block
+    const float scale_log2 = a.softmax_scale * kLog2e;
+
+    float4 O[4][TD];
     #pragma unroll
-    for (int j = 0; j < d; j++) my_O[j] = 0.0f;
-
-    load_tile_g2s<Br, d, NUM_THREADS, LDQ>(Q_ptr, q_stride, smem_Q, valid_q);
-    __syncthreads();
-
-    const int kv_limit = fwd_kv_limit(is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
-    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
-        const int kv_start = kv_blk * Bc;
-        const int valid_kv = min(Bc, seq_len_k - kv_start);
-
-        // All threads finished the previous S (they passed the barrier after the
-        // previous V load), so K can be overwritten; P@V does not read K.
-        load_tile_g2s<Bc, d, NUM_THREADS>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
-        __syncthreads();
-
-        float p[Bc];
-        if (owns_row) {
-            float local_max = -INFINITY;
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                float s;
-                if ((kv_start + c) >= seq_len_k ||
-                    (is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
-                    s = -INFINITY;
-                } else {
-                    s = half_dot<d>(smem_Q + tid * LDQ, smem_K + c * d) * softmax_scale;
-                }
-                p[c] = s;
-                local_max = fmaxf(local_max, s);
-            }
-            const float new_max = fmaxf(row_max, local_max);
-            // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
-            const float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
-            row_max = new_max;
-            row_sum *= rescale;
-            #pragma unroll
-            for (int j = 0; j < d; j++) my_O[j] *= rescale;
-            float local_sum = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {
-                p[c] = (p[c] == -INFINITY) ? 0.0f : expf(p[c] - new_max);
-                local_sum += p[c];
-            }
-            row_sum += local_sum;
-        }
-
-        // All threads finished reading K (S above) before V is written over the
-        // previous V; the barrier also publishes V.
-        load_tile_g2s<Bc, d, NUM_THREADS>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
-        __syncthreads();
-
-        // O += P @ V: own row of P (registers) x V rows (broadcast reads)
-        if (owns_row) {
-            #pragma unroll
-            for (int c = 0; c < Bc; c++) {  // no p == 0 skip: divergent, and 0 * inf must give NaN
-                const half2* v2 = reinterpret_cast<const half2*>(smem_V + c * d);
-                #pragma unroll
-                for (int j = 0; j < d / 2; j++) {
-                    const float2 v = __half22float2(v2[j]);
-                    my_O[2 * j]     = fmaf(p[c], v.x, my_O[2 * j]);
-                    my_O[2 * j + 1] = fmaf(p[c], v.y, my_O[2 * j + 1]);
-                }
-            }
-        }
-    }
-
-    if (owns_row) {
-        const float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-        half2* o_dst2 = reinterpret_cast<half2*>(O_ptr + tid * o_stride);
+    for (int i = 0; i < 4; i++) {
         #pragma unroll
-        for (int j = 0; j < d / 2; j++) {
-            o_dst2[j] = __floats2half2_rn(my_O[2 * j] * inv_sum, my_O[2 * j + 1] * inv_sum);
+        for (int t = 0; t < TD; t++) O[i][t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    BandSoftmax<4, 8> softmax;
+    softmax.init();
+
+    auto step = [&](auto mask_tag, int kv_start) {
+        constexpr bool kMask = decltype(mask_tag)::value;
+
+        // S = Q K^T for 4 rows x TN keys, k in chunks of 4 (float4 reads: Q rows
+        // broadcast within the 8 lanes of a row group, the 8 K rows in different
+        // bank groups thanks to the padded stride)
+        float s[4][TN];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int j = 0; j < TN; j++) s[i][j] = 0.0f;
+        }
+        #pragma unroll 4
+        for (int k = 0; k < d; k += 4) {
+            float4 q[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) q[i] = *reinterpret_cast<const float4*>(smem_Q + (row0 + i) * LDF + k);
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                const float4 kk = *reinterpret_cast<const float4*>(smem_K + (cg + 8 * j) * LDF + k);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    s[i][j] = fmaf(q[i].x, kk.x, s[i][j]);
+                    s[i][j] = fmaf(q[i].y, kk.y, s[i][j]);
+                    s[i][j] = fmaf(q[i].z, kk.z, s[i][j]);
+                    s[i][j] = fmaf(q[i].w, kk.w, s[i][j]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int j = 0; j < TN; j++) {
+                s[i][j] = (kMask && fwd_key_masked(a, a.q_row_start + row0 + i, kv_start + cg + 8 * j))
+                          ? -INFINITY : s[i][j] * scale_log2;
+            }
+        }
+        float alpha[4];
+        softmax.update(s, alpha);
+
+        // P^T for the band: key-major, so P @ V reads one float4 per key
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            *reinterpret_cast<float4*>(smem_Pt + (cg + 8 * j) * LDP + 4 * rg) =
+                make_float4(s[0][j], s[1][j], s[2][j], s[3][j]);
+        }
+        __syncwarp();
+
+        // O = O * alpha + P V
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int t = 0; t < TD; t++) {
+                O[i][t].x *= alpha[i]; O[i][t].y *= alpha[i]; O[i][t].z *= alpha[i]; O[i][t].w *= alpha[i];
+            }
+        }
+        #pragma unroll 4
+        for (int c = 0; c < Bc; c++) {  // no p == 0 skip: 0 * inf must give NaN
+            const float4 p = *reinterpret_cast<const float4*>(smem_Pt + c * LDP + 4 * rg);
+            const float pr[4] = {p.x, p.y, p.z, p.w};
+            #pragma unroll
+            for (int t = 0; t < TD; t++) {
+                const float4 v = *reinterpret_cast<const float4*>(smem_V + c * LDF + 4 * cg + 32 * t);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    O[i][t].x = fmaf(pr[i], v.x, O[i][t].x);
+                    O[i][t].y = fmaf(pr[i], v.y, O[i][t].y);
+                    O[i][t].z = fmaf(pr[i], v.z, O[i][t].z);
+                    O[i][t].w = fmaf(pr[i], v.w, O[i][t].w);
+                }
+            }
+        }
+        __syncwarp();  // P^T reads done before the next block overwrites it
+    };
+
+    fwd_band_run<Tile, LDF>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    if (!band_active) return;
+
+    float inv[4], lse[4];
+    softmax.finalize(inv, lse);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int row = row0 + i;
+        if (row >= a.valid_q) break;
+        if (cg == 0) a.L[row * a.l_stride] = lse[i];
+        #pragma unroll
+        for (int t = 0; t < TD; t++) {
+            const half2 lo = __floats2half2_rn(O[i][t].x * inv[i], O[i][t].y * inv[i]);
+            const half2 hi = __floats2half2_rn(O[i][t].z * inv[i], O[i][t].w * inv[i]);
+            uint2 packed;
+            memcpy(&packed.x, &lo, 4);
+            memcpy(&packed.y, &hi, 4);
+            *reinterpret_cast<uint2*>(a.O + row * a.o_stride + 4 * cg + 32 * t) = packed;
         }
     }
-    return row_max + logf(fmaxf(row_sum, 1e-20f));
 }
+};
 
 // ---------------------------------------------------------------------------
-// Forward kernel — CUDA cores (Pascal), batched [B, H, N, d]
-// ---------------------------------------------------------------------------
-template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_fwd_pascal_kernel(FlashAttnParams params) {
-    constexpr int Br = Tile::Br;
-    const int bh_idx = blockIdx.y;
-    const int b_idx = bh_idx / params.num_heads;
-    const int h_idx = bh_idx % params.num_heads;
-    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
-    const int q_row_start = blockIdx.x * Br;
-    if (q_row_start >= params.seq_len_q) return;
-    const int valid_q = min(Br, params.seq_len_q - q_row_start);
-
-    const float lse = pascal_fwd_block<Tile>(
-        params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
-                 + q_row_start * params.q_seq_stride, params.q_seq_stride,
-        params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride, params.k_seq_stride,
-        params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride, params.v_seq_stride,
-        params.O + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
-                 + q_row_start * params.o_seq_stride, params.o_seq_stride,
-        q_row_start, valid_q, params.seq_len_q, params.seq_len_k,
-        params.softmax_scale, params.is_causal);
-
-    const int tid = threadIdx.x;
-    if (tid < valid_q) {
-        params.L[b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_row_start + tid] = lse;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Forward kernel — CUDA cores (Pascal), varlen (packed [total, H, d])
-// ---------------------------------------------------------------------------
-template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
-    constexpr int Br = Tile::Br;
-    const int h_idx = blockIdx.y;
-    const int block_x = blockIdx.x;
-
-    // Binary search: find which sequence this block belongs to
-    int lo = 0, hi = params.num_seqs;
-    while (lo < hi) {
-        const int mid = (lo + hi) / 2;
-        if (params.block_offsets[mid + 1] <= block_x) lo = mid + 1;
-        else hi = mid;
-    }
-    const int seq_idx = lo;
-
-    const int local_block = block_x - params.block_offsets[seq_idx];
-    const int q_start_tok = params.cu_seqlens_q[seq_idx];
-    const int k_start_tok = params.cu_seqlens_k[seq_idx];
-    const int seq_len_q = params.cu_seqlens_q[seq_idx + 1] - q_start_tok;
-    const int seq_len_k = params.cu_seqlens_k[seq_idx + 1] - k_start_tok;
-    const int q_row_start = local_block * Br;
-    if (q_row_start >= seq_len_q) return;
-    const int valid_q = min(Br, seq_len_q - q_row_start);
-    const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
-
-    const float lse = pascal_fwd_block<Tile>(
-        params.Q + (q_start_tok + q_row_start) * params.q_token_stride + h_idx * params.q_head_stride,
-        params.q_token_stride,
-        params.K + k_start_tok * params.k_token_stride + kv_h_idx * params.k_head_stride,
-        params.k_token_stride,
-        params.V + k_start_tok * params.v_token_stride + kv_h_idx * params.v_head_stride,
-        params.v_token_stride,
-        params.O + (q_start_tok + q_row_start) * params.o_token_stride + h_idx * params.o_head_stride,
-        params.o_token_stride,
-        q_row_start, valid_q, seq_len_q, seq_len_k,
-        params.softmax_scale, params.is_causal);
-
-    const int tid = threadIdx.x;
-    if (tid < valid_q) {
-        params.L[(q_start_tok + q_row_start + tid) * params.num_heads + h_idx] = lse;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Host launchers — same dispatch scheme as the WMMA forward (one candidate per
-// head_dim: every Pascal tile fits the 48 KB of shared memory per block).
+// Host side: tile per head_dim (TilePascal_*, flash_attn_common.h), launched
+// with the shared launch_fwd / launch_fwd_varlen.
 // ---------------------------------------------------------------------------
 template <typename F>
 static void dispatch_pascal_fwd_tile(int head_dim, F&& f) {
@@ -230,33 +172,16 @@ static void dispatch_pascal_fwd_tile(int head_dim, F&& f) {
     if (!ok) throw_no_tile("CUDA-core forward", head_dim, limit);
 }
 
-template <typename Tile>
-static void launch_pascal_fwd(FlashAttnParams& params, cudaStream_t stream) {
-    constexpr int smem = Tile::smem_bytes();
-    dim3 grid(cdiv(params.seq_len_q, Tile::Br), params.batch_size * params.num_heads);
-    dim3 block(Tile::kNumWarps * 32);
-    flash_attn_fwd_pascal_kernel<Tile><<<grid, block, smem, stream>>>(params);
-}
-
-template <typename Tile>
-static void launch_pascal_fwd_varlen(FlashAttnVarlenParams& params, int total_q_blocks,
-                                     cudaStream_t stream) {
-    constexpr int smem = Tile::smem_bytes();
-    dim3 grid(total_q_blocks, params.num_heads);
-    dim3 block(Tile::kNumWarps * 32);
-    flash_attn_fwd_pascal_varlen_kernel<Tile><<<grid, block, smem, stream>>>(params);
-}
-
 void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream) {
     dispatch_pascal_fwd_tile(params.head_dim, [&](auto tile) {
-        launch_pascal_fwd<decltype(tile)>(params, stream);
+        launch_fwd<decltype(tile), PascalFwd>(params, stream);
     });
 }
 
 void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params,
                                   int total_q_blocks, cudaStream_t stream) {
     dispatch_pascal_fwd_tile(params.head_dim, [&](auto tile) {
-        launch_pascal_fwd_varlen<decltype(tile)>(params, total_q_blocks, stream);
+        launch_fwd_varlen<decltype(tile), PascalFwd>(params, total_q_blocks, stream);
     });
 }
 

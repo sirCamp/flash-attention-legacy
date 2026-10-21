@@ -1,6 +1,8 @@
 # P2.8 design: FA2-style warp-band forward
 
-Status: approved for implementation, step by step (docs/PLAN.md, P2.8). Baseline: `docs/bench/*.json`.
+Status: steps 0, 1, 2 and 5 done (see the step list); the code is the reference where this design differs. Baseline: `docs/bench/*.json` in git history (commit 81e45f9); current numbers in the same files.
+
+**As implemented** (differs from the original plan below): the shared part is `csrc/include/flash_attn_fwd_band.h` (`FwdBlockArgs`, batched/varlen kernels, `fwd_key_masked`, `BandSoftmax<ROWS, ROW_LANES>`, `fwd_band_loop`, `fwd_band_run` with the Q/K/V copies and optional K/V register prefetch, host launchers). Each family is a `Body` with `run<Tile>(const FwdBlockArgs&)`: `VoltaFwd` (WMMA, staged S/P) and `PascalFwd` (fp32 register micro-tile), instead of a per-op `Mma` policy. Tiles: `TileVolta_*` / `TilePascal_*` in `flash_attn_common.h`, chosen by measurement (comments there).
 
 ## Constraints from the current code
 - One block body per family (`volta_fwd_block`, `pascal_fwd_block`) shared by the batched and varlen kernels; today they return a per-thread lse (thread = row).
@@ -52,7 +54,7 @@ for j:
 2. Register prefetch in the body.
 3. `MmaSm75` (Turing); `FORCE_ARCH=volta` keeps WMMA testable on T4; `sm` passed to `*_block_rows` so launch and varlen offsets share one selection.
 4. Tuning (staged O stores, per-warp n-tile skipping on the diagonal, tile sweep). Acceptance: forward N=4096 within 1.5x of SDPA mem-efficient on V100 and T4.
-5. `MmaSimt` (Pascal) replaces `pascal_fwd_block`; 1080 Ti must not regress, P100 d=128 is the main target.
+5. **Done**: `PascalFwd` (fp32 register micro-tile, fp32 shared memory) replaces the thread-per-row forward, inside the shared band header (P2.1 for the forward). N=4096 causal, P100 / 1080 Ti: d=64 27 -> 12.2 / 74 -> 15.4 ms (P100 now 0.78x SDPA mem-efficient), d=128 81 -> 52 / 176 -> 41, d=256 1768 -> 285 (P100). Open: d=128/256 on Pascal (TN=1 tiles are shared-memory bound, d=256 runs one-warp blocks).
 6. Cleanup (old bodies and tiles), PLAN §1b/§3b, regenerate `occupancy_table.md`.
 7. Optional: Volta `mma.m8n8k4`.
 

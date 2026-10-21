@@ -174,6 +174,7 @@ struct FwdTileWmma {
     static constexpr int kLdH = d_ + 8;
     static constexpr int kLdS = Bc_ + 8;
     static constexpr int kStageFloats = 16 * kLdS;  // per warp
+    static constexpr bool kPrefetch = true;  // K/V register prefetch (measured faster for every tile)
     static constexpr int smem_bytes() {
         return (Br + 2 * Bc) * kLdH * 2 + kNumWarps * (kStageFloats + 16) * 4;
     }
@@ -183,21 +184,29 @@ struct FwdTileWmma {
     static_assert(kStageFloats >= 256 + 64, "WMMA forward staging too small");
 };
 
-// CUDA-core forward (Pascal SM 6.x): Q[Br,kLdQ] + K[Bc,d] + V[Bc,d] (half); P
-// stays in registers. Q rows are padded by 8 halves so that the per-row 128-bit
-// reads are bank-conflict free.
+// CUDA-core forward (Pascal SM 6.x), same band scheme as the WMMA one: each
+// warp owns 16 query rows; lane = 8 * rg + cg holds rows 4rg..4rg+3 of the band,
+// keys cg + 8j and O columns 4cg + 32i..+3, all in fp32 registers.
+// Shared memory, fp32 (converted once when stored, no conversion in the inner
+// products): Q[Br,kLdF], K[Bc,kLdF], V[Bc,kLdF] (rows padded by 4 floats: the 8
+// K rows read at once start in different 4-bank groups), then per warp P^T
+// [Bc,kLdP] (key-major; stride 20 makes the 8 float4 stores conflict free).
 template <int Br_, int Bc_, int d_>
 struct FwdTileSimt {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
-    static constexpr int kNumWarps = Br_ / 32;
-    static constexpr int kLdQ = d_ + 8;
+    static constexpr int kNumWarps = Br_ / 16;
+    static constexpr int kLdF = d_ + 4;
+    static constexpr int kLdP = 20;
+    // Prefetch the next K/V block into registers only when it costs at most two
+    // uint4 per thread and tile (else plain shared-memory loads); same count as
+    // TileRegs<Bc, d, threads>::kPerThread, which is device-only.
+    static constexpr bool kPrefetch = (Bc_ * d_ / 8 + kNumWarps * 32 - 1) / (kNumWarps * 32) <= 2;
     static constexpr int smem_bytes() {
-        return (Br * kLdQ + 2 * Bc * d) * 2;
+        return ((Br + 2 * Bc) * kLdF + kNumWarps * Bc * kLdP) * 4;
     }
-    static_assert(Br_ % 32 == 0 && d_ % 8 == 0, "invalid CUDA-core forward tile");
-    static_assert(kLdQ % 8 == 0, "128-bit row reads need 16-byte aligned Q rows");
+    static_assert(Br_ % 16 == 0 && Bc_ % 8 == 0 && d_ % 32 == 0, "invalid CUDA-core forward tile");
 };
 
 // WMMA forward tiles, in order of preference (the first that fits the device's
@@ -215,18 +224,23 @@ using TileVolta_d128_64k = FwdTileWmma<128, 16, 128>;  // 55 KB
 using TileVolta_d256 = FwdTileWmma<128, 16, 256>;   // 95 KB (V100)
 using TileVolta_d256_64k = FwdTileWmma<64, 16, 256>;   // 56 KB
 
-using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 14 KB
-using TilePascal_d64  = FwdTileSimt<128, 32, 64>;   // 26 KB
-using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 19 KB
-using TilePascal_d128 = FwdTileSimt<64, 16, 128>;   // 25 KB
-using TilePascal_d256 = FwdTileSimt<32, 16, 256>;   // 33 KB
+// CUDA-core forward tiles (48 KB per block on Pascal). Measured, forward causal
+// B=2 H=16 N=4096, P100 / 1080 Ti in ms (thread-per-row kernel before P2.8):
+// d=32 6.1 / 7.3 (13.4 / 24); d=64 12.2 / 15.4 (27 / 74); d=96 21.8 / 23.8
+// (47 / 118); d=128 52 / 41 (81 / 176); d=256 285 / 189 (1768 on P100). fp32
+// shared memory limits d=256 to one-warp blocks (docs/PLAN.md P2.8).
+using TilePascal_d32  = FwdTileSimt<64, 32, 32>;    // 28 KB
+using TilePascal_d64  = FwdTileSimt<64, 16, 64>;    // 31 KB
+using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 43 KB
+using TilePascal_d128 = FwdTileSimt<32, 8, 128>;    // 26 KB
+using TilePascal_d256 = FwdTileSimt<16, 8, 256>;    // 33 KB
 
 // First tile of the list whose smem_bytes() fits `smem_limit`: calls f(Tile{})
 // and returns true, or returns false if none fits. Shared by every launcher and
 // by the host code that needs the selected Br (varlen block offsets), so the
-// selection can never disagree between them. Today every list has one tile
-// (it fits all supported GPUs); the lists exist for per-device candidates
-// (e.g. the forward redesign, docs/PLAN.md P2.8).
+// selection can never disagree between them. Lists with more than one tile
+// give devices with more shared memory per block a larger tile (e.g. the WMMA
+// forward at d=128/256: V100 96 KB, T4 64 KB).
 template <typename First, typename... Rest, typename F>
 inline bool with_first_fitting_tile(int smem_limit, F& f) {
     if (First::smem_bytes() <= smem_limit) {
@@ -344,7 +358,8 @@ __host__ __device__ __forceinline__ int cdiv(int a, int b) {
 // registers) and store them to shared memory later: load_tile_g2r reads a
 // [ROWS, COLS] half tile (row stride src_row_stride) into TileRegs, rows >=
 // num_valid_rows as zeros; store_tile_r2s writes it with row stride DST_STRIDE
-// (>= COLS, padded against bank conflicts). load_tile_g2s does both directly.
+// (>= COLS, padded against bank conflicts), as half or converted to fp32.
+// load_tile_g2s does both directly.
 // Rows must start 16-byte aligned (COLS, strides multiples of 8 halves;
 // contiguous_aligned() on the host).
 // ---------------------------------------------------------------------------
@@ -378,6 +393,22 @@ __device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, 
     }
 }
 
+// fp32 destination: the 8 halves are converted once, when stored (the CUDA-core
+// kernels compute in fp32 from shared memory).
+template <typename R, int DST_STRIDE>
+__device__ __forceinline__ void tile_vec_store(float* __restrict__ dst, int idx, uint4 v) {
+    static_assert(DST_STRIDE % 4 == 0, "128-bit tile copies need DST_STRIDE % 4 == 0 (floats)");
+    if (R::kVecs % R::kThreads == 0 || idx < R::kVecs) {
+        const half2* h = reinterpret_cast<const half2*>(&v);
+        const float2 f0 = __half22float2(h[0]), f1 = __half22float2(h[1]);
+        const float2 f2 = __half22float2(h[2]), f3 = __half22float2(h[3]);
+        float4* d4 = reinterpret_cast<float4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
+                                               + (idx % R::kVecPerRow) * 8);
+        d4[0] = make_float4(f0.x, f0.y, f1.x, f1.y);
+        d4[1] = make_float4(f2.x, f2.y, f3.x, f3.y);
+    }
+}
+
 template <int ROWS, int COLS, int NUM_THREADS>
 __device__ __forceinline__ void load_tile_g2r(
     const half* __restrict__ src, int src_row_stride,
@@ -390,9 +421,9 @@ __device__ __forceinline__ void load_tile_g2r(
     }
 }
 
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
 __device__ __forceinline__ void store_tile_r2s(
-    const TileRegs<ROWS, COLS, NUM_THREADS>& regs, half* __restrict__ dst
+    const TileRegs<ROWS, COLS, NUM_THREADS>& regs, DstT* __restrict__ dst
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
@@ -402,10 +433,10 @@ __device__ __forceinline__ void store_tile_r2s(
 }
 
 // One vector at a time (no tile-sized register buffer).
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
 __device__ __forceinline__ void load_tile_g2s(
     const half* __restrict__ src, int src_row_stride,
-    half* __restrict__ dst, int num_valid_rows
+    DstT* __restrict__ dst, int num_valid_rows
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
