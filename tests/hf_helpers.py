@@ -193,3 +193,27 @@ def tiny_vision_tower(kind="qwen2_vl", head_dim=64, n_heads=2, depth=2, seed=0):
                                      intermediate_size=128, out_hidden_size=64, window_size=56,
                                      fullatt_block_indexes=[depth - 1])
     return Tower(cfg).eval()
+
+
+def tiny_image_encoder(kind, head_dim=64, n_heads=2, layers=2, image_size=64, patch=8, seed=0):
+    """Random-weight single-image vision encoders (bidirectional attention over the
+    patches of each image, batched): SigLIP, CLIP; Pixtral (several images of
+    different sizes in one sequence, separated by a block mask / cu_seq_lens)."""
+    torch.manual_seed(seed)
+    hidden = head_dim * n_heads
+    if kind == "siglip":
+        from transformers import SiglipVisionConfig, SiglipVisionModel
+        cfg = SiglipVisionConfig(hidden_size=hidden, num_attention_heads=n_heads, num_hidden_layers=layers,
+                                 intermediate_size=2 * hidden, image_size=image_size, patch_size=patch)
+        return SiglipVisionModel(cfg).eval()
+    if kind == "clip":
+        from transformers import CLIPVisionConfig, CLIPVisionModel
+        cfg = CLIPVisionConfig(hidden_size=hidden, num_attention_heads=n_heads, num_hidden_layers=layers,
+                               intermediate_size=2 * hidden, image_size=image_size, patch_size=patch,
+                               projection_dim=hidden)
+        return CLIPVisionModel(cfg).eval()
+    from transformers import PixtralVisionConfig, PixtralVisionModel
+    cfg = PixtralVisionConfig(hidden_size=hidden, num_attention_heads=n_heads, num_hidden_layers=layers,
+                              intermediate_size=2 * hidden, image_size=image_size, patch_size=patch,
+                              head_dim=head_dim)
+    return PixtralVisionModel(cfg).eval()

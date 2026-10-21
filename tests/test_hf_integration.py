@@ -918,14 +918,18 @@ def test_packed_position_ids_training_grads():
     assert err(g) <= max(3 * err(noise_g), 1e-5), (err(g), err(noise_g))
 
 
+_GRIDS = [[1, 8, 8], [1, 12, 8], [1, 4, 4], [1, 8, 4], [1, 4, 12], [1, 8, 8], [1, 4, 4], [1, 12, 12]]
+
+
+@pytest.mark.parametrize("n_images", [1, 3, 8])
 @pytest.mark.parametrize("kind,head_dim,expect_varlen", [
     ("qwen2_vl", 64, True), ("qwen2_vl", 80, True), ("qwen2_vl", 48, False), ("qwen2_5_vl", 64, True)])
-def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen):
+def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen, n_images):
     """VLM vision encoders: patches of several images attend within their image
-    (and window, Qwen2.5-VL) via cu_seq_lens."""
+    (and window, Qwen2.5-VL) via cu_seq_lens; 1, 3 and 8 images."""
     tower = tiny_vision_tower(kind, head_dim=head_dim)
     cfg = tower.config
-    grid = torch.tensor([[1, 8, 8], [1, 12, 8], [1, 4, 4]])
+    grid = torch.tensor(_GRIDS[:n_images])
     patch = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size ** 2
     x = torch.randn(int(grid.prod(-1).sum()), patch, generator=torch.Generator().manual_seed(0))
 
@@ -941,7 +945,43 @@ def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen
         assert len(counter.varlen_calls) == cfg.depth and fallback_stats() == {}
     else:
         assert counter.varlen_calls == [] and fallback_stats() == {"head_dim": cfg.depth}
-    assert_close_to_gold(out, gold, noise, f"{kind} d={head_dim}")
+    assert_close_to_gold(out, gold, noise, f"{kind} d={head_dim} x{n_images}")
+
+
+@pytest.mark.parametrize("n_images", [1, 3, 8])
+@pytest.mark.parametrize("kind,head_dim", [("siglip", 72), ("clip", 64), ("pixtral", 64)])
+def test_image_encoders_on_kernel(monkeypatch, kind, head_dim, n_images):
+    """P3.3: SigLIP (so400m-style d=72), CLIP, Pixtral (images of different sizes in
+    one sequence) with 1, 3, 8 images: every attention layer on the kernel, output
+    within the noise of FP32 eager."""
+    from .hf_helpers import tiny_image_encoder
+
+    enc = tiny_image_encoder(kind, head_dim=head_dim)
+    g = torch.Generator().manual_seed(0)
+    if kind == "pixtral":
+        sizes = [(64, 64), (48, 32), (32, 64), (16, 16), (64, 48), (32, 32), (48, 48), (16, 32)][:n_images]
+        pixels = [torch.randn(3, h, w, generator=g) for h, w in sizes]
+        sizes_t = torch.tensor(sizes)
+
+        def run(impl, dtype=torch.float16):
+            m = load_impl(enc, impl, dtype)
+            x = torch.stack([torch.nn.functional.pad(p, (0, 64 - p.shape[2], 0, 64 - p.shape[1])) for p in pixels])
+            with torch.no_grad():
+                return m(x.to("cuda", dtype), image_sizes=sizes_t.cuda()).last_hidden_state.float()
+    else:
+        x = torch.randn(n_images, 3, 64, 64, generator=g)
+
+        def run(impl, dtype=torch.float16):
+            with torch.no_grad():
+                return load_impl(enc, impl, dtype)(pixel_values=x.to("cuda", dtype)).last_hidden_state.float()
+
+    gold, noise = run("eager", torch.float32), run("eager")
+    counter = KernelCounter(monkeypatch)
+    out = run("flash_attn_legacy")
+    n_layers = enc.config.num_hidden_layers
+    assert len(counter.calls) + len(counter.varlen_calls) == n_layers and fallback_stats() == {}, \
+        (counter.calls, counter.varlen_calls, fallback_stats())
+    assert_close_to_gold(out, gold, noise, f"{kind} x{n_images}")
 
 
 # ---------------------------------------------------------------------------
