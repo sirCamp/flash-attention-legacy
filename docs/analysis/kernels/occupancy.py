@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Parse ptxas -v output and compute theoretical occupancy per kernel instantiation/arch."""
+"""Parse ptxas -v output and compute theoretical occupancy per kernel instantiation/arch.
+
+STALE: TILES below predates P2.3 and the P2.8 forward; regenerate in P2.8 step 6."""
 import re, glob, os, math, json
 RAW = "/workspace/analysis/kernels/raw"
 TILES = {  # (Br, Bc, d, warps)

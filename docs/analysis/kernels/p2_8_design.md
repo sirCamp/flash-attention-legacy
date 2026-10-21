@@ -17,7 +17,7 @@ Softmax: `scale_log2 = scale * log2(e)`; per KV block `m_new = max(m_old, rowmax
 Lane `g = lane>>2`, `t = lane&3`: per 8-column n-tile a thread holds rows g, g+8, cols 2t, 2t+1 (c0,c1 / c2,c3); `kRowsPerThread = 2`, `kRowLanes = 4`. S = Bc/2 regs, O = d/2 regs, Q in registers (`ldmatrix.x4`, d/4 regs; Q kept in smem at d=256). K via `ldmatrix` (no trans), V via `ldmatrix.trans`. P as the A operand straight from S: for k-step kk, `A = {half2(S[kk].c0,c1), half2(S[kk].c2,c3)}` (the m16n8k8 C layout equals the A layout; the reason to use k8 rather than k16). Smem rows stride d+8 halves.
 
 ### Volta: `MmaWmmaStaged` (WMMA 16x16x16 with per-warp staging)
-S fragments stored to a per-warp `[16][Bc+4]` float staging, softmax with 2 lanes per row (interleaved float4 chunks), P written as half in place (ldm `2*(Bc+4)`), reloaded as matrix_a. O rescale without assuming the WMMA layout: probe the accumulator row map once per block through `store_matrix_sync` (a bijection), then apply per-row alpha read from per-warp smem. No block-wide barrier for softmax. SDPA mem-efficient also stages through smem on sm_70, so the target is reachable. `mma.m8n8k4` is a later optional step (P2.8.7) only if V100 stays above 1.5x.
+S fragments stored to a per-warp `[16][Bc+8]` float staging (Bc+8, not Bc+4: with Bc+4 at Bc=64 lanes (r=0,h=1) and (r=1,h=0) hit the same banks), softmax with 2 lanes per row (interleaved float4 chunks), P written as half in place (ldm `2*(Bc+8)`), reloaded as matrix_a. O rescale without assuming the WMMA layout: probe the accumulator row map once per block through `store_matrix_sync` (a bijection), then apply per-row alpha read from per-warp smem. No block-wide barrier for softmax. SDPA mem-efficient also stages through smem on sm_70, so the target is reachable. `mma.m8n8k4` is a later optional step (P2.8.7) only if V100 stays above 1.5x.
 
 ### Pascal: `MmaSimt` (fp32 FMA register micro-tile)
 Today's forward is conversion bound (`half_dot`: ~2 cvt per FMA, F2F at 1/4 FFMA rate on sm_6x). Convert once at the smem store (fp32 smem). Lane `= rg*8 + cg`: rows 4rg..4rg+3 (`kRowsPerThread = 4`, `kRowLanes = 8`), keys `cg + 8j`, O columns `4cg + 32i..+3`. S with LDS.128 of Q (broadcast) and K: 64 FFMA per 8 LDS.128 at TN=4, no cvt. P stored transposed per warp `[Bc][16]` fp32. O = d/2 regs (vs `my_O[d]` today).
@@ -25,11 +25,11 @@ Today's forward is conversion bound (`half_dot`: ~2 cvt per FMA, F2F at 1/4 FFMA
 ## Tiles (`<Br, Bc, d, warps>`, in `with_first_fitting_tile` order; sizes computed, speeds to measure)
 | d | Turing mma | V100 WMMA-staged | Pascal SIMT fp32 |
 |---|---|---|---|
-| 32 | `<64,64,32,4>` 15 KB | `<64,64,32,4>` 32 KB | `<64,32,32,4>` 26 KB |
-| 64 | `<64,64,64,4>` 27 KB | `<64,64,64,4>` 44 KB, `<64,32,64,4>` 27.6 KB | `<64,16,64,4>` 30 KB |
-| 96 | `<64,64,96,4>` 39 KB, `<64,32,96,4>` 26 KB | `<64,32,96,4>` 35 KB | `<64,16,96,4>` 40 KB, `<32,16,96,2>` 27.6 KB |
-| 128 | `<64,64,128,4>` 51 KB, `<64,32,128,4>` 34 KB | `<64,64,128,4>` 68 KB, `<64,32,128,4>` 43 KB | `<32,16,128,2>` 35 KB |
-| 256 | `<64,32,256,4>` 66 KB, `<64,16,256,4>` 50.7 KB | `<64,32,256,4>` 75 KB, `<64,16,256,4>` 55 KB | `<16,16,256,1>` 50 KB, `<16,8,256,1>` 34 KB |
+| 32 | `<64,64,32,4>` 15 KB | `<64,64,32,4>` 33 KB | `<64,32,32,4>` 26 KB |
+| 64 | `<64,64,64,4>` 27 KB | `<64,64,64,4>` 45 KB, `<64,32,64,4>` 29 KB | `<64,16,64,4>` 30 KB |
+| 96 | `<64,64,96,4>` 39 KB, `<64,32,96,4>` 26 KB | `<64,32,96,4>` 36 KB | `<64,16,96,4>` 40 KB, `<32,16,96,2>` 27.6 KB |
+| 128 | `<64,64,128,4>` 51 KB, `<64,32,128,4>` 34 KB | `<64,64,128,4>` 70 KB, `<64,32,128,4>` 44 KB | `<32,16,128,2>` 35 KB |
+| 256 | `<64,32,256,4>` 66 KB, `<64,16,256,4>` 50.7 KB | `<64,32,256,4>` 77 KB, `<64,16,256,4>` 56 KB | `<16,16,256,1>` 50 KB, `<16,8,256,1>` 34 KB |
 
 Register budget (tensor cores): O d/2 + S Bc/2 + Q d/4 + prefetch + ~30. `__launch_bounds__(threads, kMinBlocks)` per tile; 0 spills checked with `build_ptxas.sh` at every step. `smem_bytes()` stays the single source of truth (staging and aliasing included).
 
@@ -48,7 +48,7 @@ for j:
 
 ## Implementation order (one change at a time; tests on all GPUs, benchmark, ptxas, review)
 0. Groundwork, behaviour neutral: (a) shared WMMA helpers in `flash_attn_wmma.h` (forward + backward); (b) g2r/r2s split; (c) blocks write L; (d) `fwd_kv_nomask_limit` + split loop in the current kernels; (e) tests: raw lse vs FP32, unaligned N (15, 17, 63, 65, 127), causal n_q >> n_k (200, 5), varlen segments 1/15/17/65, d=256 N=4096.
-1. `fwd_band_block` + `MmaWmmaStaged` for sm_70/75: replaces `volta_fwd_block`. Largest win on V100 and T4 at once.
+1. **Done**: warp-band WMMA body (staged) for sm_70/75 replaces the thread-per-row `volta_fwd_block` (V100 fwd N=4096 d=64 9.5 -> 5.6 ms, d=128 24.2 -> 11.6; T4 26.1 -> 14.0, 48.6 -> 27.9). The `Mma` policy split (shared `fwd_band_block` in its own header) is deliberately done in step 3, when the second policy exists, instead of abstracting around a single user; the loop, masking and softmax must then live once in the shared body.
 2. Register prefetch in the body.
 3. `MmaSm75` (Turing); `FORCE_ARCH=volta` keeps WMMA testable on T4; `sm` passed to `*_block_rows` so launch and varlen offsets share one selection.
 4. Tuning (staged O stores, per-warp n-tile skipping on the diagonal, tile sweep). Acceptance: forward N=4096 within 1.5x of SDPA mem-efficient on V100 and T4.

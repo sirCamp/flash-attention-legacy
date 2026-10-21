@@ -155,26 +155,32 @@ struct FlashAttnBwdParams {
 //
 // One template per kernel family; smem_bytes() is the single source of truth
 // for the dynamic shared memory of a tile (used by the launches and by the
-// runtime tile selection). Br = threads per block: 1 thread owns 1 Q row.
+// runtime tile selection). Threads per block: 32 * kNumWarps of each tile.
 // ---------------------------------------------------------------------------
 
-// WMMA forward (Volta SM 7.0, Turing SM 7.5): Q[Br,d] + K[Bc,d] + V[Bc,d] (half),
-// S[Br,kLdS] (float, reused for the P@V chunks), P[Br,kLdP] (half).
-// The row strides are padded (+4 floats / +8 halves, still valid WMMA leading
-// dimensions) so that the per-row 128-bit accesses are bank-conflict free.
-// Constraints: Br, Bc multiples of 16; d % Bc == 0 (P@V in chunks of Bc).
+// WMMA forward (Volta SM 7.0, Turing SM 7.5), FA2-style: each warp owns a band
+// of 16 query rows, O stays in WMMA accumulator fragments (registers).
+// Shared memory: Q[Br,kLdH], K[Bc,kLdH], V[Bc,kLdH] (half, rows padded by 8
+// halves: valid WMMA leading dimension, conflict-free fragment loads), then per
+// warp an S/P staging tile [16,kLdS] float (P is written in place as half, row
+// stride 2*kLdS) and 16 per-row scales. kLdS = Bc+8 makes the softmax reads (two
+// lanes per row, interleaved float4 chunks) bank-conflict free.
 template <int Br_, int Bc_, int d_>
 struct FwdTileWmma {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
-    static constexpr int kNumWarps = Br_ / 32;
-    static constexpr int kLdS = Bc_ + 4;
-    static constexpr int kLdP = Bc_ + 8;
+    static constexpr int kNumWarps = Br_ / 16;
+    static constexpr int kLdH = d_ + 8;
+    static constexpr int kLdS = Bc_ + 8;
+    static constexpr int kStageFloats = 16 * kLdS;  // per warp
     static constexpr int smem_bytes() {
-        return (Br * d + 2 * Bc * d) * 2 + Br * kLdS * 4 + Br * kLdP * 2;
+        return (Br + 2 * Bc) * kLdH * 2 + kNumWarps * (kStageFloats + 16) * 4;
     }
-    static_assert(Br_ % 32 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA forward tile");
+    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % 16 == 0, "invalid WMMA forward tile");
+    // The staging tile also holds the one-time accumulator layout probe
+    // (256 floats + a 256-byte table).
+    static_assert(kStageFloats >= 256 + 64, "WMMA forward staging too small");
 };
 
 // CUDA-core forward (Pascal SM 6.x): Q[Br,kLdQ] + K[Bc,d] + V[Bc,d] (half); P
@@ -194,13 +200,12 @@ struct FwdTileSimt {
     static_assert(kLdQ % 8 == 0, "128-bit row reads need 16-byte aligned Q rows");
 };
 
-// Forward tiles: Bc = 16 for every head_dim, measured fastest on V100 and T4
-// (smaller tiles -> more blocks per SM; see the WMMA launcher). Every WMMA tile
-// fits the 64 KB per block of Turing.
-using TileVolta_d32  = FwdTileWmma<128, 16, 32>;    // 26 KB
-using TileVolta_d64  = FwdTileWmma<128, 16, 64>;    // 36 KB
-using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 46 KB
-using TileVolta_d128 = FwdTileWmma<128, 16, 128>;   // 56 KB
+// WMMA forward tiles: 4 warps (64 rows); Bc as large as registers and the 64 KB
+// per block of Turing allow (docs/analysis/kernels/p2_8_design.md).
+using TileVolta_d32  = FwdTileWmma<64, 64, 32>;     // 34 KB
+using TileVolta_d64  = FwdTileWmma<64, 64, 64>;     // 45 KB
+using TileVolta_d96  = FwdTileWmma<64, 32, 96>;     // 36 KB
+using TileVolta_d128 = FwdTileWmma<64, 32, 128>;    // 44 KB
 using TileVolta_d256 = FwdTileWmma<64, 16, 256>;    // 56 KB
 
 using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 14 KB
@@ -410,6 +415,19 @@ __host__ __device__ __forceinline__ int fwd_kv_limit(
     const int last_visible_key = q_row_start + Br - 1 + (seq_len_k - seq_len_q);
     const int lim = (last_visible_key < 0) ? 0 : cdiv(last_visible_key + 1, Bc);
     return lim < nkv ? lim : nkv;
+}
+
+// Number of leading K/V blocks that need no masking for any row of the Q block
+// [q_row_start, q_row_start + Br): fully inside seq_len_k and, if causal, fully
+// visible to the first row (bottom-right alignment). Always <= fwd_kv_limit.
+__host__ __device__ __forceinline__ int fwd_kv_nomask_limit(
+    bool causal, int q_row_start, int Bc, int seq_len_q, int seq_len_k
+) {
+    const int full = seq_len_k / Bc;
+    if (!causal) return full;
+    const int visible = q_row_start + 1 + (seq_len_k - seq_len_q);  // keys seen by the first row
+    const int lim = (visible <= 0) ? 0 : visible / Bc;
+    return lim < full ? lim : full;
 }
 
 // First Q block that can see any key of the K/V block starting at kv_start (backward).
