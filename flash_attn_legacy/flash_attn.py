@@ -22,11 +22,49 @@ except ImportError as e:
     )
 
 
+# The kernels compute in fp16. bf16 / fp32 inputs are converted (exact within the
+# fp16 range up to fp16 precision) and the output is converted back.
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_FP16_MAX = 65504.0
+
+
+class FP16RangeError(OverflowError):
+    """bf16/fp32 inputs hold values beyond the fp16 range the kernels compute in."""
+
+
+def _check_fp16_range(*tensors):
+    """Raise FP16RangeError unless every value fits the fp16 range (one host sync;
+    inf-norm reduction, no full-size temporaries). NaN also raises: it would hide
+    an overflow in the same tensor; callers fall back to their original dtype."""
+    amax = torch.stack([torch.linalg.vector_norm(t.detach(), float("inf")).float()
+                        for t in tensors]).max()
+    if not bool(amax <= _FP16_MAX):
+        raise FP16RangeError(f"flash_attn_legacy: {tensors[0].dtype} inputs exceed the fp16 "
+                             f"range or contain NaN (max |x| = {amax.item():.4g})")
+
+
+def _to_fp16(q, k, v):
+    """Convert non-fp16 inputs to fp16, range-checked. Gradients through the
+    conversion are not supported: without loss scaling, bf16/fp32 training
+    gradients may underflow in fp16."""
+    if q.dtype == torch.float16:
+        return q, k, v
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        raise NotImplementedError(
+            f"flash_attn_legacy: training with {q.dtype} inputs is not supported (the kernels "
+            "compute in fp16 and gradients may underflow without loss scaling); use fp16 "
+            "with a GradScaler, or run inference under torch.inference_mode()")
+    _check_fp16_range(q, k, v)
+    return q.half(), k.half(), v.half()
+
+
 def _check_inputs(q, k, v, ndim):
     """Validate dtype/device/rank of q, k, v (raises, so it survives python -O)."""
     for name, t in (("q", q), ("k", k), ("v", v)):
-        if t.dtype != torch.float16:
-            raise TypeError(f"{name} must be float16, got {t.dtype}")
+        if t.dtype not in _SUPPORTED_DTYPES:
+            raise TypeError(f"{name} must be one of {_SUPPORTED_DTYPES}, got {t.dtype}")
+        if t.dtype != q.dtype:
+            raise TypeError(f"q, k, v must have the same dtype, got {q.dtype} and {t.dtype}")
         if not t.is_cuda:
             raise ValueError(f"{name} must be a CUDA tensor")
         if t.dim() != ndim:
@@ -102,20 +140,23 @@ def flash_attention(
       - MQA: same as GQA with H_kv = 1
 
     Args:
-        q: Query [B, H_q, N, d] float16
-        k: Key   [B, H_kv, N, d] float16
-        v: Value [B, H_kv, N, d] float16
+        q: Query [B, H_q, N, d] float16 (bfloat16 / float32 accepted for inference:
+           converted to fp16, range-checked, FP16RangeError if out of range)
+        k: Key   [B, H_kv, N, d], same dtype as q
+        v: Value [B, H_kv, N, d], same dtype as q
         softmax_scale: default 1/sqrt(d)
         causal: apply a causal mask
         is_causal: deprecated alias of `causal`
 
     Returns:
-        [B, H_q, N, d] float16
+        [B, H_q, N, d] in the dtype of q
     """
     causal = _resolve_causal(causal, is_causal)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    return FlashAttentionFunc.apply(q, k, v, softmax_scale, causal)
+    _check_inputs(q, k, v, ndim=4)
+    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal)
+    return out if q.dtype == torch.float16 else out.to(q.dtype)
 
 
 class FlashAttnVarlenFunc(Function):
@@ -209,9 +250,10 @@ def flash_attn_varlen_func(
     Backward uses per-sequence calls to the batched backward kernel.
 
     Args:
-        q: [total_q, num_heads, head_dim] float16
-        k: [total_k, num_heads_k, head_dim] float16
-        v: [total_k, num_heads_k, head_dim] float16
+        q: [total_q, num_heads, head_dim] float16 (bfloat16 / float32 for inference,
+           as in flash_attention)
+        k: [total_k, num_heads_k, head_dim], same dtype as q
+        v: [total_k, num_heads_k, head_dim], same dtype as q
         cu_seqlens_q: [batch_size + 1] int32 — cumulative sequence lengths for Q
         cu_seqlens_k: [batch_size + 1] int32 — cumulative sequence lengths for K/V
         max_seqlen_q: max sequence length in Q
@@ -220,7 +262,7 @@ def flash_attn_varlen_func(
         causal: apply causal mask
 
     Returns:
-        [total_q, num_heads, head_dim] float16
+        [total_q, num_heads, head_dim] in the dtype of q
 
     Example:
         # Batch of 3 sequences: lengths 128, 256, 64
@@ -236,10 +278,12 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
 
-    return FlashAttnVarlenFunc.apply(
-        q, k, v, cu_seqlens_q, cu_seqlens_k,
+    _check_inputs(q, k, v, ndim=3)
+    out = FlashAttnVarlenFunc.apply(
+        *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, softmax_scale, causal,
     )
+    return out if q.dtype == torch.float16 else out.to(q.dtype)
 
 
 class FlashAttention(nn.Module):
@@ -327,13 +371,17 @@ class FlashMultiHeadAttention(nn.Module):
         v = self.v_proj(kv).view(B, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         orig_dtype = q.dtype
-        if q.dtype != torch.float16:
+        if orig_dtype != torch.float16 and torch.is_grad_enabled():
+            # Training a non-fp16 module: kept for compatibility (fp32 modules by
+            # default), but gradients are fp16 without loss scaling.
+            warnings.warn("FlashMultiHeadAttention: training with non-fp16 weights computes "
+                          "attention gradients in fp16 without loss scaling (they may "
+                          "underflow); prefer fp16 + GradScaler", UserWarning, stacklevel=2)
+            _check_fp16_range(q, k, v)
             q, k, v = q.half(), k.half(), v.half()
 
-        out = flash_attention(q, k, v, self.scale, self.causal)
-
-        if orig_dtype != torch.float16:
-            out = out.to(orig_dtype)
+        out = flash_attention(q, k, v, self.scale, self.causal)  # bf16/fp32: range-checked
+        out = out.to(orig_dtype)
 
         out = out.transpose(1, 2).contiguous().view(B, N, self.embed_dim)
         return self.dropout(self.out_proj(out))

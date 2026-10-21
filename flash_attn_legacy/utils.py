@@ -15,6 +15,7 @@ def check_head_dim(d: int) -> None:
     if d not in SUPPORTED_HEAD_DIMS:
         raise ValueError(f"head_dim must be one of {SUPPORTED_HEAD_DIMS}, got {d}")
 
+
 _SM_TO_ARCH = {
     60: "Pascal (GP100)", 61: "Pascal (GP10x)", 62: "Pascal (Jetson)",
     70: "Volta", 72: "Volta (Jetson)",

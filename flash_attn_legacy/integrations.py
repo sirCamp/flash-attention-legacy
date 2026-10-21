@@ -66,6 +66,11 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "head_dim": FallbackReason(f"head_dim not in {SUPPORTED_HEAD_DIMS}"),
     "v_head_dim": FallbackReason("V head_dim != Q head_dim (e.g. MLA)"),
     "dropout": FallbackReason("attention dropout in training mode"),
+    "fp16_overflow": FallbackReason(
+        "non-fp16 inputs (bf16/fp32) exceed the fp16 range the kernel computes in"),
+    "non_fp16_training": FallbackReason(
+        "bf16/fp32 training: kernel gradients are fp16 and may underflow without loss "
+        "scaling (docs/PLAN.md P6.2)"),
 }
 
 # 2D masks follow HF's flash_attention_2 convention: a [B, n] mask means only the
@@ -141,6 +146,9 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
         return "attention_mask", ""
     if dropout > 0.0 and module.training:
         return "dropout", ""
+    if query.dtype != torch.float16 and torch.is_grad_enabled() and (
+            query.requires_grad or key.requires_grad or value.requires_grad):
+        return "non_fp16_training", f" ({query.dtype})"
     return None, ""
 
 
@@ -235,12 +243,15 @@ def _eager_attention(query, key, value, mask, scaling, dropout_p, softcap=None,
 # tensor: transformers passes the same object to every layer, so the host sync
 # needed to read them happens once per forward, not once per layer. The key
 # includes the tensor version (bumped by every in-place write, e.g. a reused
-# buffer) and the device; a copy simply recomputes. The attribute is a fast
-# path, never needed for correctness.
+# buffer) and the device; a copy, or an inference-mode tensor (no version
+# counter), simply recomputes. The attribute is a fast path, never needed for
+# correctness.
 _SEGMENTS_ATTR = "_flash_attn_legacy_segments"
 
 
 def _cached_segments(source, q_len, device, compute):
+    if source.is_inference():
+        return compute()  # inference tensors have no version counter: no caching
     key = (q_len, source._version, device)
     cached = getattr(source, _SEGMENTS_ATTR, None)
     if cached is not None and cached[0] == key:
@@ -339,7 +350,9 @@ def flash_attn_legacy_forward(
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
-    from .flash_attn import flash_attention
+    if key.dtype != query.dtype:
+        # e.g. an fp32 static cache under fp16 autocast: compute in the query dtype
+        key, value = key.to(query.dtype), value.to(query.dtype)
 
     padding_2d = False
     if attention_mask is not None and attention_mask.dim() == 2:
@@ -385,29 +398,35 @@ def flash_attn_legacy_forward(
     reason, detail = _kernel_fallback_reason(module, query, key, value, attention_mask,
                                              dropout, kwargs)
 
+    attn_output = None
     if reason is None:
-        # Our flash kernel (O(N) memory), batched or varlen
-        q_fp16 = query.half() if query.dtype != torch.float16 else query
-        k_fp16 = key.half() if key.dtype != torch.float16 else key
-        v_fp16 = value.half() if value.dtype != torch.float16 else value
+        # Our flash kernel (O(N) memory), batched or varlen. bf16 / fp32 inputs are
+        # converted to fp16 by the API, which raises FP16RangeError on overflow.
+        from .flash_attn import FP16RangeError, flash_attention, flash_attn_varlen_func
 
-        if segments is None:
-            attn_output = flash_attention(q_fp16, k_fp16, v_fp16,
-                                          softmax_scale=scaling, causal=is_causal)
-        else:
-            from .flash_attn import flash_attn_varlen_func
+        try:
+            if segments is None:
+                attn_output = flash_attention(query, key, value,
+                                              softmax_scale=scaling, causal=is_causal)
+            else:
+                cu_seqlens, max_len = segments
+                packed = [t[0].transpose(0, 1) for t in (query, key, value)]  # [N, H, d]
+                attn_output = flash_attn_varlen_func(
+                    *packed, cu_seqlens, cu_seqlens, max_len, max_len,
+                    softmax_scale=scaling, causal=is_causal,
+                ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
+        except FP16RangeError:
+            reason, detail = "fp16_overflow", f" ({query.dtype})"
+        if attn_output is not None and query.dtype == torch.float32:
+            _warn_once("fp32_compute", "flash_attn_legacy: float32 inputs are computed in "
+                                       "float16 by the kernel (inference only)")
 
-            cu_seqlens, max_len = segments
-            packed = [t[0].transpose(0, 1) for t in (q_fp16, k_fp16, v_fp16)]  # [N, H, d]
-            attn_output = flash_attn_varlen_func(
-                *packed, cu_seqlens, cu_seqlens, max_len, max_len,
-                softmax_scale=scaling, causal=is_causal,
-            ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
-
-        if query.dtype != torch.float16:
-            attn_output = attn_output.to(query.dtype)
-    else:
+    if attn_output is None:
         action = _record_fallback(reason, detail)  # raises if no correct fallback exists
+        if reason == "non_fp16_training" and not module.training:
+            _warn_once("grad_in_eval", "flash_attn_legacy: %s inference with gradients enabled "
+                       "runs on SDPA; wrap it in torch.inference_mode() to use the kernel",
+                       query.dtype)
 
         # One mask for both fallbacks: boolean (True = keep) or additive float,
         # with bottom-right causality; `causal_only` = plain causal, q_len == kv_len.

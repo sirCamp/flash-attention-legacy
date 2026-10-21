@@ -29,7 +29,7 @@ Dimensioni: **S** = qualche ora, **M** = 1–3 giorni, **L** = più di 3 giorni.
 | B4 | Sequenze impacchettate con `use_cache=True` o `cu_seq_lens` trattate come una sola sequenza | training con packing | confermato su V100 |
 | B5 | `cu_seq_lens` ignorato **sia nel kernel sia nel fallback SDPA**: l'attention attraversa le immagini | Qwen2-VL-2B (vedi B6), Qwen3-VL e Pixtral (d=64, percorso kernel). Qwen2.5-VL **non** è colpito oggi (tutto su SDPA). | confermato su CPU [R1] |
 | B6 | Il controllo dell'head_dim si fa sulla **config** (`hidden_size / num_attention_heads`), non sulla singola chiamata. Sbaglia per i sotto-modelli: in Qwen2-VL-2B calcola 96 invece di 80 e lascia passare il nostro backend. Inoltre sposta interi sotto-modelli su SDPA | VLM; tutti i modelli con head_dim personalizzato | confermato da codice e config [R2] |
-| B7 | Input BF16 o FP32 convertiti in FP16 senza avviso nel percorso kernel: possibile overflow sopra 65504 | modelli BF16 (Gemma, …) | da codice [R3] |
+| B7 | Input BF16 o FP32 convertiti in FP16 senza avviso nel percorso kernel: possibile overflow sopra 65504 | modelli BF16 (Gemma, …) | **chiuso in P0.5** |
 | B8 | Su T4 il forward d=64 e d=128 solleva un'eccezione (shared memory oltre i 64 KB per blocco): BERT e Llama non partono | sm_75 | confermato da ptxas, da verificare sulla T4 [R4] |
 
 **Feature mancanti** (oggi su SDPA: corrette, ma senza kernel):
@@ -89,7 +89,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P0.2 | **B1, StaticCache**: quando deleghiamo alla maschera SDPA, la chiamiamo con `allow_is_causal_skip=False`; `None` resta solo nel caso che abbiamo verificato. | S | Logit entro il rumore rispetto a eager FP32 con cache statica, ibrida e sliding (Gemma 2/3), offloaded, decoding assistito e beam search, su TinyLlama, Llama 8B e Gemma 3. |
 | P0.3 | **B2, B3, MLA**: con `softcap` o `s_aux` si usa un fallback che li applica (eager con maschera). Con head_dim di V diverso da quello di Q si usa SDPA, che lo supporta [R16]. | S | Gemma 2 e gpt-oss ridotto entro il rumore rispetto a eager FP32. |
 | P0.4 | **B4 e B5**: con `cu_seq_lens_q/k` si usa `flash_attn_varlen_func` se l'head_dim è supportato. Altrimenti un fallback che **rispetta i segmenti** (maschera a blocchi diagonali o loop per segmento) [R1]. Il packing ricavato da `position_ids` con `use_cache=False` resta sul fallback SDPA di oggi, che è già corretto, finché P1.3 non lo rende veloce [R8]. | S–M | Batch impacchettato: loss uguale a quella delle sequenze eseguite singolarmente. Encoder di visione di Qwen2-VL-2B, Qwen3-VL e Pixtral (2 e 8 immagini) entro il rumore. Gradiente dei q/k proj (1-cos rispetto all'oro) non peggiore di SDPA FP16 mem-efficient [R7]. |
-| P0.5 | **B7, dtype**: BF16 va sul fallback (finché non c'è P5.2). Il downcast da FP32 a FP16 si documenta, con un controllo opzionale di overflow (`amax`). | S | Test con input BF16 vicini al limite FP16: nessun overflow silenzioso. |
+| P0.5 | **B7, dtype** (fatto): BF16/FP32 in inferenza girano sul kernel dopo una conversione in FP16 controllata nell'API (`FP16RangeError` se un valore supera 65504 → fallback `fp16_overflow` nel dtype originale). In training (gradienti richiesti) vanno su SDPA (`non_fp16_training`): senza loss scaling i gradienti FP16 andrebbero in underflow. FP32 in inferenza: avviso una tantum che il calcolo è in FP16. In più: il prodotto scalare del forward Pascal non si forma più in FP16 (overflow con prodotti > 65504; anche 2.3–2.9× più veloce sulla 1080 Ti). | S | Fatto: test di overflow, training BF16 e prodotti grandi falliscono sul codice precedente. |
 | P0.6 | **B8, guardia sulle architetture**: prima del lancio si controlla se la tile entra nella shared memory del device; se non entra, il fallback è registrato (P0.1). È temporaneo: P2.3 lo rende inutile. | S | Sulla T4 BERT e Llama girano (su fallback) e i test non sollevano eccezioni. |
 | P0.7 | **Casi limite**: `is_causal=None` nei kwargs si interpreta come attributo del modulo, come fa SDPA. Validazione di `cu_seqlens` (monotonia, ultimo valore uguale al totale). Sequenze di lunghezza 0 senza lanci con griglia 0. | S | Test dedicati. |
 | P0.8 | **Documentazione dei limiti noti emersi in P0.1–P0.2** (README):<br>• Pascal + `cache_implementation="static"`: HF compila da solo e Triton non supporta sm<7, quindi serve `disable_compile=True`.<br>• Decoder bidirezionale (`is_causal=False`) con cache statica: le chiavi vuote vengono incluse, come fa SDPA di HF.<br>• Doge con cache statica: indicizza la maschera come 4D e solleva un errore. | S | Sezione "Known limitations" aggiornata. |
@@ -136,7 +136,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
-| P5.1 | Percorso FP32 per sm_61 (K/V in FP32 al caricamento, FFMA). Selezionabile anche con `FORCE_ARCH` nel build di test, per verificarne la correttezza sulla V100 [R5] | M | 1080 Ti: forward misurato prima e dopo con l'harness |
+| P5.1 | Percorso FP32 per sm_61. **In parte anticipato in P0.5**: il prodotto Q·K del forward Pascal è in FP32 (FFMA), 2.3–2.9× più veloce sulla 1080 Ti. Resta: K/V in FP32 in shared memory (meno conversioni), P@V, scelta a runtime per sm_60 vs sm_61, misurata anche su P100 | M | 1080 Ti e P100: forward misurato prima e dopo con l'harness |
 | P5.2 | Backward CUDA-core: fette di colonne di dK/dV e dQ ridotto in shared memory. In alternativa, un kernel dQ separato che risolve insieme le atomic Pascal e il determinismo (P6.3) [R15] | M | 1080 Ti: backward misurato; niente spill a d≤128 |
 | P5.3 | Padding delle righe in shared memory contro i bank conflict (tutte le architetture) | S | Profiler e harness |
 
@@ -145,10 +145,10 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | ID | Intervento | Dim |
 |---|---|---|
 | P6.1 | Kernel di decode split-KV con GQA | M–L |
-| P6.2 | BF16 nativo (conversione in FP16 con saturazione, o FP32 su Pascal) | M |
+| P6.2 | Training BF16/FP32 sul kernel: scaling a potenze di 2 del gradiente dO prima della conversione in FP16 (esatto, il backward è lineare in dO), dQ/dK/dV restituiti in FP32 o nel dtype originale, gestione dell'overflow dei gradienti scalati. Chiude il fallback `non_fp16_training` | M |
 | P6.3 | dQ deterministico (kernel dQ separato, vedi P5.2) | M |
 | P6.4 | Dropout con Philox | L |
-| P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sincronizzazioni host: nel builder della maschera `bool(pad.all())` e `int(q_offset)`; nella funzione di attention `bool(mask.all())` quando il marcatore della maschera 2D si perde (una sync per strato, es. Gemma 3 con cache statica) [R10] | M |
+| P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sincronizzazioni host: nel builder della maschera `bool(pad.all())` e `int(q_offset)`; nella funzione di attention `bool(mask.all())` quando il marcatore della maschera 2D si perde (una sync per strato, es. Gemma 3 con cache statica); il controllo di range FP16 per input BF16/FP32 (`amax`, una sync per chiamata nel percorso kernel); la lettura dei segmenti (una sync per forward) [R10] | M |
 | P6.6 | `mma.sync` su sm_75, solo se l'harness lo giustifica | L |
 
 ---
@@ -162,6 +162,7 @@ Soluzioni provvisorie introdotte durante P0, ciascuna con la voce che la sostitu
 | Fallback eager (FP32, a blocchi di query, senza tensor core, orientato all'inferenza) per `softcap` | P0.3 | P4.2 softcap nel kernel, più P4.1 window (gli strati sliding di Gemma 2 oggi vanno anch'essi su eager) | Gemma 2 sul kernel in tutti gli strati; il motivo `softcap` sparisce dal registro |
 | Fallback eager per i sink `s_aux` | P0.3 | P4.3 sink nel kernel, più P4.1 window (gpt-oss alterna strati sliding) | gpt-oss sul kernel in tutti gli strati; il motivo `s_aux` sparisce dal registro |
 | Fallback eager per `position_bias` (nessun modello HF 5.x lo passa oggi: copertura difensiva) | P0.3 | da decidere: kernel con bias additivo, oppure errore esplicito | Il motivo `position_bias` sparisce dal registro |
+| Training BF16/FP32 → fallback SDPA (`non_fp16_training`) | P0.5 | P6.2 backward con scaling di dO | Nessun motivo `non_fp16_training`; gradienti BF16 entro il rumore anche con loss × 1e-6 |
 | `_eager_attention` stessa | P0.3 | — | Si rimuove solo quando nessun motivo del registro ha più l'azione `eager` |
 | ~~`cu_seq_lens` solleva `NotImplementedError`~~ | P0.1 | P0.4 | **Chiuso in P0.4**: varlen nel kernel o maschera a segmenti nei fallback; resta `raise` solo per `cu_seq_lens` incoerenti |
 | Backward varlen come loop Python per segmento (packing in training, encoder di visione in training) | prima di P0, usato da P0.4 | P2.4 varlen backward nativo | Un solo lancio del kernel, nessuna sincronizzazione host per segmento. Già oggi più veloce del fallback SDPA a blocchi: V100 7.6–15.9 ms contro 24, 1080 Ti 36–267 ms contro 5260, a 8192 token |

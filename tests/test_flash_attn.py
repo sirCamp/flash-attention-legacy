@@ -754,9 +754,80 @@ class TestValidation:
 
     def test_wrong_dtype_raises(self):
         from flash_attn_legacy import flash_attention
-        q, k, v = self._qkv(dtype=torch.float32)
+        q, k, v = self._qkv(dtype=torch.float64)
         with pytest.raises(TypeError):
             flash_attention(q, k, v)
+
+    def test_mixed_dtypes_raise(self):
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv()
+        with pytest.raises(TypeError):
+            flash_attention(q, k.bfloat16(), v)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_non_fp16_inference_is_fp16_compute(self, dtype):
+        """bf16/fp32 inputs: same result as converting to fp16 first, output in dtype."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(dtype=dtype)
+        out = flash_attention(q, k, v, causal=True)
+        ref = flash_attention(q.half(), k.half(), v.half(), causal=True)
+        assert out.dtype == dtype
+        torch.testing.assert_close(out, ref.to(dtype), atol=0, rtol=0)
+
+    def test_non_fp16_out_of_range_raises(self):
+        from flash_attn_legacy import flash_attention
+        from flash_attn_legacy.flash_attn import FP16RangeError
+        q, k, v = self._qkv(dtype=torch.bfloat16)
+        k[0, 0, 1, 2] = 7e4
+        with pytest.raises(FP16RangeError):
+            flash_attention(q, k, v)
+
+    def test_nan_does_not_hide_overflow(self):
+        from flash_attn_legacy import flash_attention
+        from flash_attn_legacy.flash_attn import FP16RangeError
+        q, k, v = self._qkv(dtype=torch.float32)
+        k[0, 0, 0, 0], k[0, 0, 1, 1] = float("nan"), 1e5
+        with pytest.raises(FP16RangeError):
+            flash_attention(q, k, v)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_mha_module_non_fp16(self, dtype):
+        """FlashMultiHeadAttention: range-checked in inference, warns in training."""
+        from flash_attn_legacy import FlashMultiHeadAttention
+        from flash_attn_legacy.flash_attn import FP16RangeError
+        mha = FlashMultiHeadAttention(256, num_heads=4, causal=True).cuda().to(dtype)
+        x = torch.randn(1, 32, 256, device="cuda", dtype=dtype)
+        with torch.no_grad():
+            assert mha(x).dtype == dtype
+            with pytest.raises(FP16RangeError):
+                mha(x * 1e6)
+        with pytest.warns(UserWarning, match="GradScaler"):
+            mha(x).sum().backward()
+
+    def test_non_fp16_training_raises(self):
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(dtype=torch.bfloat16, requires_grad=True)
+        with pytest.raises(NotImplementedError):
+            flash_attention(q, k, v)
+
+    @pytest.mark.parametrize("arch", ["pascal", "volta"])
+    def test_large_qk_products_do_not_overflow(self, monkeypatch, arch):
+        """q_i * k_i > 65504 for in-range fp16 inputs: products must not be formed in
+        fp16 (the Pascal path used __hmul2). FORCE_ARCH runs either path on any GPU."""
+        from flash_attn_legacy import flash_attention
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_FORCE_ARCH", arch)
+        torch.manual_seed(0)
+        q, k, v = self._qkv(n_q=32, n_k=32)
+        q[..., 0], k[..., 0] = 300.0, 300.0  # one product of 9e4 per (q, k) pair
+        scale = 1e-4  # keeps the scores themselves moderate
+        if arch == "volta" and torch.cuda.get_device_capability()[0] < 7:
+            with pytest.raises(RuntimeError, match="tensor cores"):
+                flash_attention(q, k, v, softmax_scale=scale)
+            return
+        out = flash_attention(q, k, v, softmax_scale=scale)
+        ref = ref_attention(q, k, v, scale)
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
     def test_bad_head_dim_raises(self):
         from flash_attn_legacy import flash_attention

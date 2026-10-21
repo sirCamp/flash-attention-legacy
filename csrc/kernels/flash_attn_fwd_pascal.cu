@@ -49,7 +49,10 @@ __device__ __forceinline__ void load_tile_g2s(
 }
 
 // ---------------------------------------------------------------------------
-// half2 dot product — compile-time length for perfect unrolling
+// half2 dot product — fp32 products and accumulation (compile-time length)
+// The products are NOT formed in fp16 (__hmul2): a single |q_i * k_i| > 65504
+// would overflow to inf even with in-range inputs, and on sm_61 fp16 math runs
+// at 1/64 of the fp32 rate.
 // ---------------------------------------------------------------------------
 template <int LEN>
 __device__ __forceinline__ float half2_dot(
@@ -64,8 +67,10 @@ __device__ __forceinline__ float half2_dot(
     float acc = 0.0f;
     #pragma unroll
     for (int i = 0; i < LEN2; i++) {
-        half2 prod = __hmul2(a2[i], b2[i]);
-        acc += __half2float(prod.x) + __half2float(prod.y);
+        const float2 x = __half22float2(a2[i]);
+        const float2 y = __half22float2(b2[i]);
+        acc = fmaf(x.x, y.x, acc);
+        acc = fmaf(x.y, y.y, acc);
     }
     return acc;
 }

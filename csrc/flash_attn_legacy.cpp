@@ -33,17 +33,22 @@ void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t strea
 // the GPU (testing only: e.g. run the Pascal CUDA-core kernels on a T4/Ampere card;
 // correctness is checked, performance numbers are not representative).
 static int get_sm_version(int device_id = -1) {
-    if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
-        const std::string f(force);
-        if (f == "pascal") return 60;
-        if (f == "volta") return 70;
-        TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
-    }
     if (device_id < 0) FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&device_id));
     int major, minor;
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id));
-    return major * 10 + minor;
+    const int sm = major * 10 + minor;
+    if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
+        const std::string f(force);
+        if (f == "pascal") return 60;  // CUDA-core kernels run on any SM >= 6.0
+        if (f == "volta") {
+            TORCH_CHECK(sm >= 70, "FLASH_ATTN_LEGACY_FORCE_ARCH=volta needs tensor cores "
+                        "(SM >= 7.0), this GPU is SM ", sm);
+            return 70;
+        }
+        TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
+    }
+    return sm;
 }
 
 // ---------------------------------------------------------------------------

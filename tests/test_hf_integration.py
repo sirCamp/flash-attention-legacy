@@ -690,3 +690,90 @@ def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen
     else:
         assert counter.varlen_calls == [] and fallback_stats() == {"head_dim": cfg.depth}
     assert_close_to_gold(out, gold, noise, f"{kind} d={head_dim}")
+
+
+# ---------------------------------------------------------------------------
+# P0.5 — non-fp16 inputs: bf16/fp32 run on the kernel after a checked fp16
+# conversion; values beyond the fp16 range fall back (never a silent inf)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+def test_non_fp16_models_run_kernel(monkeypatch, arch, dtype):
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    ids = torch.randint(0, base.config.vocab_size, (1, 200))
+    gold = logits(load_impl(base, "eager", torch.float32), ids)
+    # noise floor: eager in the model dtype for bf16; fp16 (our compute dtype) for fp32
+    noise = logits(load_impl(base, "eager", torch.bfloat16 if dtype == torch.bfloat16
+                             else torch.float16), ids)
+    counter = KernelCounter(monkeypatch)
+    out = logits(load_impl(base, "flash_attn_legacy", dtype), ids)
+    full = sum(t == "full_attention" for t in getattr(base.config, "layer_types", None)
+               or ["full_attention"] * base.config.num_hidden_layers)
+    assert len(counter.calls) == full and "fp16_overflow" not in fallback_stats()
+    assert_close_to_gold(out, gold, noise, f"{arch} {dtype}")
+
+
+def test_bf16_training_falls_back_and_matches_gold():
+    """bf16 training: kernel gradients would be fp16 without loss scaling (underflow),
+    so the call goes to SDPA in bf16 (reason non_fp16_training)."""
+    base = tiny_llama(initializer_range=0.1)
+    ids = torch.randint(0, base.config.vocab_size, (1, 64))
+
+    def grads(model):
+        model.train()
+        out = model(input_ids=ids.cuda(), labels=ids.cuda())
+        out.loss.backward()
+        return out.loss.item(), torch.cat([getattr(model.model.layers[0].self_attn, p).weight.grad
+                                           .float().flatten() for p in ("q_proj", "k_proj", "v_proj")])
+
+    gold_loss, gold_g = grads(load_impl(base, "eager", torch.float32))
+    noise_loss, noise_g = grads(load_impl(base, "eager", torch.bfloat16))
+    loss, g = grads(load_impl(base, "flash_attn_legacy", torch.bfloat16))
+    assert fallback_stats() == {"non_fp16_training": base.config.num_hidden_layers}
+    err = lambda x: 1 - torch.nn.functional.cosine_similarity(x, gold_g, dim=0).item()  # noqa: E731
+    assert abs(loss - gold_loss) <= max(3 * abs(noise_loss - gold_loss), 1e-3), (loss, gold_loss)
+    assert err(g) <= max(3 * err(noise_g), 1e-5), (err(g), err(noise_g))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("where", ["v", "k", "segments"])
+def test_fp16_overflow_falls_back_in_original_dtype(dtype, where):
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1], dtype=dtype)
+    (k if where == "k" else v)[0, 0, 3, 5] = 1e5  # beyond fp16 (65504)
+    kw = {}
+    if where == "segments":
+        cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+        kw = dict(cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None,
+                                                    scaling=0.125, **kw)
+    if where == "segments":
+        ref = _per_segment_reference(q, k, v, 0.125, True).transpose(1, 2)
+    else:
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=0.125).transpose(1, 2)
+    assert fallback_stats() == {"fp16_overflow": 1}
+    assert out.dtype == dtype and torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+def test_bf16_eval_with_grad_enabled_warns(caplog):
+    """eval() without inference_mode: weights require grad -> SDPA; must be visible."""
+    base = tiny_llama()
+    model = load_impl(base, "flash_attn_legacy", torch.bfloat16).eval()
+    ids = torch.randint(0, base.config.vocab_size, (1, 32), device="cuda")
+    with caplog.at_level(logging.WARNING, logger=integrations.__name__):
+        model(input_ids=ids)
+    assert any("inference_mode" in r.getMessage() for r in caplog.records)
+    reset_fallback_stats()
+    with torch.inference_mode():
+        model(input_ids=ids)
+    assert fallback_stats() == {}  # kernel in every layer
+
+
+def test_mixed_kv_dtype_computed_in_query_dtype(monkeypatch):
+    q, k, v = _qkv()
+    counter = KernelCounter(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k.float(), v.float(), None)
+    assert out.dtype == torch.float16 and counter.calls == [(16, 16)]
