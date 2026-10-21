@@ -34,7 +34,8 @@ struct FlashAttnParams {
     int batch_size;
     int num_heads;       // H_q — query heads
     int num_heads_k;     // H_kv — key/value heads (== num_heads for MHA, 1 for MQA)
-    int seq_len;
+    int seq_len_q;       // N_q
+    int seq_len_k;       // N_kv (may differ from N_q; causal is bottom-right aligned)
     int head_dim;        // 32, 64, 96, 128, or 256
 
     // Strides (in elements) for Q
@@ -124,7 +125,7 @@ struct FlashAttnBwdParams {
     half* __restrict__ dV;
 
     // Dimensions
-    int batch_size, num_heads, num_heads_k, seq_len, head_dim;
+    int batch_size, num_heads, num_heads_k, seq_len_q, seq_len_k, head_dim;
     float softmax_scale;
     bool is_causal;
 
@@ -309,6 +310,32 @@ struct TileBwd_d256 {
 // ---------------------------------------------------------------------------
 __host__ __device__ __forceinline__ int cdiv(int a, int b) {
     return (a + b - 1) / b;
+}
+
+// ---------------------------------------------------------------------------
+// Causal masking with N_q != N_kv is bottom-right aligned (same as upstream
+// flash-attn): query row i may attend to keys j <= i + (N_kv - N_q).
+// For N_q == N_kv this is the usual j <= i.
+// ---------------------------------------------------------------------------
+
+// Number of K/V blocks a Q block starting at q_row_start has to visit (forward).
+__host__ __device__ __forceinline__ int fwd_kv_limit(
+    bool causal, int q_row_start, int Br, int Bc, int seq_len_q, int seq_len_k
+) {
+    const int nkv = cdiv(seq_len_k, Bc);
+    if (!causal) return nkv;
+    const int last_visible_key = q_row_start + Br - 1 + (seq_len_k - seq_len_q);
+    const int lim = (last_visible_key < 0) ? 0 : cdiv(last_visible_key + 1, Bc);
+    return lim < nkv ? lim : nkv;
+}
+
+// First Q block that can see any key of the K/V block starting at kv_start (backward).
+__host__ __device__ __forceinline__ int bwd_first_q_block(
+    bool causal, int kv_start, int Br, int seq_len_q, int seq_len_k
+) {
+    if (!causal) return 0;
+    const int first_q = kv_start - (seq_len_k - seq_len_q);
+    return first_q <= 0 ? 0 : first_q / Br;
 }
 
 }  // namespace flash_attn_legacy

@@ -1,0 +1,1254 @@
+{
+ "model": "google/gemma-3-1b-it",
+ "tag": "gemma3_1b",
+ "override": {},
+ "scenarios": {
+  "prefill": {
+   "N": 1000,
+   "path": {
+    "calls": 26,
+    "kernel_calls": 4,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 4,
+     "kernel_layers": [
+      5,
+      11,
+      17,
+      23
+     ],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 1000, 1000), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       1000,
+       1000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 1000):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "flash_vs_sdpa": {
+    "one_minus_cos": 1.1324882507324219e-06,
+    "worst_pos_one_minus_cos": 1.4781951904296875e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.236328125,
+    "finite": true
+   },
+   "eager_vs_sdpa": {
+    "one_minus_cos": 2.086162567138672e-06,
+    "worst_pos_one_minus_cos": 5.3882598876953125e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.3671875,
+    "finite": true
+   },
+   "flash_vs_eager": {
+    "one_minus_cos": 2.0265579223632812e-06,
+    "worst_pos_one_minus_cos": 4.184246063232422e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.375,
+    "finite": true
+   }
+  },
+  "left_padded": {
+   "path_forward": {
+    "calls": 26,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "masks": [
+      "{'shape': (2, 1, 201, 201), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       201,
+       201
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 201):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "seq0_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 1.1920928955078125e-07,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq0_eager_vs_sdpa": {
+    "one_minus_cos": 4.112720489501953e-06,
+    "worst_pos_one_minus_cos": 1.7702579498291016e-05,
+    "top1": 1.0,
+    "max_abs": 0.2421875,
+    "finite": true
+   },
+   "seq1_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 5.960464477539063e-08,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq1_eager_vs_sdpa": {
+    "one_minus_cos": 5.364418029785156e-07,
+    "worst_pos_one_minus_cos": 1.2516975402832031e-06,
+    "top1": 1.0,
+    "max_abs": 0.046875,
+    "finite": true
+   },
+   "short_padded_vs_alone_flash": {
+    "one_minus_cos": 5.960464477539062e-07,
+    "worst_pos_one_minus_cos": 1.5497207641601562e-06,
+    "top1": 1.0,
+    "max_abs": 0.0479736328125,
+    "finite": true
+   },
+   "path_generate": {
+    "calls": 624,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "masks": [
+      "{'shape': (2, 1, 201, 201), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       201,
+       201
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "decode(q=1)": {
+     "calls": 598,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "masks": [
+      "{'shape': (2, 1, 1, 202), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 203), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 204), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 205), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 206), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 207), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       202
+      ],
+      [
+       1,
+       203
+      ],
+      [
+       1,
+       204
+      ],
+      [
+       1,
+       205
+      ],
+      [
+       1,
+       206
+      ],
+      [
+       1,
+       207
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(2, 1):int64\"",
+      "\"tensor(2, 201):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "gen_first_div": [
+    24,
+    24
+   ],
+   "gen_text_flash": [
+    " defaultdict\n\n# Define a function to generate a random number\ndef generate_random_number(min_val, max",
+    " Paris.\n\nThe largest city in France is Paris.\n\nThe most popular city in France is Paris.\n\nThe most"
+   ],
+   "gen_text_sdpa": [
+    " defaultdict\n\n# Define a function to generate a random number\ndef generate_random_number(min_val, max",
+    " Paris.\n\nThe largest city in France is Paris.\n\nThe most popular city in France is Paris.\n\nThe most"
+   ]
+  },
+  "chunked": {
+   "split": [
+    300,
+    100
+   ],
+   "path": {
+    "calls": 52,
+    "kernel_calls": 30,
+    "prefill(q>1)": {
+     "calls": 52,
+     "kernel": 30,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 100, 400), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       100,
+       400
+      ],
+      [
+       300,
+       300
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 100):int64\"",
+      "\"tensor(1, 300):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "flash_chunk_vs_sdpa_full": {
+    "one_minus_cos": 7.748603820800781e-07,
+    "worst_pos_one_minus_cos": 4.589557647705078e-06,
+    "top1": 1.0,
+    "max_abs": 0.109375,
+    "finite": true
+   },
+   "eager_chunk_vs_sdpa_full": {
+    "one_minus_cos": 9.5367431640625e-07,
+    "worst_pos_one_minus_cos": 5.4836273193359375e-06,
+    "top1": 1.0,
+    "max_abs": 0.12890625,
+    "finite": true
+   },
+   "sdpa_chunk_vs_sdpa_full": {
+    "one_minus_cos": 8.344650268554688e-07,
+    "worst_pos_one_minus_cos": 4.589557647705078e-06,
+    "top1": 1.0,
+    "max_abs": 0.109375,
+    "finite": true
+   }
+  },
+  "generate": {
+   "wall_s_flash_attn_legacy": 2.51,
+   "path": {
+    "calls": 1664,
+    "kernel_calls": 26,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 26,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       26,
+       26
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "decode(q=1)": {
+     "calls": 1638,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       27
+      ],
+      [
+       1,
+       28
+      ],
+      [
+       1,
+       29
+      ],
+      [
+       1,
+       30
+      ],
+      [
+       1,
+       31
+      ],
+      [
+       1,
+       32
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 26):int64\"",
+      "\"tensor(26)\"",
+      "\"tensor(27)\"",
+      "\"tensor(28)\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "wall_s_sdpa": 2.64,
+   "wall_s_eager": 2.57,
+   "first_div_flash_vs_sdpa": 5,
+   "first_div_eager_vs_sdpa": 64,
+   "first_div_flash_vs_eager": 5,
+   "text_flash": "\n\n1.  **Tile-based processing:** The input is divided into tiles.  This means that the entire input is processed in chunks, rather than being processed sequentially.\n2.  **No need for a full attention matrix:** Because the input is divided into tiles, we don't need to store the",
+   "text_sdpa": "\n\n1.  **Input Sequence Length:** The input sequence length is 1000.\n2.  **Attention Head:**  We have 1000 attention heads.\n3.  **Attention Tile Size:** Each attention tile is 1024.\n4.  **Number",
+   "text_eager": "\n\n1.  **Input Sequence Length:** The input sequence length is 1000.\n2.  **Attention Head:**  We have 1000 attention heads.\n3.  **Attention Tile Size:** Each attention tile is 1024.\n4.  **Number"
+  },
+  "long": {
+   "N": 5000,
+   "window": 512,
+   "path": {
+    "calls": 26,
+    "kernel_calls": 4,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 4,
+     "kernel_layers": [
+      5,
+      11,
+      17,
+      23
+     ],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 5000, 5000), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       5000,
+       5000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 5000):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "flash_vs_sdpa": {
+    "all": {
+     "one_minus_cos": 5.960464477539062e-07,
+     "worst_pos_one_minus_cos": 1.1622905731201172e-05,
+     "top1": 1.0,
+     "max_abs": 0.28125,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 1.6689300537109375e-06,
+     "worst_pos_one_minus_cos": 7.569789886474609e-06,
+     "top1": 1.0,
+     "max_abs": 0.1796875,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 5.364418029785156e-07,
+     "worst_pos_one_minus_cos": 1.1622905731201172e-05,
+     "top1": 1.0,
+     "max_abs": 0.28125,
+     "finite": true
+    }
+   },
+   "eager_vs_sdpa": {
+    "all": {
+     "one_minus_cos": 1.1920928955078125e-06,
+     "worst_pos_one_minus_cos": 3.808736801147461e-05,
+     "top1": 0.9991701245307922,
+     "max_abs": 0.4375,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 3.337860107421875e-06,
+     "worst_pos_one_minus_cos": 3.814697265625e-05,
+     "top1": 1.0,
+     "max_abs": 0.3330078125,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 1.1324882507324219e-06,
+     "worst_pos_one_minus_cos": 1.5735626220703125e-05,
+     "top1": 0.9990925788879395,
+     "max_abs": 0.4375,
+     "finite": true
+    }
+   },
+   "flash_vs_eager": {
+    "all": {
+     "one_minus_cos": 1.1920928955078125e-06,
+     "worst_pos_one_minus_cos": 3.0875205993652344e-05,
+     "top1": 0.9991701245307922,
+     "max_abs": 0.314453125,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 3.337860107421875e-06,
+     "worst_pos_one_minus_cos": 3.0934810638427734e-05,
+     "top1": 1.0,
+     "max_abs": 0.314453125,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 1.1324882507324219e-06,
+     "worst_pos_one_minus_cos": 1.9550323486328125e-05,
+     "top1": 0.9990925788879395,
+     "max_abs": 0.3125,
+     "finite": true
+    }
+   },
+   "chunk_path": {
+    "calls": 26,
+    "kernel_calls": 4,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 4,
+     "kernel_layers": [
+      5,
+      11,
+      17,
+      23
+     ],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 256, 767), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       256,
+       767
+      ],
+      [
+       256,
+       5000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 256):int64\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "flash_chunk_vs_sdpa_full": {
+    "one_minus_cos": 8.940696716308594e-07,
+    "worst_pos_one_minus_cos": 5.066394805908203e-06,
+    "top1": 1.0,
+    "max_abs": 0.16015625,
+    "finite": true
+   },
+   "gen_path": {
+    "calls": 832,
+    "kernel_calls": 4,
+    "prefill(q>1)": {
+     "calls": 26,
+     "kernel": 4,
+     "kernel_layers": [
+      5,
+      11,
+      17,
+      23
+     ],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 5000, 5000), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       5000,
+       5000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "decode(q=1)": {
+     "calls": 806,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 1, 512), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       512
+      ],
+      [
+       1,
+       5001
+      ],
+      [
+       1,
+       5002
+      ],
+      [
+       1,
+       5003
+      ],
+      [
+       1,
+       5004
+      ],
+      [
+       1,
+       5005
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.0625"
+     ],
+     "sliding_window": [
+      "512",
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 5000):int64\"",
+      "\"tensor(5000)\"",
+      "\"tensor(5001)\"",
+      "\"tensor(5002)\""
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "512",
+     "None"
+    ]
+   },
+   "gen_first_div_flash_vs_sdpa": 32,
+   "gen_text_flash": " int) -> None:\n    \"\"\"\n    Unwinds the generation steps.\n    \"\"\"\n    pass\n\ndef _prepare_attention_mask(sequences",
+   "gen_text_sdpa": " int) -> None:\n    \"\"\"\n    Unwinds the generation steps.\n    \"\"\"\n    pass\n\ndef _prepare_attention_mask(sequences"
+  }
+ },
+ "errors": {},
+ "config": {
+  "head_dim": 256,
+  "n_heads": 4,
+  "n_kv_heads": 1,
+  "layers": 26,
+  "sliding_window": 512,
+  "use_sliding_window": "n/a",
+  "layer_types": [
+   "full_attention",
+   "sliding_attention"
+  ],
+  "n_sliding_layers": 22,
+  "attn_logit_softcapping": null,
+  "final_logit_softcapping": null,
+  "is_causal": "n/a",
+  "attn_impl_after_load": "flash_attn_legacy",
+  "max_pos": 32768,
+  "gen_cache_impl": "hybrid",
+  "has_sinks": false
+ },
+ "first_records": {
+  "prefill": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": 512,
+    "q": [
+     1,
+     4,
+     1000,
+     256
+    ],
+    "k": [
+     1,
+     1,
+     1000,
+     256
+    ],
+    "dtype": "torch.float16",
+    "mask": {
+     "shape": [
+      1,
+      1,
+      1000,
+      1000
+     ],
+     "dtype": "bool"
+    },
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.0625,
+     "sliding_window": 512,
+     "position_ids": "tensor(1, 1000):int64"
+    },
+    "kernel": false,
+    "kernel_args": null
+   },
+   {
+    "layer": 1,
+    "module_is_causal": true,
+    "module_sliding_window": 512,
+    "q": [
+     1,
+     4,
+     1000,
+     256
+    ],
+    "k": [
+     1,
+     1,
+     1000,
+     256
+    ],
+    "dtype": "torch.float16",
+    "mask": {
+     "shape": [
+      1,
+      1,
+      1000,
+      1000
+     ],
+     "dtype": "bool"
+    },
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.0625,
+     "sliding_window": 512,
+     "position_ids": "tensor(1, 1000):int64"
+    },
+    "kernel": false,
+    "kernel_args": null
+   }
+  ],
+  "generate_decode": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": 512,
+    "q": [
+     1,
+     4,
+     1,
+     256
+    ],
+    "k": [
+     1,
+     1,
+     27,
+     256
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.0625,
+     "sliding_window": 512,
+     "position_ids": "tensor(26)"
+    },
+    "kernel": false,
+    "kernel_args": null
+   }
+  ]
+ },
+ "gold_fp32_eager": {
+  "prefill": {
+   "flash": {
+    "one_minus_cos": 1.3113021850585938e-06,
+    "worst_pos_one_minus_cos": 2.6226043701171875e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.28543853759765625,
+    "finite": true
+   },
+   "sdpa": {
+    "one_minus_cos": 1.3709068298339844e-06,
+    "worst_pos_one_minus_cos": 3.2067298889160156e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.2856903076171875,
+    "finite": true
+   },
+   "eager": {
+    "one_minus_cos": 1.6689300537109375e-06,
+    "worst_pos_one_minus_cos": 2.8967857360839844e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.3664875030517578,
+    "finite": true
+   }
+  },
+  "chunked_flash": {
+   "one_minus_cos": 6.556510925292969e-07,
+   "worst_pos_one_minus_cos": 4.112720489501953e-06,
+   "top1": 1.0,
+   "max_abs": 0.11842465400695801,
+   "finite": true
+  },
+  "gen_first_div_vs_gold": {
+   "flash": 5,
+   "sdpa": 64,
+   "eager": 64
+  },
+  "gen_text_gold": "\n\n1.  **Input Sequence Length:** The input sequence length is 1000.\n2.  **Attention Head:**  We have 1000 attention heads.\n3.  **Attention Tile Size:** Each attention tile is 1024.\n4.  **Number",
+  "long": {
+   "flash": {
+    "all": {
+     "one_minus_cos": 7.152557373046875e-07,
+     "worst_pos_one_minus_cos": 1.3172626495361328e-05,
+     "top1": 0.9991701245307922,
+     "max_abs": 0.755950927734375,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 2.086162567138672e-06,
+     "worst_pos_one_minus_cos": 1.239776611328125e-05,
+     "top1": 1.0,
+     "max_abs": 0.17277097702026367,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 6.556510925292969e-07,
+     "worst_pos_one_minus_cos": 1.3172626495361328e-05,
+     "top1": 0.9990925788879395,
+     "max_abs": 0.755950927734375,
+     "finite": true
+    }
+   },
+   "sdpa": {
+    "all": {
+     "one_minus_cos": 7.748603820800781e-07,
+     "worst_pos_one_minus_cos": 3.981590270996094e-05,
+     "top1": 0.9991701245307922,
+     "max_abs": 0.818450927734375,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 1.9073486328125e-06,
+     "worst_pos_one_minus_cos": 1.1026859283447266e-05,
+     "top1": 1.0,
+     "max_abs": 0.16106867790222168,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 6.556510925292969e-07,
+     "worst_pos_one_minus_cos": 3.981590270996094e-05,
+     "top1": 0.9990925788879395,
+     "max_abs": 0.818450927734375,
+     "finite": true
+    }
+   },
+   "eager": {
+    "all": {
+     "one_minus_cos": 1.0132789611816406e-06,
+     "worst_pos_one_minus_cos": 2.300739288330078e-05,
+     "top1": 1.0,
+     "max_abs": 0.787200927734375,
+     "finite": true
+    },
+    "pos<512": {
+     "one_minus_cos": 2.384185791015625e-06,
+     "worst_pos_one_minus_cos": 2.3066997528076172e-05,
+     "top1": 1.0,
+     "max_abs": 0.22975492477416992,
+     "finite": true
+    },
+    "pos>=512": {
+     "one_minus_cos": 8.940696716308594e-07,
+     "worst_pos_one_minus_cos": 1.4424324035644531e-05,
+     "top1": 1.0,
+     "max_abs": 0.787200927734375,
+     "finite": true
+    }
+   }
+  },
+  "longchunk_flash": {
+   "one_minus_cos": 8.344650268554688e-07,
+   "worst_pos_one_minus_cos": 7.867813110351562e-06,
+   "top1": 0.99609375,
+   "max_abs": 0.849700927734375,
+   "finite": true
+  },
+  "longgen_first_div_vs_gold": {
+   "flash": 32,
+   "sdpa": 32
+  },
+  "longgen_text_gold": " int) -> None:\n    \"\"\"\n    Unwinds the generation steps.\n    \"\"\"\n    pass\n\ndef _prepare_attention_mask(sequences"
+ },
+ "elapsed_s": 34.3
+}

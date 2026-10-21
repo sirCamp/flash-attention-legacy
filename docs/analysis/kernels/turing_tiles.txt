@@ -1,0 +1,43 @@
+d   | variant  | Br  | Bc | smem B (KB)    | blocks/SM | warps/SM | KV loads per Q row-block (rel.)
+ 32 | kv_alias | 128 | 16 |  21504 ( 21.0) |         3 |       12 | 1.0x
+ 32 | kv_alias |  64 | 16 |  11264 ( 11.0) |         5 |       10 | 2.0x
+ 32 | current  |  64 | 16 |  12288 ( 12.0) |         5 |       10 | 2.0x
+ 32 | kv_alias |  32 | 16 |   6144 (  6.0) |        10 |       10 | 4.0x
+ 32 | current  |  32 | 16 |   7168 (  7.0) |         9 |        9 | 4.0x
+ 32 | current  | 128 | 16 |  22528 ( 22.0) |         2 |        8 | 1.0x
+----
+ 64 | kv_alias | 128 | 16 |  30720 ( 30.0) |         2 |        8 | 1.0x
+ 64 | current  | 128 | 16 |  32768 ( 32.0) |         2 |        8 | 1.0x
+ 64 | kv_alias |  64 | 16 |  16384 ( 16.0) |         4 |        8 | 2.0x
+ 64 | kv_alias |  32 | 16 |   9216 (  9.0) |         7 |        7 | 4.0x
+ 64 | current  |  64 | 16 |  18432 ( 18.0) |         3 |        6 | 2.0x
+ 64 | current  |  32 | 16 |  11264 ( 11.0) |         5 |        5 | 4.0x
+----
+ 96 | kv_alias |  64 | 16 |  21504 ( 21.0) |         3 |        6 | 2.0x
+ 96 | kv_alias |  32 | 16 |  12288 ( 12.0) |         5 |        5 | 4.0x
+ 96 | kv_alias | 128 | 32 |  55296 ( 54.0) |         1 |        4 | 1.0x
+ 96 | current  | 128 | 32 |  61440 ( 60.0) |         1 |        4 | 1.0x
+ 96 | kv_alias | 128 | 16 |  39936 ( 39.0) |         1 |        4 | 1.0x
+ 96 | current  | 128 | 16 |  43008 ( 42.0) |         1 |        4 | 1.0x
+----
+128 | kv_alias | 128 | 32 |  65536 ( 64.0) |         1 |        4 | 1.0x
+128 | kv_alias | 128 | 16 |  49152 ( 48.0) |         1 |        4 | 1.0x
+128 | current  | 128 | 16 |  53248 ( 52.0) |         1 |        4 | 1.0x
+128 | kv_alias |  64 | 16 |  26624 ( 26.0) |         2 |        4 | 2.0x
+128 | current  |  64 | 16 |  30720 ( 30.0) |         2 |        4 | 2.0x
+128 | kv_alias |  32 | 16 |  15360 ( 15.0) |         4 |        4 | 4.0x
+----
+256 | kv_alias |  64 | 32 |  61440 ( 60.0) |         1 |        2 | 2.0x
+256 | kv_alias |  64 | 16 |  47104 ( 46.0) |         1 |        2 | 2.0x
+256 | current  |  64 | 16 |  55296 ( 54.0) |         1 |        2 | 2.0x
+256 | kv_alias |  32 | 16 |  27648 ( 27.0) |         2 |        2 | 4.0x
+256 | kv_alias |  32 | 64 |  61440 ( 60.0) |         1 |        1 | 4.0x
+256 | kv_alias |  32 | 32 |  38912 ( 38.0) |         1 |        1 | 4.0x
+----
+
+Volta-WMMA bwd smem (B): current vs dK/dV accumulators kept in WMMA register fragments
+d= 32 Br=32 Bc=32: current=26624 (26.0 KB)  acc-in-regs=18432 (18.0 KB), +2 frags/warp = +16 regs/thread
+d= 64 Br=32 Bc=32: current=43008 (42.0 KB)  acc-in-regs=26624 (26.0 KB), +4 frags/warp = +32 regs/thread
+d= 96 Br=32 Bc=16: current=35840 (35.0 KB)  acc-in-regs=23552 (23.0 KB), +3 frags/warp = +24 regs/thread
+d=128 Br=16 Bc=16: current=35328 (34.5 KB)  acc-in-regs=18944 (18.5 KB), +4 frags/warp = +32 regs/thread
+d=256 Br=16 Bc=16: current=68096 (66.5 KB)  acc-in-regs=35328 (34.5 KB), +8 frags/warp = +64 regs/thread

@@ -1,0 +1,12 @@
+flash_attn_fwd_volta sm_60 .945797824 s rc=0
+flash_attn_fwd_volta sm_61 .822998260 s rc=0
+flash_attn_fwd_volta sm_70 12.771720127 s rc=0
+flash_attn_fwd_volta sm_75 11.183652030 s rc=0
+flash_attn_fwd_pascal sm_60 120.860147760 s rc=0
+flash_attn_fwd_pascal sm_61 116.448390414 s rc=0
+flash_attn_fwd_pascal sm_70 118.045346846 s rc=0
+flash_attn_fwd_pascal sm_75 122.504693085 s rc=0
+flash_attn_bwd sm_60 13.173714795 s rc=0
+flash_attn_bwd sm_61 10.896486654 s rc=0
+flash_attn_bwd sm_70 23.564859500 s rc=0
+flash_attn_bwd sm_75 26.787271446 s rc=0

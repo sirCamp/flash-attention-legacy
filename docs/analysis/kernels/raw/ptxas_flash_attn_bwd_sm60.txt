@@ -1,0 +1,45 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_12TileBwd_d256EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_12TileBwd_d256EEEvNS_18FlashAttnBwdParamsE
+    4696 bytes stack frame, 13892 bytes spill stores, 13980 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 4696 bytes cumulative stack size, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_12TileBwd_d128EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_12TileBwd_d128EEEvNS_18FlashAttnBwdParamsE
+    2368 bytes stack frame, 6868 bytes spill stores, 7092 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 2368 bytes cumulative stack size, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d96EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d96EEEvNS_18FlashAttnBwdParamsE
+    2232 bytes stack frame, 5456 bytes spill stores, 7296 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 2232 bytes cumulative stack size, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d64EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d64EEEvNS_18FlashAttnBwdParamsE
+    184 bytes stack frame, 324 bytes spill stores, 384 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 184 bytes cumulative stack size, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d32EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy21flash_attn_bwd_kernelINS_11TileBwd_d32EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 197 registers, used 1 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_12TileBwd_d256EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_12TileBwd_d256EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 2 registers, used 0 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_12TileBwd_d128EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_12TileBwd_d128EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 2 registers, used 0 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d96EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d96EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 2 registers, used 0 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d64EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d64EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 2 registers, used 0 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d32EEEvNS_18FlashAttnBwdParamsE' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy27flash_attn_bwd_volta_kernelINS_11TileBwd_d32EEEvNS_18FlashAttnBwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 2 registers, used 0 barriers, 528 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy19precompute_D_kernelEPK6__halfS2_Pfiiiiiiiii' for 'sm_60'
+ptxas info    : Function properties for _ZN17flash_attn_legacy19precompute_D_kernelEPK6__halfS2_Pfiiiiiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, used 0 barriers, 380 bytes cmem[0]

@@ -2,7 +2,7 @@
 
 **Flash Attention v2 for Pascal and Volta GPUs**
 
-CUDA implementation of [Flash Attention v2](https://arxiv.org/abs/2307.09288) for older NVIDIA GPUs not supported by the [official flash-attn package](https://github.com/Dao-AILab/flash-attention).
+CUDA implementation of [Flash Attention v2](https://arxiv.org/abs/2307.08691) for older NVIDIA GPUs not supported by the [official flash-attn package](https://github.com/Dao-AILab/flash-attention).
 
 ## Why?
 
@@ -39,7 +39,7 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 | **Volta** | V100, Titan V | 7.0 | 1st gen | WMMA 16x16x16 |
 | **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | half2 packed FP16 |
 
-Head dimensions: **d=64, d=128**. FP16 only (Pascal/Volta lack native BF16).
+Head dimensions: **d = 32, 64, 96, 128, 256**. FP16 only (Pascal/Volta lack native BF16).
 
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 
@@ -91,7 +91,7 @@ outputs = model.generate(**inputs, max_new_tokens=100)
 print(tokenizer.decode(outputs[0]))
 ```
 
-The integration automatically uses our flash kernel for **prefill** (where memory savings matter) and falls back to standard attention for **decode** (q_len=1, no O(N^2) issue).
+The integration uses our flash kernel for unmasked **prefill** (where memory savings matter) and falls back to PyTorch SDPA for decode (q_len=1) and padded/masked batches.
 
 ### Monkey-patch (transformers < 5.0)
 
@@ -118,7 +118,7 @@ q = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16)
 k = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16)
 v = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16)
 
-out = flash_attention(q, k, v, is_causal=True)
+out = flash_attention(q, k, v, causal=True)
 ```
 
 ### GQA (grouped-query attention)
@@ -129,7 +129,7 @@ q = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
 k = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
 v = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
 
-out = flash_attention(q, k, v, is_causal=True)
+out = flash_attention(q, k, v, causal=True)
 ```
 
 ### Variable-length (packed sequences)
@@ -396,10 +396,11 @@ pytest tests/test_generation_benchmark.py -v -s -k "prefill"
 
 ## Limitations
 
-1. **Head dimensions**: only d=64 and d=128
+1. **Head dimensions**: only d = 32, 64, 96, 128, 256
 2. **FP16 only**: no BF16 (Pascal/Volta lack native BF16)
-3. **No dropout** in attention kernel
-4. **Prefill only**: decode (q_len=1) falls back to standard attention (no O(N^2) issue there)
+3. **No dropout, no arbitrary attention mask** in the kernel (causal or none). With HuggingFace, an explicit `attention_mask` (padding), attention dropout in training and decode (q_len=1) fall back to PyTorch SDPA
+4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
+5. **Non-deterministic dQ**: the backward accumulates dQ with FP32 `atomicAdd`
 
 ## Roadmap
 
@@ -413,7 +414,7 @@ pytest tests/test_generation_benchmark.py -v -s -k "prefill"
 ## References
 
 - Dao et al., [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135) (2022)
-- Dao, [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.09288) (2023)
+- Dao, [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691) (2023)
 - Milakov & Gimelshein, [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867) (2018)
 
 ## Citation

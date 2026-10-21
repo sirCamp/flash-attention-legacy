@@ -5,6 +5,16 @@ GPU detection, compatibility checking, and benchmarking utilities.
 import torch
 from typing import Dict, Optional
 
+# Single source of truth for the head dimensions the CUDA kernels are compiled for
+# (keep in sync with the dispatch switches in csrc/).
+SUPPORTED_HEAD_DIMS = (32, 64, 96, 128, 256)
+
+
+def check_head_dim(d: int) -> None:
+    """Raise ValueError if `d` is not a supported head dimension."""
+    if d not in SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim must be one of {SUPPORTED_HEAD_DIMS}, got {d}")
+
 _SM_TO_ARCH = {
     60: "Pascal (GP100)", 61: "Pascal (GP10x)", 62: "Pascal (Jetson)",
     70: "Volta", 72: "Volta (Jetson)",
@@ -70,7 +80,7 @@ def check_gpu_compatibility(device: Optional[int] = None, verbose: bool = True) 
 
 def benchmark_flash_vs_standard(
     batch_size: int = 2, num_heads: int = 8, seq_len: int = 2048,
-    head_dim: int = 64, is_causal: bool = False,
+    head_dim: int = 64, causal: bool = False,
     num_warmup: int = 10, num_iters: int = 100
 ) -> Dict:
     """Benchmark Flash Attention vs PyTorch standard attention."""
@@ -84,14 +94,14 @@ def benchmark_flash_vs_standard(
     def std_attn(q, k, v):
         scale = 1.0 / (head_dim ** 0.5)
         s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-        if is_causal:
+        if causal:
             mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
             s.masked_fill_(mask, float('-inf'))
         return torch.matmul(torch.softmax(s, dim=-1).half(), v)
 
     # Warmup
     for _ in range(num_warmup):
-        flash_attention(q, k, v, is_causal=is_causal)
+        flash_attention(q, k, v, causal=causal)
         std_attn(q, k, v)
     torch.cuda.synchronize()
 
@@ -100,7 +110,7 @@ def benchmark_flash_vs_standard(
     s_ev, e_ev = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     s_ev.record()
     for _ in range(num_iters):
-        flash_attention(q, k, v, is_causal=is_causal)
+        flash_attention(q, k, v, causal=causal)
     e_ev.record()
     torch.cuda.synchronize()
     flash_ms = s_ev.elapsed_time(e_ev) / num_iters

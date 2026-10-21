@@ -34,7 +34,7 @@ def bench_one(B, H, N, d, is_causal, iters=100):
 
     # Warmup
     for _ in range(20):
-        flash_attention(q, k, v, softmax_scale=scale, is_causal=is_causal)
+        flash_attention(q, k, v, softmax_scale=scale, causal=is_causal)
         std_attention(q, k, v, scale, is_causal)
     torch.cuda.synchronize()
 
@@ -49,12 +49,12 @@ def bench_one(B, H, N, d, is_causal, iters=100):
         return s.elapsed_time(e) / iters, torch.cuda.max_memory_allocated() / 1e6
 
     flash_ms, flash_mem = time_fn(
-        lambda: flash_attention(q, k, v, softmax_scale=scale, is_causal=is_causal), iters)
+        lambda: flash_attention(q, k, v, softmax_scale=scale, causal=is_causal), iters)
     std_ms, std_mem = time_fn(
         lambda: std_attention(q, k, v, scale, is_causal), iters)
 
     # Quick correctness check
-    out_f = flash_attention(q, k, v, softmax_scale=scale, is_causal=is_causal)
+    out_f = flash_attention(q, k, v, softmax_scale=scale, causal=is_causal)
     out_s = std_attention(q, k, v, scale, is_causal)
     max_diff = (out_f.float() - out_s.float()).abs().max().item()
 

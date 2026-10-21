@@ -52,13 +52,14 @@ nvcc_flags = [
     "-gencode", "arch=compute_60,code=sm_60",   # Pascal P100
     "-gencode", "arch=compute_61,code=sm_61",   # Pascal GTX 1080/Ti
     "-gencode", "arch=compute_70,code=sm_70",   # Volta V100
+    "-gencode", "arch=compute_75,code=sm_75",   # Turing T4 (runs the Volta/WMMA path)
     "-gencode", "arch=compute_70,code=compute_70",  # PTX for forward compat
     # FP16 support
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
     "-std=c++17",
-    # Maximize shared memory
-    "-Xptxas", "-dlcm=ca",  # cache all levels
+    # Cache global loads in L1 and L2 (default on sm_70, opt-in on sm_60/61)
+    "-Xptxas", "-dlcm=ca",
 ]
 
 # Platform-specific compiler flags

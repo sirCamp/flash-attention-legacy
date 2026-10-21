@@ -1,0 +1,453 @@
+{
+ "config": {
+  "head_dim": 64,
+  "layer_types": [
+   "sliding_attention",
+   "full_attention"
+  ],
+  "sliding_window": 128,
+  "sinks": [
+   [
+    -1.8493248224258423,
+    -0.8506884574890137,
+    -5.287691593170166,
+    0.2903677225112915
+   ],
+   [
+    0.3616516590118408,
+    -1.1045255661010742,
+    1.8476266860961914,
+    -1.4699409008026123
+   ]
+  ]
+ },
+ "cases": {
+  "N=64": {
+   "path": {
+    "calls": 2,
+    "kernel_calls": 2,
+    "prefill(q>1)": {
+     "calls": 2,
+     "kernel": 2,
+     "kernel_layers": [
+      0,
+      1
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       64,
+       64
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "128",
+      "null"
+     ],
+     "s_aux": [
+      "\"tensor(4,):float16\""
+     ],
+     "position_ids": [
+      "\"tensor(1, 64):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ],
+     "output_router_logits": [
+      "false"
+     ]
+    }
+   },
+   "first_records": [
+    {
+     "layer": 0,
+     "module_is_causal": true,
+     "module_sliding_window": 128,
+     "q": [
+      1,
+      4,
+      64,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      64,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": null,
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": 128,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 64):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": true,
+     "kernel_args": {
+      "causal": true,
+      "scale": 0.125
+     }
+    },
+    {
+     "layer": 1,
+     "module_is_causal": true,
+     "module_sliding_window": null,
+     "q": [
+      1,
+      4,
+      64,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      64,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": null,
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": null,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 64):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": true,
+     "kernel_args": {
+      "causal": true,
+      "scale": 0.125
+     }
+    }
+   ],
+   "flash_vs_fp32gold": {
+    "one_minus_cos": 0.019591093063354492,
+    "worst_pos_one_minus_cos": 0.3447732925415039,
+    "top1": 0.71875,
+    "max_abs": 0.9277887344360352,
+    "finite": true
+   },
+   "eager16_vs_fp32gold": {
+    "one_minus_cos": 5.960464477539062e-07,
+    "worst_pos_one_minus_cos": 8.344650268554688e-07,
+    "top1": 1.0,
+    "max_abs": 0.0016812384128570557,
+    "finite": true
+   },
+   "flash_vs_eager16": {
+    "one_minus_cos": 0.0195920467376709,
+    "worst_pos_one_minus_cos": 0.3447989225387573,
+    "top1": 0.71875,
+    "max_abs": 0.9276123046875,
+    "finite": true
+   }
+  },
+  "N=100": {
+   "path": {
+    "calls": 2,
+    "kernel_calls": 2,
+    "prefill(q>1)": {
+     "calls": 2,
+     "kernel": 2,
+     "kernel_layers": [
+      0,
+      1
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       100,
+       100
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "128",
+      "null"
+     ],
+     "s_aux": [
+      "\"tensor(4,):float16\""
+     ],
+     "position_ids": [
+      "\"tensor(1, 100):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ],
+     "output_router_logits": [
+      "false"
+     ]
+    }
+   },
+   "first_records": [
+    {
+     "layer": 0,
+     "module_is_causal": true,
+     "module_sliding_window": 128,
+     "q": [
+      1,
+      4,
+      100,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      100,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": null,
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": 128,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 100):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": true,
+     "kernel_args": {
+      "causal": true,
+      "scale": 0.125
+     }
+    },
+    {
+     "layer": 1,
+     "module_is_causal": true,
+     "module_sliding_window": null,
+     "q": [
+      1,
+      4,
+      100,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      100,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": null,
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": null,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 100):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": true,
+     "kernel_args": {
+      "causal": true,
+      "scale": 0.125
+     }
+    }
+   ],
+   "flash_vs_fp32gold": {
+    "one_minus_cos": 0.015158116817474365,
+    "worst_pos_one_minus_cos": 0.12897425889968872,
+    "top1": 0.85999995470047,
+    "max_abs": 0.6188532114028931,
+    "finite": true
+   },
+   "eager16_vs_fp32gold": {
+    "one_minus_cos": 2.980232238769531e-07,
+    "worst_pos_one_minus_cos": 5.364418029785156e-07,
+    "top1": 1.0,
+    "max_abs": 0.0011888742446899414,
+    "finite": true
+   },
+   "flash_vs_eager16": {
+    "one_minus_cos": 0.015159070491790771,
+    "worst_pos_one_minus_cos": 0.12905818223953247,
+    "top1": 0.85999995470047,
+    "max_abs": 0.61865234375,
+    "finite": true
+   }
+  },
+  "N=512": {
+   "path": {
+    "calls": 2,
+    "kernel_calls": 1,
+    "prefill(q>1)": {
+     "calls": 2,
+     "kernel": 1,
+     "kernel_layers": [
+      1
+     ],
+     "fallback_layers": [
+      0
+     ],
+     "masks": [
+      "None",
+      "{'shape': (1, 1, 512, 512), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       512,
+       512
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "128",
+      "null"
+     ],
+     "s_aux": [
+      "\"tensor(4,):float16\""
+     ],
+     "position_ids": [
+      "\"tensor(1, 512):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ],
+     "output_router_logits": [
+      "false"
+     ]
+    }
+   },
+   "first_records": [
+    {
+     "layer": 0,
+     "module_is_causal": true,
+     "module_sliding_window": 128,
+     "q": [
+      1,
+      4,
+      512,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      512,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": {
+      "shape": [
+       1,
+       1,
+       512,
+       512
+      ],
+      "dtype": "bool"
+     },
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": 128,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 512):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": false,
+     "kernel_args": null
+    },
+    {
+     "layer": 1,
+     "module_is_causal": true,
+     "module_sliding_window": null,
+     "q": [
+      1,
+      4,
+      512,
+      64
+     ],
+     "k": [
+      1,
+      2,
+      512,
+      64
+     ],
+     "dtype": "torch.float16",
+     "mask": null,
+     "kwargs": {
+      "dropout": 0.0,
+      "scaling": 0.125,
+      "sliding_window": null,
+      "s_aux": "tensor(4,):float16",
+      "position_ids": "tensor(1, 512):int64",
+      "use_cache": true,
+      "output_router_logits": false
+     },
+     "kernel": true,
+     "kernel_args": {
+      "causal": true,
+      "scale": 0.125
+     }
+    }
+   ],
+   "flash_vs_fp32gold": {
+    "one_minus_cos": 0.0038825273513793945,
+    "worst_pos_one_minus_cos": 0.1624518632888794,
+    "top1": 0.94140625,
+    "max_abs": 0.6632916927337646,
+    "finite": true
+   },
+   "eager16_vs_fp32gold": {
+    "one_minus_cos": 0.000493466854095459,
+    "worst_pos_one_minus_cos": 0.24207651615142822,
+    "top1": 0.9921875,
+    "max_abs": 0.7142179012298584,
+    "finite": true
+   },
+   "flash_vs_eager16": {
+    "one_minus_cos": 0.004378795623779297,
+    "worst_pos_one_minus_cos": 0.24182581901550293,
+    "top1": 0.94140625,
+    "max_abs": 0.725372314453125,
+    "finite": true
+   }
+  }
+ }
+}

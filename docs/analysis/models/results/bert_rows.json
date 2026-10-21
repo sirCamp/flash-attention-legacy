@@ -1,0 +1,128 @@
+{
+ "worst_pos": 88,
+ "worst_1mcos": 0.0001614689826965332,
+ "token": ".",
+ "n_pos_1mcos_gt_1e-5": 1,
+ "layers": [
+  {
+   "layer": 0,
+   "kernel_max": 0.0007774829864501953,
+   "sdpa_max": 0.0007774829864501953,
+   "kernel_row_worst": 415,
+   "kernel_err_at_worst_pos": 0.00038683414459228516,
+   "sdpa_err_at_worst_pos": 0.00038683414459228516,
+   "max_row_ratio": 1.1803278923034668,
+   "max_scaled_logit": 15.844690322875977
+  },
+  {
+   "layer": 1,
+   "kernel_max": 0.000957489013671875,
+   "sdpa_max": 0.000957489013671875,
+   "kernel_row_worst": 396,
+   "kernel_err_at_worst_pos": 0.0004715919494628906,
+   "sdpa_err_at_worst_pos": 0.0004715919494628906,
+   "max_row_ratio": 1.2386691570281982,
+   "max_scaled_logit": 18.719303131103516
+  },
+  {
+   "layer": 2,
+   "kernel_max": 0.0009772777557373047,
+   "sdpa_max": 0.0009758472442626953,
+   "kernel_row_worst": 395,
+   "kernel_err_at_worst_pos": 0.00040650367736816406,
+   "sdpa_err_at_worst_pos": 0.00040650367736816406,
+   "max_row_ratio": 1.1868183612823486,
+   "max_scaled_logit": 38.02688980102539
+  },
+  {
+   "layer": 3,
+   "kernel_max": 0.0011439323425292969,
+   "sdpa_max": 0.0011439323425292969,
+   "kernel_row_worst": 360,
+   "kernel_err_at_worst_pos": 0.0005197525024414062,
+   "sdpa_err_at_worst_pos": 0.0005197525024414062,
+   "max_row_ratio": 1.3521478176116943,
+   "max_scaled_logit": 21.463258743286133
+  },
+  {
+   "layer": 4,
+   "kernel_max": 0.0010805130004882812,
+   "sdpa_max": 0.0010805130004882812,
+   "kernel_row_worst": 163,
+   "kernel_err_at_worst_pos": 0.0005805492401123047,
+   "sdpa_err_at_worst_pos": 0.0005805492401123047,
+   "max_row_ratio": 1.4031052589416504,
+   "max_scaled_logit": 13.73588752746582
+  },
+  {
+   "layer": 5,
+   "kernel_max": 0.0010390281677246094,
+   "sdpa_max": 0.0010390281677246094,
+   "kernel_row_worst": 333,
+   "kernel_err_at_worst_pos": 0.000586390495300293,
+   "sdpa_err_at_worst_pos": 0.000586390495300293,
+   "max_row_ratio": 1.8123655319213867,
+   "max_scaled_logit": 17.361597061157227
+  },
+  {
+   "layer": 6,
+   "kernel_max": 0.001035928726196289,
+   "sdpa_max": 0.001230001449584961,
+   "kernel_row_worst": 327,
+   "kernel_err_at_worst_pos": 0.000525355339050293,
+   "sdpa_err_at_worst_pos": 0.000525355339050293,
+   "max_row_ratio": 1.2951806783676147,
+   "max_scaled_logit": 16.50593376159668
+  },
+  {
+   "layer": 7,
+   "kernel_max": 0.0008568763732910156,
+   "sdpa_max": 0.0008568763732910156,
+   "kernel_row_worst": 437,
+   "kernel_err_at_worst_pos": 0.0005025863647460938,
+   "sdpa_err_at_worst_pos": 0.00047397613525390625,
+   "max_row_ratio": 1.4291294813156128,
+   "max_scaled_logit": 15.303668975830078
+  },
+  {
+   "layer": 8,
+   "kernel_max": 0.000980377197265625,
+   "sdpa_max": 0.000980377197265625,
+   "kernel_row_worst": 429,
+   "kernel_err_at_worst_pos": 0.0004807710647583008,
+   "sdpa_err_at_worst_pos": 0.0004807710647583008,
+   "max_row_ratio": 1.2529162168502808,
+   "max_scaled_logit": 13.334609031677246
+  },
+  {
+   "layer": 9,
+   "kernel_max": 0.0011131763458251953,
+   "sdpa_max": 0.0011131763458251953,
+   "kernel_row_worst": 21,
+   "kernel_err_at_worst_pos": 0.0008273124694824219,
+   "sdpa_err_at_worst_pos": 0.0008273124694824219,
+   "max_row_ratio": 1.3154324293136597,
+   "max_scaled_logit": 17.34489631652832
+  },
+  {
+   "layer": 10,
+   "kernel_max": 0.0009052753448486328,
+   "sdpa_max": 0.0009052753448486328,
+   "kernel_row_worst": 77,
+   "kernel_err_at_worst_pos": 0.00045931339263916016,
+   "sdpa_err_at_worst_pos": 0.00045931339263916016,
+   "max_row_ratio": 1.269252061843872,
+   "max_scaled_logit": 12.695526123046875
+  },
+  {
+   "layer": 11,
+   "kernel_max": 0.0011489391326904297,
+   "sdpa_max": 0.0011489391326904297,
+   "kernel_row_worst": 11,
+   "kernel_err_at_worst_pos": 5.397200584411621e-05,
+   "sdpa_err_at_worst_pos": 5.397200584411621e-05,
+   "max_row_ratio": 1.3459335565567017,
+   "max_scaled_logit": 14.597047805786133
+  }
+ ]
+}

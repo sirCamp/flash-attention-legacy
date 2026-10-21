@@ -8,6 +8,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
+#include <string>
 #include "include/flash_attn_common.h"
 
 namespace flash_attn_legacy {
@@ -27,7 +29,16 @@ void precompute_D(
 void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream);
 void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream);
 
+// FLASH_ATTN_LEGACY_FORCE_ARCH=pascal|volta forces the kernel family regardless of
+// the GPU (testing only: e.g. run the Pascal CUDA-core kernels on a T4/Ampere card;
+// correctness is checked, performance numbers are not representative).
 static int get_sm_version(int device_id = -1) {
+    if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
+        const std::string f(force);
+        if (f == "pascal") return 60;
+        if (f == "volta") return 70;
+        TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
+    }
     if (device_id < 0) FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&device_id));
     int major, minor;
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
@@ -36,8 +47,9 @@ static int get_sm_version(int device_id = -1) {
 }
 
 // ---------------------------------------------------------------------------
-// Forward — supports GQA: Q is [B, H_q, N, d], K/V are [B, H_kv, N, d]
-// H_q must be divisible by H_kv
+// Forward — supports GQA and N_q != N_kv:
+//   Q is [B, H_q, N_q, d], K/V are [B, H_kv, N_kv, d]; H_q % H_kv == 0.
+// Causal masking is bottom-right aligned (query i sees keys j <= i + N_kv - N_q).
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
@@ -45,18 +57,22 @@ std::vector<torch::Tensor> flash_attn_forward(
 ) {
     Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
 
-    TORCH_CHECK(Q.is_cuda(), "Q must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16, "Q must be float16");
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
+    TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(),
+                "Q, K, V must be on the same device");
+    TORCH_CHECK(Q.dtype() == torch::kFloat16 && K.dtype() == torch::kFloat16 &&
+                V.dtype() == torch::kFloat16, "Q, K, V must be float16");
     TORCH_CHECK(Q.dim() == 4, "Q must be [B, H_q, N, d]");
     TORCH_CHECK(K.dim() == 4 && V.dim() == 4, "K,V must be 4D");
 
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
+    const int Nk = K.size(2);
 
     TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
                 "head_dim must be 32, 64, 96, 128, or 256, got ", d);
-    TORCH_CHECK(K.size(0) == B && K.size(2) == N && K.size(3) == d, "K shape mismatch");
-    TORCH_CHECK(V.size(0) == B && V.size(1) == H_kv && V.size(2) == N && V.size(3) == d, "V shape mismatch");
+    TORCH_CHECK(K.size(0) == B && K.size(3) == d, "K shape mismatch");
+    TORCH_CHECK(V.sizes() == K.sizes(), "V shape must match K");
     TORCH_CHECK(H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
 
     auto opts_half = Q.options();
@@ -75,7 +91,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     p.L = L.data_ptr<float>();
 
     p.batch_size = B; p.num_heads = H_q; p.num_heads_k = H_kv;
-    p.seq_len = N; p.head_dim = d;
+    p.seq_len_q = N; p.seq_len_k = Nk; p.head_dim = d;
     p.softmax_scale = softmax_scale; p.is_causal = is_causal;
 
     p.q_batch_stride = Q.stride(0); p.q_head_stride = Q.stride(1); p.q_seq_stride = Q.stride(2);
@@ -112,12 +128,28 @@ std::vector<torch::Tensor> flash_attn_backward(
     Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
     O = O.contiguous();
 
-    TORCH_CHECK(Q.is_cuda() && Q.dtype() == torch::kFloat16, "Q must be CUDA float16");
-    TORCH_CHECK(dO.sizes() == Q.sizes(), "dO shape must match Q");
+    for (const auto* t : {&dO, &Q, &K, &V, &O}) {
+        TORCH_CHECK(t->is_cuda() && t->dtype() == torch::kFloat16,
+                    "dO, Q, K, V, O must be CUDA float16");
+        TORCH_CHECK(t->device() == Q.device(), "dO, Q, K, V, O must be on the same device");
+    }
+    TORCH_CHECK(Q.dim() == 4 && K.dim() == 4 && V.dim() == 4, "Q, K, V must be 4D");
+    TORCH_CHECK(dO.sizes() == Q.sizes() && O.sizes() == Q.sizes(), "dO and O shapes must match Q");
 
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
+    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
+                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv for GQA");
+    const int Nk = K.size(2);
+    TORCH_CHECK(K.size(0) == B && K.size(3) == d, "K shape mismatch");
+    TORCH_CHECK(V.sizes() == K.sizes(), "V shape must match K");
+
+    TORCH_CHECK(L.is_cuda() && L.dtype() == torch::kFloat32 && L.device() == Q.device(),
+                "L must be CUDA float32 on the same device as Q");
+    L = L.contiguous();
+    TORCH_CHECK(L.dim() == 3 && L.size(0) == B && L.size(1) == H_q && L.size(2) == N,
+                "L must be [B, H_q, N]");
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -125,8 +157,8 @@ std::vector<torch::Tensor> flash_attn_backward(
     // dQ in FP32 (atomicAdd accumulator) → convert to FP16 at end
     torch::Tensor dQ_fp32 = torch::zeros({B, H_q, N, d}, Q.options().dtype(torch::kFloat32));
     // dK, dV have KV head shape — each element written exactly once (no atomics)
-    torch::Tensor dK = torch::empty({B, H_kv, N, d}, K.options());
-    torch::Tensor dV = torch::empty({B, H_kv, N, d}, V.options());
+    torch::Tensor dK = torch::empty({B, H_kv, Nk, d}, K.options());
+    torch::Tensor dV = torch::empty({B, H_kv, Nk, d}, V.options());
 
     // Precompute D = rowsum(dO * O) → [B, H_q, N]
     const int l_batch_stride = H_q * N;
@@ -155,7 +187,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     bwd.dV = reinterpret_cast<half*>(dV.data_ptr<at::Half>());
 
     bwd.batch_size = B; bwd.num_heads = H_q; bwd.num_heads_k = H_kv;
-    bwd.seq_len = N; bwd.head_dim = d;
+    bwd.seq_len_q = N; bwd.seq_len_k = Nk; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale; bwd.is_causal = is_causal;
 
     bwd.q_batch_stride = Q.stride(0); bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(2);
@@ -198,8 +230,14 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
 ) {
     Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
 
-    TORCH_CHECK(Q.is_cuda(), "Q must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16, "Q must be float16");
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
+    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda() &&
+                cu_seqlens_q.device() == Q.device() && cu_seqlens_k.device() == Q.device(),
+                "cu_seqlens_q/k must be on the same CUDA device as Q");
+    TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(),
+                "Q, K, V must be on the same device");
+    TORCH_CHECK(Q.dtype() == torch::kFloat16 && K.dtype() == torch::kFloat16 &&
+                V.dtype() == torch::kFloat16, "Q, K, V must be float16");
     TORCH_CHECK(Q.dim() == 3, "Q must be [total_q, H_q, d]");
     TORCH_CHECK(K.dim() == 3 && V.dim() == 3, "K,V must be 3D");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must be int32");

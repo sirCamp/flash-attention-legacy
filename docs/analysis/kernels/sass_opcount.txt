@@ -1,0 +1,96 @@
+# static SASS instruction counts (not dynamic!) per instantiation
+# cols: kind arch tile | total_instr code_KB | HMUL2/HFMA2/HADD2 (fp16 math) | F2F (cvt) | FFMA | HMMA | LDS | LDL/STL (local mem) | RED/ATOM (global atomics)
+bwd_cudacore       sm_60 TileBwd_d256     | instr= 17016 code=  177.2KB | fp16= 1024 F2F=  512 FFMA=   769 HMMA=    0 LDS=  128 LDL= 3495 STL= 3473 RED/ATOM=  256
+bwd_cudacore       sm_60 TileBwd_d128     | instr=  9168 code=   95.5KB | fp16=  512 F2F=  256 FFMA=   385 HMMA=    0 LDS=   64 LDL= 1773 STL= 1717 RED/ATOM=  128
+bwd_cudacore       sm_60 TileBwd_d96      | instr=  7566 code=   78.8KB | fp16=  384 F2F=  192 FFMA=   289 HMMA=    0 LDS=   48 LDL= 1824 STL= 1364 RED/ATOM=   96
+bwd_cudacore       sm_60 TileBwd_d64      | instr=  3264 code=   34.0KB | fp16=  256 F2F=  128 FFMA=   193 HMMA=    0 LDS=   32 LDL=   96 STL=   81 RED/ATOM=   64
+bwd_cudacore       sm_60 TileBwd_d32      | instr=  1632 code=   17.0KB | fp16=  128 F2F=   64 FFMA=    97 HMMA=    0 LDS=   16 LDL=    0 STL=    0 RED/ATOM=   32
+precompute_D       sm_60 -                | instr=   510 code=    5.3KB | fp16=  116 F2F=    0 FFMA=    29 HMMA=    0 LDS=    0 LDL=    0 STL=    0 RED/ATOM=    0
+bwd_cudacore       sm_61 TileBwd_d256     | instr= 16716 code=  174.1KB | fp16=    0 F2F= 1536 FFMA=   769 HMMA=    0 LDS=  128 LDL= 3285 STL= 3263 RED/ATOM=  256
+bwd_cudacore       sm_61 TileBwd_d128     | instr=  9048 code=   94.2KB | fp16=    0 F2F=  768 FFMA=   385 HMMA=    0 LDS=   64 LDL= 1679 STL= 1623 RED/ATOM=  128
+bwd_cudacore       sm_61 TileBwd_d96      | instr=  8034 code=   83.7KB | fp16=    0 F2F=  576 FFMA=   289 HMMA=    0 LDS=   48 LDL= 2113 STL= 1512 RED/ATOM=   96
+bwd_cudacore       sm_61 TileBwd_d64      | instr=  3264 code=   34.0KB | fp16=    0 F2F=  384 FFMA=   193 HMMA=    0 LDS=   32 LDL=   98 STL=   83 RED/ATOM=   64
+bwd_cudacore       sm_61 TileBwd_d32      | instr=  1632 code=   17.0KB | fp16=    0 F2F=  192 FFMA=    97 HMMA=    0 LDS=   16 LDL=    0 STL=    0 RED/ATOM=   32
+precompute_D       sm_61 -                | instr=   516 code=    5.4KB | fp16=    0 F2F=  116 FFMA=    29 HMMA=    0 LDS=    0 LDL=    0 STL=    0 RED/ATOM=    0
+bwd_cudacore       sm_70 TileBwd_d256     | instr= 16544 code=  258.5KB | fp16= 1024 F2F=  512 FFMA=   769 HMMA=    0 LDS=  128 LDL= 3801 STL= 3774 RED/ATOM=  256
+bwd_cudacore       sm_70 TileBwd_d128     | instr=  8432 code=  131.8KB | fp16=  512 F2F=  256 FFMA=   385 HMMA=    0 LDS=   64 LDL= 1879 STL= 1811 RED/ATOM=  128
+bwd_cudacore       sm_70 TileBwd_d96      | instr=  6832 code=  106.8KB | fp16=  384 F2F=  192 FFMA=   289 HMMA=    0 LDS=   48 LDL= 1565 STL= 1454 RED/ATOM=   96
+bwd_cudacore       sm_70 TileBwd_d64      | instr=  2968 code=   46.4KB | fp16=  256 F2F=  128 FFMA=   193 HMMA=    0 LDS=   32 LDL=  133 STL=   82 RED/ATOM=   64
+bwd_cudacore       sm_70 TileBwd_d32      | instr=  1440 code=   22.5KB | fp16=  128 F2F=   64 FFMA=    97 HMMA=    0 LDS=   16 LDL=    0 STL=    0 RED/ATOM=   32
+bwd_volta          sm_70 TileBwd_d256     | instr=  6736 code=  105.2KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  896['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  474 LDL=    0 STL=    0 RED/ATOM=  112
+bwd_volta          sm_70 TileBwd_d128     | instr=  3864 code=   60.4KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  448['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  258 LDL=    3 STL=    2 RED/ATOM=   56
+bwd_volta          sm_70 TileBwd_d96      | instr=  3472 code=   54.2KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  416['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  251 LDL=    1 STL=    1 RED/ATOM=   42
+bwd_volta          sm_70 TileBwd_d64      | instr=  2608 code=   40.8KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  320['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  195 LDL=    0 STL=    0 RED/ATOM=   14
+bwd_volta          sm_70 TileBwd_d32      | instr=  1760 code=   27.5KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  160['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  120 LDL=    0 STL=    0 RED/ATOM=    7
+precompute_D       sm_70 -                | instr=   432 code=    6.8KB | fp16=  116 F2F=    0 FFMA=    29 HMMA=    0 LDS=    0 LDL=    0 STL=    0 RED/ATOM=    0
+bwd_cudacore       sm_75 TileBwd_d256     | instr= 16272 code=  254.2KB | fp16= 1024 F2F=  512 FFMA=   769 HMMA=    0 LDS=  128 LDL= 3706 STL= 3690 RED/ATOM=  256
+bwd_cudacore       sm_75 TileBwd_d128     | instr=  8264 code=  129.1KB | fp16=  512 F2F=  256 FFMA=   385 HMMA=    0 LDS=   64 LDL= 1769 STL= 1763 RED/ATOM=  128
+bwd_cudacore       sm_75 TileBwd_d96      | instr=  6696 code=  104.6KB | fp16=  384 F2F=  192 FFMA=   289 HMMA=    0 LDS=   48 LDL= 1437 STL= 1372 RED/ATOM=   96
+bwd_cudacore       sm_75 TileBwd_d64      | instr=  2896 code=   45.2KB | fp16=  256 F2F=  128 FFMA=   193 HMMA=    0 LDS=   32 LDL=   72 STL=   65 RED/ATOM=   64
+bwd_cudacore       sm_75 TileBwd_d32      | instr=  1392 code=   21.8KB | fp16=  128 F2F=   64 FFMA=    97 HMMA=    0 LDS=   16 LDL=    0 STL=    0 RED/ATOM=   32
+bwd_volta          sm_75 TileBwd_d256     | instr=  5576 code=   87.1KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  224['HMMA.1688.F32'] LDS=  410 LDL=    0 STL=    0 RED/ATOM=  112
+bwd_volta          sm_75 TileBwd_d128     | instr=  3248 code=   50.8KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  112['HMMA.1688.F32'] LDS=  226 LDL=    3 STL=    3 RED/ATOM=   56
+bwd_volta          sm_75 TileBwd_d96      | instr=  2928 code=   45.8KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=  104['HMMA.1688.F32'] LDS=  207 LDL=    0 STL=    0 RED/ATOM=   42
+bwd_volta          sm_75 TileBwd_d64      | instr=  2280 code=   35.6KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=   80['HMMA.1688.F32'] LDS=  155 LDL=    0 STL=    0 RED/ATOM=   14
+bwd_volta          sm_75 TileBwd_d32      | instr=  1576 code=   24.6KB | fp16=    0 F2F=   24 FFMA=     7 HMMA=   40['HMMA.1688.F32'] LDS=  100 LDL=    0 STL=    0 RED/ATOM=    7
+precompute_D       sm_75 -                | instr=   432 code=    6.8KB | fp16=  116 F2F=    0 FFMA=    29 HMMA=    0 LDS=    0 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_60 TilePascal_d256  | instr= 42480 code=  442.5KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  391 STL=  557 RED/ATOM=    0
+fwd_pascal_varlen  sm_60 TilePascal_d128  | instr= 19692 code=  205.1KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_60 TilePascal_d96   | instr= 15444 code=  160.9KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_60 TilePascal_d64   | instr= 18480 code=  192.5KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_60 TilePascal_d32   | instr=  9804 code=  102.1KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_60 TilePascal_d256  | instr= 42750 code=  445.3KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  369 STL=  555 RED/ATOM=    0
+fwd_pascal         sm_60 TilePascal_d128  | instr= 19848 code=  206.8KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_60 TilePascal_d96   | instr= 15564 code=  162.1KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_60 TilePascal_d64   | instr= 18504 code=  192.8KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_60 TilePascal_d32   | instr=  9858 code=  102.7KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_61 TilePascal_d256  | instr= 42498 code=  442.7KB | fp16= 4096 F2F=12544 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  391 STL=  557 RED/ATOM=    0
+fwd_pascal_varlen  sm_61 TilePascal_d128  | instr= 19692 code=  205.1KB | fp16= 2048 F2F= 6272 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_61 TilePascal_d96   | instr= 15444 code=  160.9KB | fp16= 1536 F2F= 4704 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_61 TilePascal_d64   | instr= 18480 code=  192.5KB | fp16= 2048 F2F= 6208 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_61 TilePascal_d32   | instr=  9804 code=  102.1KB | fp16= 1024 F2F= 3104 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_61 TilePascal_d256  | instr= 42768 code=  445.5KB | fp16= 4096 F2F=12544 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  369 STL=  555 RED/ATOM=    0
+fwd_pascal         sm_61 TilePascal_d128  | instr= 19848 code=  206.8KB | fp16= 2048 F2F= 6272 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_61 TilePascal_d96   | instr= 15564 code=  162.1KB | fp16= 1536 F2F= 4704 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_61 TilePascal_d64   | instr= 18504 code=  192.8KB | fp16= 2048 F2F= 6208 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_61 TilePascal_d32   | instr=  9858 code=  102.7KB | fp16= 1024 F2F= 3104 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_70 TilePascal_d256  | instr= 41456 code=  647.8KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  481 STL=  651 RED/ATOM=    0
+fwd_pascal_varlen  sm_70 TilePascal_d128  | instr= 19144 code=  299.1KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_70 TilePascal_d96   | instr= 14528 code=  227.0KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_70 TilePascal_d64   | instr= 18200 code=  284.4KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_70 TilePascal_d32   | instr=  9672 code=  151.1KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_70 TilePascal_d256  | instr= 41728 code=  652.0KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  465 STL=  653 RED/ATOM=    0
+fwd_pascal         sm_70 TilePascal_d128  | instr= 19280 code=  301.2KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_70 TilePascal_d96   | instr= 14632 code=  228.6KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_70 TilePascal_d64   | instr= 18240 code=  285.0KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_70 TilePascal_d32   | instr=  9712 code=  151.8KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_75 TilePascal_d256  | instr= 41168 code=  643.2KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  455 STL=  608 RED/ATOM=    0
+fwd_pascal_varlen  sm_75 TilePascal_d128  | instr= 19008 code=  297.0KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_75 TilePascal_d96   | instr= 14416 code=  225.2KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_75 TilePascal_d64   | instr= 18128 code=  283.2KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal_varlen  sm_75 TilePascal_d32   | instr=  9640 code=  150.6KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_75 TilePascal_d256  | instr= 41496 code=  648.4KB | fp16=16384 F2F=  256 FFMA=  4098 HMMA=    0 LDS= 2564 LDL=  454 STL=  611 RED/ATOM=    0
+fwd_pascal         sm_75 TilePascal_d128  | instr= 19144 code=  299.1KB | fp16= 8192 F2F=  128 FFMA=  2050 HMMA=    0 LDS= 1284 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_75 TilePascal_d96   | instr= 14520 code=  226.9KB | fp16= 6144 F2F=   96 FFMA=  1538 HMMA=    0 LDS=  964 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_75 TilePascal_d64   | instr= 18176 code=  284.0KB | fp16= 8192 F2F=   64 FFMA=  2050 HMMA=    0 LDS= 1288 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_pascal         sm_75 TilePascal_d32   | instr=  9680 code=  151.2KB | fp16= 4096 F2F=   32 FFMA=  1026 HMMA=    0 LDS=  648 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_70 TileVolta_d256   | instr= 11624 code=  181.6KB | fp16=    0 F2F=  263 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  407 LDL= 1195 STL= 1423 RED/ATOM=    0
+fwd_volta_varlen   sm_70 TileVolta_d128   | instr=  5928 code=   92.6KB | fp16=    0 F2F=  135 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  391 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_70 TileVolta_d96    | instr=  4688 code=   73.2KB | fp16=    0 F2F=  103 FFMA=     2 HMMA=  768['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  303 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_70 TileVolta_d64    | instr=  5256 code=   82.1KB | fp16=    0 F2F=   71 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  407 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_70 TileVolta_d32    | instr=  2144 code=   33.5KB | fp16=    0 F2F=   39 FFMA=     2 HMMA=  256['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  127 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_70 TileVolta_d256   | instr= 11888 code=  185.8KB | fp16=    0 F2F=  263 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  407 LDL= 1200 STL= 1427 RED/ATOM=    0
+fwd_volta          sm_70 TileVolta_d128   | instr=  6064 code=   94.8KB | fp16=    0 F2F=  135 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  391 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_70 TileVolta_d96    | instr=  4776 code=   74.6KB | fp16=    0 F2F=  103 FFMA=     2 HMMA=  768['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  303 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_70 TileVolta_d64    | instr=  5336 code=   83.4KB | fp16=    0 F2F=   71 FFMA=     2 HMMA= 1024['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  407 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_70 TileVolta_d32    | instr=  2184 code=   34.1KB | fp16=    0 F2F=   39 FFMA=     2 HMMA=  256['HMMA.884.F32.F32.STEP0', 'HMMA.884.F32.F32.STEP1', 'HMMA.884.F32.F32.STEP2', 'HMMA.884.F32.F32.STEP3'] LDS=  127 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_75 TileVolta_d256   | instr=  8472 code=  132.4KB | fp16=    0 F2F=  263 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  343 LDL=  297 STL=  395 RED/ATOM=    0
+fwd_volta_varlen   sm_75 TileVolta_d128   | instr=  4920 code=   76.9KB | fp16=    0 F2F=  135 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  327 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_75 TileVolta_d96    | instr=  3880 code=   60.6KB | fp16=    0 F2F=  103 FFMA=     2 HMMA=  192['HMMA.1688.F32'] LDS=  255 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_75 TileVolta_d64    | instr=  4312 code=   67.4KB | fp16=    0 F2F=   71 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  343 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta_varlen   sm_75 TileVolta_d32    | instr=  1888 code=   29.5KB | fp16=    0 F2F=   39 FFMA=     2 HMMA=   64['HMMA.1688.F32'] LDS=  111 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_75 TileVolta_d256   | instr=  8752 code=  136.8KB | fp16=    0 F2F=  263 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  343 LDL=  300 STL=  398 RED/ATOM=    0
+fwd_volta          sm_75 TileVolta_d128   | instr=  5040 code=   78.8KB | fp16=    0 F2F=  135 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  327 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_75 TileVolta_d96    | instr=  3992 code=   62.4KB | fp16=    0 F2F=  103 FFMA=     2 HMMA=  192['HMMA.1688.F32'] LDS=  255 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_75 TileVolta_d64    | instr=  4368 code=   68.2KB | fp16=    0 F2F=   71 FFMA=     2 HMMA=  256['HMMA.1688.F32'] LDS=  343 LDL=    0 STL=    0 RED/ATOM=    0
+fwd_volta          sm_75 TileVolta_d32    | instr=  1928 code=   30.1KB | fp16=    0 F2F=   39 FFMA=     2 HMMA=   64['HMMA.1688.F32'] LDS=  111 LDL=    0 STL=    0 RED/ATOM=    0

@@ -1,0 +1,63 @@
+{
+ "model": "mistralai/Mistral-7B-Instruct-v0.3",
+ "prefill_ms": {
+  "512": {
+   "flash_attn_legacy": 143.39,
+   "flash_attn_legacy_peak_GB": 13.63,
+   "sdpa": 141.1,
+   "sdpa_peak_GB": 13.7,
+   "speedup": 0.984
+  },
+  "1024": {
+   "flash_attn_legacy": 294.88,
+   "flash_attn_legacy_peak_GB": 13.75,
+   "sdpa": 316.49,
+   "sdpa_peak_GB": 14.02,
+   "speedup": 1.073
+  },
+  "2048": {
+   "flash_attn_legacy": 694.51,
+   "flash_attn_legacy_peak_GB": 13.99,
+   "sdpa": 817.47,
+   "sdpa_peak_GB": 15.11,
+   "speedup": 1.177
+  },
+  "4096": {
+   "flash_attn_legacy": 1856.49,
+   "flash_attn_legacy_peak_GB": 14.47,
+   "sdpa": 2397.42,
+   "sdpa_peak_GB": 18.98,
+   "speedup": 1.291
+  },
+  "8192": {
+   "flash_attn_legacy": 5692.97,
+   "flash_attn_legacy_peak_GB": 15.42,
+   "sdpa": "OOM"
+  }
+ },
+ "decode": {
+  "prompt32_flash_attn_legacy": {
+   "s": 3.949,
+   "tok_per_s": 32.4
+  },
+  "prompt32_sdpa": {
+   "s": 4.322,
+   "tok_per_s": 29.6
+  },
+  "prompt1000_flash_attn_legacy": {
+   "s": 4.398,
+   "tok_per_s": 29.1
+  },
+  "prompt1000_sdpa": {
+   "s": 4.788,
+   "tok_per_s": 26.7
+  }
+ },
+ "kernel_calls": {
+  "512": 192,
+  "1024": 192,
+  "2048": 192,
+  "4096": 192,
+  "8192": 192
+ }
+}

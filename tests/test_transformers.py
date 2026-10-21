@@ -140,7 +140,7 @@ class TestTransformersIntegration:
         k = torch.randn(B, H_kv, N, d, device='cuda', dtype=torch.float16) * 0.3
         v = torch.randn(B, H_kv, N, d, device='cuda', dtype=torch.float16) * 0.3
 
-        out = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         assert out.shape == (B, H_q, N, d)
         assert not torch.isnan(out).any()
 

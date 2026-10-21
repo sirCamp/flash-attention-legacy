@@ -106,7 +106,7 @@ class TestFlashVsStandard:
         k = torch.randn_like(q) * 0.3
         v = torch.randn_like(q) * 0.3
 
-        out_flash = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        out_flash = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         out_std = standard_attention(q, k, v, scale, is_causal=True)
 
         max_diff = (out_flash.float() - out_std.float()).abs().max().item()
@@ -135,7 +135,7 @@ class TestFlashVsStandard:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         mem_before = torch.cuda.memory_allocated()
-        _ = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        _ = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         torch.cuda.synchronize()
         flash_extra_mb = (torch.cuda.max_memory_allocated() - mem_before) / 1e6
 
@@ -164,7 +164,7 @@ class TestFlashVsStandard:
         v = torch.randn_like(q) * 0.3
 
         fn_std = lambda: standard_attention(q, k, v, scale, is_causal=True)
-        fn_flash = lambda: flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        fn_flash = lambda: flash_attention(q, k, v, softmax_scale=scale, causal=True)
 
         _warmup(fn_std)
         _warmup(fn_flash)
@@ -215,7 +215,7 @@ class TestComparisonTable:
             v = torch.randn_like(q) * 0.3
 
             fn_std = lambda: standard_attention(q, k, v, scale, is_causal=True)
-            fn_flash = lambda: flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+            fn_flash = lambda: flash_attention(q, k, v, softmax_scale=scale, causal=True)
 
             _warmup(fn_std, 3)
             _warmup(fn_flash, 3)
@@ -224,7 +224,7 @@ class TestComparisonTable:
             flash_ms, flash_sd, flash_mb, _ = _measure(fn_flash, iters=10)
 
             # Correctness
-            out_f = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+            out_f = flash_attention(q, k, v, softmax_scale=scale, causal=True)
             out_s = standard_attention(q, k, v, scale, is_causal=True)
             max_diff = (out_f.float() - out_s.float()).abs().max().item()
 

@@ -1,0 +1,783 @@
+{
+ "model": "Qwen/Qwen3-0.6B",
+ "tag": "qwen3_06b",
+ "override": {},
+ "scenarios": {
+  "prefill": {
+   "N": 1000,
+   "path": {
+    "calls": 28,
+    "kernel_calls": 28,
+    "prefill(q>1)": {
+     "calls": 28,
+     "kernel": 28,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       1000,
+       1000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.08838834764831845"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 1000):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "flash_vs_sdpa": {
+    "one_minus_cos": 2.384185791015625e-06,
+    "worst_pos_one_minus_cos": 3.933906555175781e-05,
+    "top1": 1.0,
+    "max_abs": 0.23724365234375,
+    "finite": true
+   },
+   "eager_vs_sdpa": {
+    "one_minus_cos": 3.5762786865234375e-06,
+    "worst_pos_one_minus_cos": 4.26173210144043e-05,
+    "top1": 1.0,
+    "max_abs": 0.234375,
+    "finite": true
+   },
+   "flash_vs_eager": {
+    "one_minus_cos": 3.516674041748047e-06,
+    "worst_pos_one_minus_cos": 0.00010979175567626953,
+    "top1": 1.0,
+    "max_abs": 0.359375,
+    "finite": true
+   }
+  },
+  "left_padded": {
+   "path_forward": {
+    "calls": 28,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 28,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "masks": [
+      "{'shape': (2, 1, 200, 200), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       200,
+       200
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.08838834764831845"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 200):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "seq0_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 1.1920928955078125e-07,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq0_eager_vs_sdpa": {
+    "one_minus_cos": 8.285045623779297e-06,
+    "worst_pos_one_minus_cos": 4.4286251068115234e-05,
+    "top1": 0.9950000047683716,
+    "max_abs": 0.288330078125,
+    "finite": true
+   },
+   "seq1_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 0.0,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq1_eager_vs_sdpa": {
+    "one_minus_cos": 3.635883331298828e-06,
+    "worst_pos_one_minus_cos": 6.616115570068359e-06,
+    "top1": 1.0,
+    "max_abs": 0.05078125,
+    "finite": true
+   },
+   "short_padded_vs_alone_flash": {
+    "one_minus_cos": 2.2649765014648438e-06,
+    "worst_pos_one_minus_cos": 4.589557647705078e-06,
+    "top1": 1.0,
+    "max_abs": 0.03515625,
+    "finite": true
+   },
+   "path_generate": {
+    "calls": 672,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 28,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "masks": [
+      "{'shape': (2, 1, 200, 200), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       200,
+       200
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "decode(q=1)": {
+     "calls": 644,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "masks": [
+      "{'shape': (2, 1, 1, 201), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 202), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 203), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 204), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 205), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 206), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       201
+      ],
+      [
+       1,
+       202
+      ],
+      [
+       1,
+       203
+      ],
+      [
+       1,
+       204
+      ],
+      [
+       1,
+       205
+      ],
+      [
+       1,
+       206
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.08838834764831845"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(2, 1):int64\"",
+      "\"tensor(2, 200):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "gen_first_div": [
+    24,
+    24
+   ],
+   "gen_text_flash": [
+    "from functools import lru_cache\nfrom typing import Any, Callable, List, Optional, Tuple, Union, Dict,",
+    " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The"
+   ],
+   "gen_text_sdpa": [
+    "from functools import lru_cache\nfrom typing import Any, Callable, List, Optional, Tuple, Union, Dict,",
+    " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The"
+   ]
+  },
+  "chunked": {
+   "split": [
+    300,
+    100
+   ],
+   "path": {
+    "calls": 56,
+    "kernel_calls": 56,
+    "prefill(q>1)": {
+     "calls": 56,
+     "kernel": 56,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       100,
+       400
+      ],
+      [
+       300,
+       300
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.08838834764831845"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 100):int64\"",
+      "\"tensor(1, 300):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "flash_chunk_vs_sdpa_full": {
+    "one_minus_cos": 1.5497207641601562e-06,
+    "worst_pos_one_minus_cos": 6.198883056640625e-06,
+    "top1": 0.9899999499320984,
+    "max_abs": 0.0859375,
+    "finite": true
+   },
+   "eager_chunk_vs_sdpa_full": {
+    "one_minus_cos": 2.1457672119140625e-06,
+    "worst_pos_one_minus_cos": 6.496906280517578e-06,
+    "top1": 0.9899999499320984,
+    "max_abs": 0.10546875,
+    "finite": true
+   },
+   "sdpa_chunk_vs_sdpa_full": {
+    "one_minus_cos": 1.4901161193847656e-06,
+    "worst_pos_one_minus_cos": 4.5299530029296875e-06,
+    "top1": 1.0,
+    "max_abs": 0.09375,
+    "finite": true
+   }
+  },
+  "generate": {
+   "wall_s_flash_attn_legacy": 2.12,
+   "path": {
+    "calls": 1792,
+    "kernel_calls": 28,
+    "prefill(q>1)": {
+     "calls": 28,
+     "kernel": 28,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       25,
+       25
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "decode(q=1)": {
+     "calls": 1764,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+     ],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       26
+      ],
+      [
+       1,
+       27
+      ],
+      [
+       1,
+       28
+      ],
+      [
+       1,
+       29
+      ],
+      [
+       1,
+       30
+      ],
+      [
+       1,
+       31
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.08838834764831845"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 25):int64\"",
+      "\"tensor(25)\"",
+      "\"tensor(26)\"",
+      "\"tensor(27)\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "wall_s_sdpa": 2.29,
+   "wall_s_eager": 2.3,
+   "first_div_flash_vs_sdpa": 64,
+   "first_div_eager_vs_sdpa": 64,
+   "first_div_flash_vs_eager": 64,
+   "text_flash": " \n\n1. The attention is computed in tiles, not in a single tensor. \n2. The running softmax statistics are stored in registers, not in a tensor. \n3. The attention is computed in a single tile, not multiple tiles. \n4. The attention is computed in a single tile, not multiple tiles",
+   "text_sdpa": " \n\n1. The attention is computed in tiles, not in a single tensor. \n2. The running softmax statistics are stored in registers, not in a tensor. \n3. The attention is computed in a single tile, not multiple tiles. \n4. The attention is computed in a single tile, not multiple tiles",
+   "text_eager": " \n\n1. The attention is computed in tiles, not in a single tensor. \n2. The running softmax statistics are stored in registers, not in a tensor. \n3. The attention is computed in a single tile, not multiple tiles. \n4. The attention is computed in a single tile, not multiple tiles"
+  }
+ },
+ "errors": {},
+ "config": {
+  "head_dim": 128,
+  "n_heads": 16,
+  "n_kv_heads": 8,
+  "layers": 28,
+  "sliding_window": null,
+  "use_sliding_window": false,
+  "layer_types": [
+   "full_attention"
+  ],
+  "n_sliding_layers": 0,
+  "attn_logit_softcapping": null,
+  "final_logit_softcapping": null,
+  "is_causal": "n/a",
+  "attn_impl_after_load": "flash_attn_legacy",
+  "max_pos": 40960,
+  "gen_cache_impl": null,
+  "has_sinks": false
+ },
+ "first_records": {
+  "prefill": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     16,
+     1000,
+     128
+    ],
+    "k": [
+     1,
+     8,
+     1000,
+     128
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.08838834764831845,
+     "sliding_window": null,
+     "position_ids": "tensor(1, 1000):int64",
+     "use_cache": true
+    },
+    "kernel": true,
+    "kernel_args": {
+     "causal": true,
+     "scale": 0.08838834764831845
+    }
+   },
+   {
+    "layer": 1,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     16,
+     1000,
+     128
+    ],
+    "k": [
+     1,
+     8,
+     1000,
+     128
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.08838834764831845,
+     "sliding_window": null,
+     "position_ids": "tensor(1, 1000):int64",
+     "use_cache": true
+    },
+    "kernel": true,
+    "kernel_args": {
+     "causal": true,
+     "scale": 0.08838834764831845
+    }
+   }
+  ],
+  "generate_decode": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     16,
+     1,
+     128
+    ],
+    "k": [
+     1,
+     8,
+     26,
+     128
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.08838834764831845,
+     "sliding_window": null,
+     "position_ids": "tensor(25)",
+     "use_cache": true
+    },
+    "kernel": false,
+    "kernel_args": null
+   }
+  ]
+ },
+ "gold_fp32_eager": {
+  "prefill": {
+   "flash": {
+    "one_minus_cos": 1.8477439880371094e-06,
+    "worst_pos_one_minus_cos": 5.155801773071289e-05,
+    "top1": 1.0,
+    "max_abs": 0.24423551559448242,
+    "finite": true
+   },
+   "sdpa": {
+    "one_minus_cos": 1.7881393432617188e-06,
+    "worst_pos_one_minus_cos": 1.8596649169921875e-05,
+    "top1": 1.0,
+    "max_abs": 0.1705026626586914,
+    "finite": true
+   },
+   "eager": {
+    "one_minus_cos": 2.7418136596679688e-06,
+    "worst_pos_one_minus_cos": 2.5391578674316406e-05,
+    "top1": 1.0,
+    "max_abs": 0.18184375762939453,
+    "finite": true
+   }
+  },
+  "chunked_flash": {
+   "one_minus_cos": 1.0728836059570312e-06,
+   "worst_pos_one_minus_cos": 4.0531158447265625e-06,
+   "top1": 0.9899999499320984,
+   "max_abs": 0.08002245426177979,
+   "finite": true
+  },
+  "gen_first_div_vs_gold": {
+   "flash": 64,
+   "sdpa": 64,
+   "eager": 64
+  },
+  "gen_text_gold": " \n\n1. The attention is computed in tiles, not in a single tensor. \n2. The running softmax statistics are stored in registers, not in a tensor. \n3. The attention is computed in a single tile, not multiple tiles. \n4. The attention is computed in a single tile, not multiple tiles"
+ },
+ "elapsed_s": 18.7
+}

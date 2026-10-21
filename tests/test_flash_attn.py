@@ -25,10 +25,13 @@ def ref_attention(q, k, v, scale, is_causal=False):
         v = v.repeat_interleave(reps, dim=1)
     s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
     if is_causal:
-        N = q.shape[-2]
-        mask = torch.triu(torch.ones(N, N, device=q.device, dtype=torch.bool), diagonal=1)
+        Nq, Nk = q.shape[-2], k.shape[-2]
+        # bottom-right aligned: query i sees keys j <= i + (Nk - Nq)
+        mask = torch.triu(torch.ones(Nq, Nk, device=q.device, dtype=torch.bool),
+                          diagonal=1 + Nk - Nq)
         s.masked_fill_(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
+    p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     return torch.matmul(p, v.float()).half()
 
 
@@ -44,10 +47,13 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False):
 
     s = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
     if is_causal:
-        N = q.shape[-2]
-        mask = torch.triu(torch.ones(N, N, device=q.device, dtype=torch.bool), diagonal=1)
+        Nq, Nk = q.shape[-2], k.shape[-2]
+        # bottom-right aligned: query i sees keys j <= i + (Nk - Nq)
+        mask = torch.triu(torch.ones(Nq, Nk, device=q.device, dtype=torch.bool),
+                          diagonal=1 + Nk - Nq)
         s.masked_fill_(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
+    p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     o = torch.matmul(p, v_f)
     o.backward(grad_out.float())
 
@@ -86,7 +92,7 @@ class TestForwardMHA:
         q = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16) * 0.3
         k, v = torch.randn_like(q) * 0.3, torch.randn_like(q) * 0.3
 
-        out = flash_attention(q, k, v, softmax_scale=scale, is_causal=is_causal)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=is_causal)
         ref = ref_attention(q, k, v, scale, is_causal)
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=5e-3)
 
@@ -170,7 +176,7 @@ class TestForwardGQA:
         k = torch.randn(B, H_kv, N, d, device='cuda', dtype=torch.float16) * 0.3
         v = torch.randn(B, H_kv, N, d, device='cuda', dtype=torch.float16) * 0.3
 
-        out = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         ref = ref_attention(q, k, v, scale, is_causal=True)
         torch.testing.assert_close(out, ref, rtol=3e-2, atol=1e-2)
 
@@ -207,7 +213,7 @@ class TestBackwardMHA:
         k = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16, requires_grad=True)
         v = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16, requires_grad=True)
 
-        flash_attention(q, k, v, is_causal=is_causal).sum().backward()
+        flash_attention(q, k, v, causal=is_causal).sum().backward()
         assert q.grad is not None and not torch.all(q.grad == 0)
         assert k.grad is not None and not torch.all(k.grad == 0)
         assert v.grad is not None and not torch.all(v.grad == 0)
@@ -224,7 +230,7 @@ class TestBackwardMHA:
         go = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16) * 0.1
 
         q.requires_grad_(True); k.requires_grad_(True); v.requires_grad_(True)
-        flash_attention(q, k, v, softmax_scale=scale, is_causal=is_causal).backward(go)
+        flash_attention(q, k, v, softmax_scale=scale, causal=is_causal).backward(go)
         dq_f, dk_f, dv_f = q.grad.clone(), k.grad.clone(), v.grad.clone()
 
         dq_r, dk_r, dv_r = ref_backward(q.detach(), k.detach(), v.detach(), go, scale, is_causal)
@@ -372,7 +378,7 @@ class TestVarlen:
         q_b = q.permute(1, 0, 2).unsqueeze(0)  # [1, H, N, d]
         k_b = k.permute(1, 0, 2).unsqueeze(0)
         v_b = v.permute(1, 0, 2).unsqueeze(0)
-        out_batch = flash_attention(q_b, k_b, v_b, softmax_scale=scale, is_causal=True)
+        out_batch = flash_attention(q_b, k_b, v_b, softmax_scale=scale, causal=True)
         out_batch = out_batch.squeeze(0).permute(1, 0, 2)  # [N, H, d]
 
         torch.testing.assert_close(out_varlen, out_batch, rtol=1e-4, atol=1e-4)
@@ -494,7 +500,7 @@ class TestLongSequences:
         q = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16) * 0.3
         k, v = torch.randn_like(q) * 0.3, torch.randn_like(q) * 0.3
 
-        out = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         assert out.shape == (B, H, N, d)
         assert not torch.isnan(out).any(), f"NaN at N={N}, d={d}"
         assert not torch.isinf(out).any(), f"Inf at N={N}, d={d}"
@@ -518,7 +524,7 @@ class TestLongSequences:
         k.requires_grad_(True)
         v.requires_grad_(True)
 
-        out = flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=True)
         out.sum().backward()
 
         assert q.grad is not None and not torch.isnan(q.grad).any()
@@ -535,7 +541,7 @@ class TestLongSequences:
         k, v = torch.randn_like(q) * 0.2, torch.randn_like(q) * 0.2
 
         torch.cuda.reset_peak_memory_stats()
-        out = flash_attention(q, k, v, is_causal=True)
+        out = flash_attention(q, k, v, causal=True)
         torch.cuda.synchronize()
 
         assert out.shape == (B, H, N, d)
@@ -564,7 +570,7 @@ class TestMemoryScaling:
             q = torch.randn(B, H, N, d, device='cuda', dtype=torch.float16)
             k, v = torch.randn_like(q), torch.randn_like(q)
             baseline = torch.cuda.memory_allocated()
-            flash_attention(q, k, v, is_causal=True)
+            flash_attention(q, k, v, causal=True)
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated()
             # Memory beyond input tensors
@@ -651,7 +657,7 @@ class TestNumericalStability:
         k = torch.randn(B, H, 64, d, device='cuda', dtype=torch.float16) * 0.3
         v = torch.randn(B, H, 64, d, device='cuda', dtype=torch.float16)
 
-        out = flash_attention(q, k, v, is_causal=True)
+        out = flash_attention(q, k, v, causal=True)
         # First position can only attend to itself → softmax([s]) = [1.0] → O[0] = V[0]
         torch.testing.assert_close(out[:, :, 0, :], v[:, :, 0, :], rtol=1e-2, atol=1e-3)
 
@@ -674,3 +680,104 @@ class TestNumericalStability:
             g_abs = grad.float().abs()
             assert g_abs.max() < 1000, f"{name} gradient exploded: max={g_abs.max():.1f}"
             assert g_abs.mean() > 1e-6, f"{name} gradient vanished: mean={g_abs.mean():.2e}"
+
+
+# ---------------------------------------------------------------------------
+# Input validation & unsupported configurations
+# ---------------------------------------------------------------------------
+
+class TestCrossLength:
+    """N_q != N_kv: forward + backward vs FP32 reference (bottom-right causal)."""
+
+    @pytest.mark.parametrize("n_q,n_k", [(64, 128), (128, 64), (1, 100), (17, 200), (100, 37)])
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    @pytest.mark.parametrize("H_q,H_kv", [(4, 4), (8, 2)])
+    def test_forward_backward(self, head_dim, n_q, n_k, causal, H_q, H_kv):
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        scale = 1.0 / math.sqrt(head_dim)
+        q = torch.randn(2, H_q, n_q, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        k = torch.randn(2, H_kv, n_k, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        v = torch.randn(2, H_kv, n_k, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        go = torch.randn(2, H_q, n_q, head_dim, device="cuda", dtype=torch.float16)
+
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=causal)
+        out.backward(go)
+        ref = ref_attention(q.detach(), k.detach(), v.detach(), scale, is_causal=causal)
+        rdq, rdk, rdv = ref_backward(q.detach(), k.detach(), v.detach(), go, scale, is_causal=causal)
+
+        assert out.shape == (2, H_q, n_q, head_dim)
+        assert k.grad.shape == k.shape and v.grad.shape == v.shape
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(q.grad, rdq, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(k.grad, rdk, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(v.grad, rdv, atol=5e-2, rtol=5e-2)
+
+    def test_varlen_unequal_lengths_backward(self):
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        H, d = 4, 64
+        lens_q, lens_k = [32, 64], [64, 40]
+        cu_q = torch.tensor([0, 32, 96], dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0, 64, 104], dtype=torch.int32, device="cuda")
+        q = torch.randn(sum(lens_q), H, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        k = torch.randn(sum(lens_k), H, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        v = torch.randn(sum(lens_k), H, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        scale = 1.0 / math.sqrt(d)
+        for causal in (False, True):
+            for t in (q, k, v):
+                t.grad = None
+            out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, 64, 64, softmax_scale=scale, causal=causal)
+            out.sum().backward()
+            qs = k_s = 0
+            for lq, lk in zip(lens_q, lens_k):
+                qi = q[qs:qs + lq].detach().permute(1, 0, 2).unsqueeze(0)
+                ki = k[k_s:k_s + lk].detach().permute(1, 0, 2).unsqueeze(0)
+                vi = v[k_s:k_s + lk].detach().permute(1, 0, 2).unsqueeze(0)
+                ref = ref_attention(qi, ki, vi, scale, is_causal=causal).squeeze(0).permute(1, 0, 2)
+                torch.testing.assert_close(out[qs:qs + lq], ref, atol=2e-2, rtol=2e-2)
+                go = torch.ones_like(qi)
+                rdq, rdk, rdv = ref_backward(qi, ki, vi, go, scale, is_causal=causal)
+                torch.testing.assert_close(q.grad[qs:qs + lq], rdq.squeeze(0).permute(1, 0, 2), atol=5e-2, rtol=5e-2)
+                torch.testing.assert_close(k.grad[k_s:k_s + lk], rdk.squeeze(0).permute(1, 0, 2), atol=5e-2, rtol=5e-2)
+                torch.testing.assert_close(v.grad[k_s:k_s + lk], rdv.squeeze(0).permute(1, 0, 2), atol=5e-2, rtol=5e-2)
+                qs += lq
+                k_s += lk
+
+
+class TestValidation:
+    """Unsupported inputs must raise (not assert, not read out of bounds)."""
+
+    def _qkv(self, n_q=64, n_k=64, d=64, dtype=torch.float16, requires_grad=False):
+        mk = lambda n: torch.randn(1, 4, n, d, device="cuda", dtype=dtype, requires_grad=requires_grad)
+        return mk(n_q), mk(n_k), mk(n_k)
+
+    def test_wrong_dtype_raises(self):
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(dtype=torch.float32)
+        with pytest.raises(TypeError):
+            flash_attention(q, k, v)
+
+    def test_bad_head_dim_raises(self):
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(d=48)
+        with pytest.raises(ValueError):
+            flash_attention(q, k, v)
+
+    @pytest.mark.parametrize("N", [1, 17, 33, 100])
+    def test_backward_ragged_tail_no_nan(self, N):
+        """Q-row padding in the last tile (N not a multiple of Br) must not leak NaN into dK/dV."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv(n_q=N, n_k=N, requires_grad=True)
+        flash_attention(q, k, v, causal=True).sum().backward()
+        for t in (q.grad, k.grad, v.grad):
+            assert not torch.isnan(t).any()
+
+    def test_is_causal_alias_deprecated(self):
+        """`is_causal` still works but warns; result equals `causal`."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv()
+        with pytest.warns(DeprecationWarning):
+            old = flash_attention(q, k, v, is_causal=True)
+        new = flash_attention(q, k, v, causal=True)
+        assert torch.equal(old, new)

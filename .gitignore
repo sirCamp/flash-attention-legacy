@@ -49,3 +49,9 @@ MANIFEST
 .env
 *.pem
 *.key
+
+# Local agent/tooling state
+.claude/
+.claude-flow/
+.swarm/
+ruvector.db

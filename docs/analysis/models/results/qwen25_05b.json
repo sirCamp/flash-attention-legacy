@@ -1,0 +1,755 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "tag": "qwen25_05b",
+ "override": {},
+ "scenarios": {
+  "prefill": {
+   "N": 1000,
+   "path": {
+    "calls": 24,
+    "kernel_calls": 24,
+    "prefill(q>1)": {
+     "calls": 24,
+     "kernel": 24,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       1000,
+       1000
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 1000):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "flash_vs_sdpa": {
+    "one_minus_cos": 3.7550926208496094e-06,
+    "worst_pos_one_minus_cos": 3.254413604736328e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.142578125,
+    "finite": true
+   },
+   "eager_vs_sdpa": {
+    "one_minus_cos": 1.049041748046875e-05,
+    "worst_pos_one_minus_cos": 0.0002671480178833008,
+    "top1": 0.9960000514984131,
+    "max_abs": 0.29052734375,
+    "finite": true
+   },
+   "flash_vs_eager": {
+    "one_minus_cos": 1.0311603546142578e-05,
+    "worst_pos_one_minus_cos": 0.00022709369659423828,
+    "top1": 0.9940000176429749,
+    "max_abs": 0.30029296875,
+    "finite": true
+   }
+  },
+  "left_padded": {
+   "path_forward": {
+    "calls": 24,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 24,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "masks": [
+      "{'shape': (2, 1, 200, 200), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       200,
+       200
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 200):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "seq0_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 1.1920928955078125e-07,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq0_eager_vs_sdpa": {
+    "one_minus_cos": 2.7477741241455078e-05,
+    "worst_pos_one_minus_cos": 0.000148773193359375,
+    "top1": 0.9950000047683716,
+    "max_abs": 0.2890625,
+    "finite": true
+   },
+   "seq1_flash_vs_sdpa": {
+    "one_minus_cos": 0.0,
+    "worst_pos_one_minus_cos": 1.1920928955078125e-07,
+    "top1": 1.0,
+    "max_abs": 0.0,
+    "finite": true
+   },
+   "seq1_eager_vs_sdpa": {
+    "one_minus_cos": NaN,
+    "worst_pos_one_minus_cos": NaN,
+    "top1": 0.0,
+    "max_abs": NaN,
+    "finite": false
+   },
+   "short_padded_vs_alone_flash": {
+    "one_minus_cos": 2.2649765014648438e-06,
+    "worst_pos_one_minus_cos": 3.4570693969726562e-06,
+    "top1": 1.0,
+    "max_abs": 0.046875,
+    "finite": true
+   },
+   "path_generate": {
+    "calls": 576,
+    "kernel_calls": 0,
+    "prefill(q>1)": {
+     "calls": 24,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "masks": [
+      "{'shape': (2, 1, 200, 200), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       200,
+       200
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "decode(q=1)": {
+     "calls": 552,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "masks": [
+      "{'shape': (2, 1, 1, 201), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 202), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 203), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 204), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 205), 'dtype': 'bool'}",
+      "{'shape': (2, 1, 1, 206), 'dtype': 'bool'}"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       201
+      ],
+      [
+       1,
+       202
+      ],
+      [
+       1,
+       203
+      ],
+      [
+       1,
+       204
+      ],
+      [
+       1,
+       205
+      ],
+      [
+       1,
+       206
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(2, 1):int64\"",
+      "\"tensor(2, 200):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "gen_first_div": [
+    24,
+    24
+   ],
+   "gen_text_flash": [
+    "from typing import Any, Dict, List, Optional, Tuple\n\nimport torch\nfrom torch.nn.utils.rnn import pad_sequence",
+    " Paris. It was founded in 789 AD by Charlemagne, the last king of the Carolingian"
+   ],
+   "gen_text_sdpa": [
+    "from typing import Any, Dict, List, Optional, Tuple\n\nimport torch\nfrom torch.nn.utils.rnn import pad_sequence",
+    " Paris. It was founded in 789 AD by Charlemagne, the last king of the Carolingian"
+   ]
+  },
+  "chunked": {
+   "split": [
+    300,
+    100
+   ],
+   "path": {
+    "calls": 48,
+    "kernel_calls": 48,
+    "prefill(q>1)": {
+     "calls": 48,
+     "kernel": 48,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       100,
+       400
+      ],
+      [
+       300,
+       300
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 100):int64\"",
+      "\"tensor(1, 300):int64\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "flash_chunk_vs_sdpa_full": {
+    "one_minus_cos": 2.562999725341797e-06,
+    "worst_pos_one_minus_cos": 2.5510787963867188e-05,
+    "top1": 1.0,
+    "max_abs": 0.12109375,
+    "finite": true
+   },
+   "eager_chunk_vs_sdpa_full": {
+    "one_minus_cos": 6.020069122314453e-06,
+    "worst_pos_one_minus_cos": 6.890296936035156e-05,
+    "top1": 1.0,
+    "max_abs": 0.1953125,
+    "finite": true
+   },
+   "sdpa_chunk_vs_sdpa_full": {
+    "one_minus_cos": 2.384185791015625e-06,
+    "worst_pos_one_minus_cos": 9.417533874511719e-06,
+    "top1": 1.0,
+    "max_abs": 0.0625,
+    "finite": true
+   }
+  },
+  "generate": {
+   "wall_s_flash_attn_legacy": 1.5,
+   "path": {
+    "calls": 1536,
+    "kernel_calls": 24,
+    "prefill(q>1)": {
+     "calls": 24,
+     "kernel": 24,
+     "kernel_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "fallback_layers": [],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       25,
+       25
+      ]
+     ],
+     "kernel_causal": [
+      "True"
+     ]
+    },
+    "decode(q=1)": {
+     "calls": 1512,
+     "kernel": 0,
+     "kernel_layers": [],
+     "fallback_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+     ],
+     "masks": [
+      "None"
+     ],
+     "qk_shapes": [
+      [
+       1,
+       26
+      ],
+      [
+       1,
+       27
+      ],
+      [
+       1,
+       28
+      ],
+      [
+       1,
+       29
+      ],
+      [
+       1,
+       30
+      ],
+      [
+       1,
+       31
+      ]
+     ],
+     "kernel_causal": []
+    },
+    "kwargs_seen": {
+     "dropout": [
+      "0.0"
+     ],
+     "scaling": [
+      "0.125"
+     ],
+     "sliding_window": [
+      "null"
+     ],
+     "position_ids": [
+      "\"tensor(1, 25):int64\"",
+      "\"tensor(25)\"",
+      "\"tensor(26)\"",
+      "\"tensor(27)\""
+     ],
+     "use_cache": [
+      "true"
+     ]
+    },
+    "module_is_causal": [
+     "True"
+    ],
+    "module_sliding_window": [
+     "None"
+    ]
+   },
+   "wall_s_sdpa": 1.71,
+   "wall_s_eager": 1.67,
+   "first_div_flash_vs_sdpa": 64,
+   "first_div_eager_vs_sdpa": 64,
+   "first_div_flash_vs_eager": 64,
+   "text_flash": " \n\n1. The original implementation of `attention` uses a single tensor for all tokens and their attention weights.\n2. In the new implementation, we use separate tensors for each token and its corresponding attention weight.\n3. This allows us to keep track of the running softmax statistics in registers, which are more efficient than storing",
+   "text_sdpa": " \n\n1. The original implementation of `attention` uses a single tensor for all tokens and their attention weights.\n2. In the new implementation, we use separate tensors for each token and its corresponding attention weight.\n3. This allows us to keep track of the running softmax statistics in registers, which are more efficient than storing",
+   "text_eager": " \n\n1. The original implementation of `attention` uses a single tensor for all tokens and their attention weights.\n2. In the new implementation, we use separate tensors for each token and its corresponding attention weight.\n3. This allows us to keep track of the running softmax statistics in registers, which are more efficient than storing"
+  }
+ },
+ "errors": {},
+ "config": {
+  "head_dim": 64,
+  "n_heads": 14,
+  "n_kv_heads": 2,
+  "layers": 24,
+  "sliding_window": null,
+  "use_sliding_window": false,
+  "layer_types": [
+   "full_attention"
+  ],
+  "n_sliding_layers": 0,
+  "attn_logit_softcapping": null,
+  "final_logit_softcapping": null,
+  "is_causal": "n/a",
+  "attn_impl_after_load": "flash_attn_legacy",
+  "max_pos": 32768,
+  "gen_cache_impl": null,
+  "has_sinks": false
+ },
+ "first_records": {
+  "prefill": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     14,
+     1000,
+     64
+    ],
+    "k": [
+     1,
+     2,
+     1000,
+     64
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.125,
+     "sliding_window": null,
+     "position_ids": "tensor(1, 1000):int64",
+     "use_cache": true
+    },
+    "kernel": true,
+    "kernel_args": {
+     "causal": true,
+     "scale": 0.125
+    }
+   },
+   {
+    "layer": 1,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     14,
+     1000,
+     64
+    ],
+    "k": [
+     1,
+     2,
+     1000,
+     64
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.125,
+     "sliding_window": null,
+     "position_ids": "tensor(1, 1000):int64",
+     "use_cache": true
+    },
+    "kernel": true,
+    "kernel_args": {
+     "causal": true,
+     "scale": 0.125
+    }
+   }
+  ],
+  "generate_decode": [
+   {
+    "layer": 0,
+    "module_is_causal": true,
+    "module_sliding_window": null,
+    "q": [
+     1,
+     14,
+     1,
+     64
+    ],
+    "k": [
+     1,
+     2,
+     26,
+     64
+    ],
+    "dtype": "torch.float16",
+    "mask": null,
+    "kwargs": {
+     "dropout": 0.0,
+     "scaling": 0.125,
+     "sliding_window": null,
+     "position_ids": "tensor(25)",
+     "use_cache": true
+    },
+    "kernel": false,
+    "kernel_args": null
+   }
+  ]
+ },
+ "gold_fp32_eager": {
+  "prefill": {
+   "flash": {
+    "one_minus_cos": 4.887580871582031e-06,
+    "worst_pos_one_minus_cos": 4.2498111724853516e-05,
+    "top1": 0.9980000257492065,
+    "max_abs": 0.15311875939369202,
+    "finite": true
+   },
+   "sdpa": {
+    "one_minus_cos": 5.0067901611328125e-06,
+    "worst_pos_one_minus_cos": 4.869699478149414e-05,
+    "top1": 0.9960000514984131,
+    "max_abs": 0.1454329490661621,
+    "finite": true
+   },
+   "eager": {
+    "one_minus_cos": 1.0788440704345703e-05,
+    "worst_pos_one_minus_cos": 0.00021326541900634766,
+    "top1": 0.9940000176429749,
+    "max_abs": 0.3140333890914917,
+    "finite": true
+   }
+  },
+  "chunked_flash": {
+   "one_minus_cos": 2.4437904357910156e-06,
+   "worst_pos_one_minus_cos": 1.2099742889404297e-05,
+   "top1": 1.0,
+   "max_abs": 0.10590648651123047,
+   "finite": true
+  },
+  "gen_first_div_vs_gold": {
+   "flash": 64,
+   "sdpa": 64,
+   "eager": 64
+  },
+  "gen_text_gold": " \n\n1. The original implementation of `attention` uses a single tensor for all tokens and their attention weights.\n2. In the new implementation, we use separate tensors for each token and its corresponding attention weight.\n3. This allows us to keep track of the running softmax statistics in registers, which are more efficient than storing"
+ },
+ "elapsed_s": 13.8
+}

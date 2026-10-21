@@ -90,7 +90,7 @@ def patch_llama_attention(model):
                 attn_output = flash_attention(
                     q_fp16, k_fp16, v_fp16,
                     softmax_scale=scale,
-                    is_causal=True,
+                    causal=True,
                 )
             else:
                 # Decode (q_len=1): standard attention is fine, no N² issue

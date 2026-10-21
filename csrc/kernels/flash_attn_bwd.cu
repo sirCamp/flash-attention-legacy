@@ -135,8 +135,8 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     const int heads_per_kv = params.num_heads / params.num_heads_k;
     const int kv_blk = blockIdx.x;
     const int kv_start = kv_blk * Bc;
-    if (kv_start >= params.seq_len) return;
-    const int valid_kv = min(Bc, params.seq_len - kv_start);
+    if (kv_start >= params.seq_len_k) return;
+    const int valid_kv = min(Bc, params.seq_len_k - kv_start);
 
     const bool owns_kv_row = (kv_row < Bc) && (kv_row < valid_kv);
 
@@ -171,16 +171,16 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     __syncthreads();
 
     // Loop over all Q heads that map to this KV head
-    const int num_q_blocks = cdiv(params.seq_len, Br);
+    const int num_q_blocks = cdiv(params.seq_len_q, Br);
 
     for (int qh = 0; qh < heads_per_kv; qh++) {
         const int h_idx = kv_h_idx * heads_per_kv + qh;
         // Causal optimization: skip Q blocks that are entirely before this KV block
-        const int q_start_blk = params.is_causal ? (kv_start / Br) : 0;
+        const int q_start_blk = bwd_first_q_block(params.is_causal, kv_start, Br, params.seq_len_q, params.seq_len_k);
 
     for (int q_blk = q_start_blk; q_blk < num_q_blocks; q_blk++) {
         const int q_start = q_blk * Br;
-        const int valid_q = min(Br, params.seq_len - q_start);
+        const int valid_q = min(Br, params.seq_len_q - q_start);
 
         // Load Q, dO for this (q_head, q_block)
         const half* Q_blk_ptr = params.Q + b_idx * params.q_batch_stride
@@ -207,9 +207,9 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 
         // Each thread in the KV row group processes a strided subset of Q rows
         if (owns_kv_row) {
-            for (int qi = lane; qi < Br && (q_start + qi) < params.seq_len; qi += THREADS_PER_KV) {
+            for (int qi = lane; qi < Br && (q_start + qi) < params.seq_len_q; qi += THREADS_PER_KV) {
                 // Causal check
-                if (params.is_causal && (kv_start + kv_row) > (q_start + qi)) continue;
+                if (params.is_causal && (kv_start + kv_row) > (q_start + qi + (params.seq_len_k - params.seq_len_q))) continue;
 
                 // Recompute S = Q[qi] . K[kv_row] * scale
                 float s = 0.0f;
@@ -443,8 +443,8 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     const int heads_per_kv = params.num_heads / params.num_heads_k;
     const int kv_blk = blockIdx.x;
     const int kv_start = kv_blk * Bc;
-    if (kv_start >= params.seq_len) return;
-    const int valid_kv = min(Bc, params.seq_len - kv_start);
+    if (kv_start >= params.seq_len_k) return;
+    const int valid_kv = min(Bc, params.seq_len_k - kv_start);
 
     // K, V base pointers
     const half* K_blk = params.K + b_idx * params.k_batch_stride
@@ -490,16 +490,16 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     bwd_load_tile<Bc, D, NUM_THREADS>(V_blk, params.v_seq_stride, smem_V, valid_kv);
     __syncthreads();
 
-    const int num_q_blocks = cdiv(params.seq_len, Br);
+    const int num_q_blocks = cdiv(params.seq_len_q, Br);
 
     // Loop over Q heads that map to this KV head
     for (int qh = 0; qh < heads_per_kv; qh++) {
         const int h_idx = kv_h_idx * heads_per_kv + qh;
-        const int q_start_blk = params.is_causal ? (kv_start / Br) : 0;
+        const int q_start_blk = bwd_first_q_block(params.is_causal, kv_start, Br, params.seq_len_q, params.seq_len_k);
 
     for (int q_blk = q_start_blk; q_blk < num_q_blocks; q_blk++) {
         const int q_start = q_blk * Br;
-        const int valid_q = min(Br, params.seq_len - q_start);
+        const int valid_q = min(Br, params.seq_len_q - q_start);
 
         // Load Q, dO
         const half* Q_ptr = params.Q + b_idx * params.q_batch_stride
@@ -531,9 +531,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                 int qi = i / Bc;
                 int kj = i % Bc;
                 float s = smem_S[i] * params.softmax_scale;
-                bool invalid = (q_start + qi >= params.seq_len) ||
-                               (kv_start + kj >= params.seq_len) ||
-                               (params.is_causal && (kv_start + kj) > (q_start + qi));
+                bool invalid = (q_start + qi >= params.seq_len_q) ||
+                               (kv_start + kj >= params.seq_len_k) ||
+                               (params.is_causal &&
+                                (kv_start + kj) > (q_start + qi + (params.seq_len_k - params.seq_len_q)));
                 float p = invalid ? 0.0f : expf(s - L_ptr[qi]);
                 smem_S[i] = p;  // S now holds P
             }
@@ -569,8 +570,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                 int qi = i / Bc;
                 float p = smem_S[i];     // P from step 2
                 float dp = smem_dP[i];
-                float di = D_ptr[qi];
-                smem_dP[i] = p * (dp - di) * params.softmax_scale;  // dS_scaled
+                // Padding rows (qi >= valid_q) have P == 0; don't read D past the
+                // sequence end (OOB, and 0 * NaN would poison dK).
+                float ds = (qi < valid_q) ? p * (dp - D_ptr[qi]) : 0.0f;
+                smem_dP[i] = ds * params.softmax_scale;  // dS_scaled
             }
         }
         // smem_S (P) is now free!
@@ -682,7 +685,7 @@ void precompute_D(
                            + (T::Bc*T::d + T::Bc*T::d + T::Br*T::Bc + T::Br*T::Bc)      \
                                 * sizeof(float)                                            \
                            + T::Br * T::Bc * sizeof(half);                                \
-        dim3 grid(cdiv((params).seq_len, T::Bc), nbh);                                   \
+        dim3 grid(cdiv((params).seq_len_k, T::Bc), nbh);                                   \
         dim3 block(T::kNumWarps * 32);                                                    \
         FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                       \
             flash_attn_bwd_volta_kernel<T>,                                               \
@@ -711,7 +714,7 @@ void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream
         using T = TileType;                                                                \
         constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d)        \
                                 * sizeof(half);                                             \
-        dim3 grid(cdiv((params).seq_len, T::Bc), nbh);                                    \
+        dim3 grid(cdiv((params).seq_len_k, T::Bc), nbh);                                    \
         dim3 block(T::kNumWarps * 32);                                                     \
         FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                        \
             flash_attn_bwd_kernel<T>,                                                      \

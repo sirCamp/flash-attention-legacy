@@ -4,10 +4,13 @@ Supports MHA, GQA, and MQA on Pascal (SM 6.x) and Volta (SM 7.0) GPUs
 """
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 from torch.autograd import Function
 from typing import Optional
+
+from .utils import check_head_dim
 
 try:
     import flash_attn_legacy_cuda
@@ -19,6 +22,19 @@ except ImportError as e:
     )
 
 
+def _check_inputs(q, k, v, ndim):
+    """Validate dtype/device/rank of q, k, v (raises, so it survives python -O)."""
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        if t.dtype != torch.float16:
+            raise TypeError(f"{name} must be float16, got {t.dtype}")
+        if not t.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if t.dim() != ndim:
+            raise ValueError(f"{name} must be {ndim}-D, got shape {tuple(t.shape)}")
+    if not (q.device == k.device == v.device):
+        raise ValueError("q, k, v must be on the same device")
+
+
 class FlashAttentionFunc(Function):
     """
     Autograd function for Flash Attention v2.
@@ -26,22 +42,20 @@ class FlashAttentionFunc(Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, is_causal):
-        assert q.dtype == torch.float16, f"Q must be float16, got {q.dtype}"
-        assert k.dtype == torch.float16 and v.dtype == torch.float16
-        assert q.is_cuda and q.dim() == 4
+    def forward(ctx, q, k, v, softmax_scale, causal):
+        _check_inputs(q, k, v, ndim=4)
         d = q.shape[-1]
-        assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
+        check_head_dim(d)
 
         H_q, H_kv = q.shape[1], k.shape[1]
-        assert H_q % H_kv == 0, f"H_q ({H_q}) must be divisible by H_kv ({H_kv})"
-
+        if H_q % H_kv != 0:
+            raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, is_causal)
+        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal)
 
         ctx.save_for_backward(q, k, v, o, lse)
         ctx.softmax_scale = softmax_scale
-        ctx.is_causal = is_causal
+        ctx.causal = causal
         return o
 
     @staticmethod
@@ -51,9 +65,22 @@ class FlashAttentionFunc(Function):
 
         dq, dk, dv = flash_attn_legacy_cuda.backward(
             grad_output, q, k, v, o, lse,
-            ctx.softmax_scale, ctx.is_causal,
+            ctx.softmax_scale, ctx.causal,
         )
         return dq, dk, dv, None, None
+
+
+def _resolve_causal(causal: bool, is_causal: Optional[bool]) -> bool:
+    """Support the deprecated `is_causal` keyword alongside `causal`."""
+    if is_causal is None:
+        return causal
+    warnings.warn(
+        "`is_causal` is deprecated, use `causal` (same name as flash_attn_varlen_func "
+        "and the upstream flash-attn API)",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return is_causal
 
 
 def flash_attention(
@@ -61,7 +88,9 @@ def flash_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: Optional[float] = None,
-    is_causal: bool = False,
+    causal: bool = False,
+    *,
+    is_causal: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Flash Attention v2 for Pascal/Volta GPUs.
@@ -77,14 +106,16 @@ def flash_attention(
         k: Key   [B, H_kv, N, d] float16
         v: Value [B, H_kv, N, d] float16
         softmax_scale: default 1/sqrt(d)
-        is_causal: causal mask
+        causal: apply a causal mask
+        is_causal: deprecated alias of `causal`
 
     Returns:
         [B, H_q, N, d] float16
     """
+    causal = _resolve_causal(causal, is_causal)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    return FlashAttentionFunc.apply(q, k, v, softmax_scale, is_causal)
+    return FlashAttentionFunc.apply(q, k, v, softmax_scale, causal)
 
 
 class FlashAttnVarlenFunc(Function):
@@ -96,11 +127,9 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, softmax_scale, is_causal):
-        assert q.dtype == torch.float16, f"Q must be float16, got {q.dtype}"
-        assert q.is_cuda and q.dim() == 3
-        d = q.shape[-1]
-        assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal):
+        _check_inputs(q, k, v, ndim=3)
+        check_head_dim(q.shape[-1])
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         cu_seqlens_q = cu_seqlens_q.contiguous().to(torch.int32)
@@ -108,12 +137,12 @@ class FlashAttnVarlenFunc(Function):
 
         o, lse = flash_attn_legacy_cuda.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, softmax_scale, is_causal,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
-        ctx.is_causal = is_causal
+        ctx.causal = causal
         return o
 
     @staticmethod
@@ -122,9 +151,6 @@ class FlashAttnVarlenFunc(Function):
         grad_output = grad_output.contiguous()
 
         batch_size = cu_seqlens_q.shape[0] - 1
-        H_q, d = q.shape[1], q.shape[2]
-        H_kv = k.shape[1]
-
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
@@ -148,7 +174,7 @@ class FlashAttnVarlenFunc(Function):
 
             dqi, dki, dvi = flash_attn_legacy_cuda.backward(
                 doi, qi, ki, vi, oi, lse_i,
-                ctx.softmax_scale, ctx.is_causal,
+                ctx.softmax_scale, ctx.causal,
             )
 
             # [1, H, seq, d] → [seq, H, d]
@@ -203,13 +229,7 @@ def flash_attn_varlen_func(
         cu_seqlens = torch.tensor([0, 128, 384, 448], dtype=torch.int32, device='cuda')
         out = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, 256, 256, causal=True)
     """
-    assert q.dim() == 3, f"q must be [total, heads, d], got shape {q.shape}"
-    assert k.dim() == 3, f"k must be [total, heads_k, d], got shape {k.shape}"
-    assert v.dim() == 3, f"v must be [total, heads_k, d], got shape {v.shape}"
-    assert q.dtype == torch.float16, f"Q must be float16, got {q.dtype}"
-
     d = q.shape[-1]
-    assert d in (32, 64, 96, 128, 256), f"head_dim must be 32, 64, 96, 128, or 256, got {d}"
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
@@ -226,10 +246,12 @@ class FlashAttention(nn.Module):
     def __init__(self, head_dim: int = 64, causal: bool = False,
                  softmax_scale: Optional[float] = None):
         super().__init__()
-        assert head_dim in (32, 64, 96, 128, 256)
+        check_head_dim(head_dim)
         self.head_dim = head_dim
         self.causal = causal
-        self.softmax_scale = softmax_scale or (1.0 / math.sqrt(head_dim))
+        self.softmax_scale = (
+            softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+        )
 
     def forward(self, q, k, v):
         return flash_attention(q, k, v, self.softmax_scale, self.causal)
@@ -264,16 +286,18 @@ class FlashMultiHeadAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        assert embed_dim % num_heads == 0
-        assert num_heads % num_kv_heads == 0, (
-            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
-        )
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+            )
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = embed_dim // num_heads
-        assert self.head_dim in (32, 64, 96, 128, 256), f"head_dim={self.head_dim}, must be 32, 64, 96, 128, or 256"
+        check_head_dim(self.head_dim)
 
         self.causal = causal
         self.scale = 1.0 / math.sqrt(self.head_dim)
@@ -288,7 +312,8 @@ class FlashMultiHeadAttention(nn.Module):
         """
         Args:
             x: [B, N, embed_dim]
-            key_value: Optional [B, N_kv, embed_dim] for cross-attention
+            key_value: Optional [B, N_kv, embed_dim] for cross-attention.
+                       The causal mask is bottom-right aligned when N_kv != N.
         Returns:
             [B, N, embed_dim]
         """

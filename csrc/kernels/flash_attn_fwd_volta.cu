@@ -186,10 +186,13 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
     const int b_idx = bh_idx / params.num_heads;
     const int h_idx = bh_idx % params.num_heads;
     const int kv_h_idx = h_idx / (params.num_heads / params.num_heads_k);
+    const int seq_len_q = params.seq_len_q;
+    const int seq_len_k = params.seq_len_k;
+    const int causal_off = seq_len_k - seq_len_q;
     const int q_row_start = blockIdx.x * Br;
-    if (q_row_start >= params.seq_len) return;
+    if (q_row_start >= seq_len_q) return;
 
-    const int valid_q = min(Br, params.seq_len - q_row_start);
+    const int valid_q = min(Br, seq_len_q - q_row_start);
 
     // Base pointers
     const half* Q_ptr = params.Q + b_idx * params.q_batch_stride
@@ -237,12 +240,11 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
     __syncthreads();
 
     // Main loop
-    const int nkv = cdiv(params.seq_len, Bc);
-    const int kv_limit = params.is_causal ? min(nkv, cdiv(q_row_start + Br, Bc)) : nkv;
+    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
 
     for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
         const int kv_start = kv_blk * Bc;
-        const int valid_kv = min(Bc, params.seq_len - kv_start);
+        const int valid_kv = min(Bc, seq_len_k - kv_start);
 
         // Load K
         volta_load_tile<Bc, d, NUM_THREADS>(
@@ -261,8 +263,8 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
             #pragma unroll
             for (int c = 0; c < Bc; c++) {
                 float s = smem_S[tid * Bc + c] * params.softmax_scale;
-                if ((kv_start + c) >= params.seq_len ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid))) {
+                if ((kv_start + c) >= seq_len_k ||
+                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
                     s = -INFINITY;
                 }
                 smem_S[tid * Bc + c] = s;
@@ -270,7 +272,8 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
             }
 
             float new_max = fmaxf(row_max, local_max);
-            float rescale = expf(row_max - new_max);
+            // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
+            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
             row_max = new_max;
             row_sum *= rescale;
             #pragma unroll
@@ -380,6 +383,7 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
     const int k_start_tok = params.cu_seqlens_k[seq_idx];
     const int seq_len_q = params.cu_seqlens_q[seq_idx + 1] - q_start_tok;
     const int seq_len_k = params.cu_seqlens_k[seq_idx + 1] - k_start_tok;
+    const int causal_off = seq_len_k - seq_len_q;
 
     const int q_row_start = local_block * Br;
     if (q_row_start >= seq_len_q) return;
@@ -421,8 +425,7 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
     __syncthreads();
 
     // Main loop over K/V blocks (within this sequence)
-    const int nkv = cdiv(seq_len_k, Bc);
-    const int kv_limit = params.is_causal ? min(nkv, cdiv(q_row_start + Br, Bc)) : nkv;
+    const int kv_limit = fwd_kv_limit(params.is_causal, q_row_start, Br, Bc, seq_len_q, seq_len_k);
 
     for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
         const int kv_start = kv_blk * Bc;
@@ -446,7 +449,7 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
             for (int c = 0; c < Bc; c++) {
                 float s = smem_S[tid * Bc + c] * params.softmax_scale;
                 if ((kv_start + c) >= seq_len_k ||
-                    (params.is_causal && (kv_start + c) > (q_row_start + tid))) {
+                    (params.is_causal && (kv_start + c) > (q_row_start + tid + causal_off))) {
                     s = -INFINITY;
                 }
                 smem_S[tid * Bc + c] = s;
@@ -454,7 +457,8 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
             }
 
             float new_max = fmaxf(row_max, local_max);
-            float rescale = expf(row_max - new_max);
+            // new_max == -inf: row sees no key yet (fully masked) -> avoid exp(-inf - -inf) = NaN
+            float rescale = (new_max == -INFINITY) ? 1.0f : expf(row_max - new_max);
             row_max = new_max;
             row_sum *= rescale;
             #pragma unroll
@@ -545,7 +549,7 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {}
         constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)  \
                            + T::Br * T::Bc * sizeof(float)                       \
                            + T::Br * T::Bc * sizeof(half);                       \
-        dim3 grid(cdiv((params).seq_len, T::Br), nbh);                          \
+        dim3 grid(cdiv((params).seq_len_q, T::Br), nbh);                          \
         dim3 block(T::kNumWarps * 32);                                           \
         FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                              \
             flash_attn_fwd_volta_kernel<T>,                                      \

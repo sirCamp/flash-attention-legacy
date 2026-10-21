@@ -18,12 +18,12 @@ Quick start:
     >>> q = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
     >>> k = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
     >>> v = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
-    >>> out = flash_attention(q, k, v, is_causal=True)
+    >>> out = flash_attention(q, k, v, causal=True)
     >>>
     >>> # GQA (8 Q heads, 2 KV heads)
     >>> k_gqa = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
     >>> v_gqa = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
-    >>> out_gqa = flash_attention(q, k_gqa, v_gqa, is_causal=True)
+    >>> out_gqa = flash_attention(q, k_gqa, v_gqa, causal=True)
 """
 
 __version__ = "0.5.0"

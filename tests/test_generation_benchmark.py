@@ -181,15 +181,20 @@ def _run_prefill_benchmark(model_name, seq_lengths, backends=BACKENDS, repeats=5
         for backend in backends:
             model = None
             try:
-                model, tokenizer = _load_model(model_name,
-                                               attn_implementation=backend)
+                try:
+                    model, tokenizer = _load_model(model_name,
+                                                   attn_implementation=backend)
+                except OSError as e:
+                    # Gated / missing model (no HF token): not a result, skip.
+                    pytest.skip(f"cannot load {model_name}: {e}")
                 input_ids = _make_input_ids(tokenizer, N)
                 actual_len = input_ids.shape[1]
 
                 torch.cuda.empty_cache()
                 stats = _prefill_memory(model, input_ids, repeats=repeats)
                 rows.append({'N': actual_len, 'backend': backend, 'stats': stats})
-            except Exception:
+            except torch.cuda.OutOfMemoryError:
+                # Only a real OOM is reported as OOM; any other error fails the test.
                 rows.append({'N': N, 'backend': backend, 'stats': None})
             finally:
                 del model
@@ -497,7 +502,7 @@ class TestVarlenBenchmark:
 
             def run_padded(q=q_pad, k=k_pad, v=v_pad):
                 with torch.no_grad():
-                    flash_attention(q, k, v, softmax_scale=scale, is_causal=True)
+                    flash_attention(q, k, v, softmax_scale=scale, causal=True)
 
             # --- Packed: concatenate, use varlen ---
             q_pack = torch.randn(total_tokens, H, d, device='cuda', dtype=torch.float16) * 0.3
