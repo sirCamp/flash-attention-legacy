@@ -40,7 +40,7 @@ from .utils import (
     get_device_info,
 )
 
-from .integrations import register
+from .integrations import register, fallback_stats, reset_fallback_stats
 
 __all__ = [
     "flash_attention",
@@ -50,6 +50,8 @@ __all__ = [
     "check_gpu_compatibility",
     "get_device_info",
     "register",
+    "fallback_stats",
+    "reset_fallback_stats",
 ]
 
 # Auto-register with HuggingFace transformers if available

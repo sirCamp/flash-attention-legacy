@@ -21,6 +21,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 transformers = pytest.importorskip("transformers")
 
+from .hf_helpers import KernelCounter, assert_within_noise, compare, logits, set_impl  # noqa: E402
+
 MODELS = [m for m in os.environ.get(
     "FA_HF_MODELS", "TinyLlama/TinyLlama-1.1B-Chat-v1.0").split(",") if m]
 
@@ -31,33 +33,6 @@ PROMPT = ("Flash attention computes exact attention in tiles, keeping the runnin
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-class KernelCounter:
-    """Counts calls to the flash kernel made through the HF integration."""
-
-    def __init__(self, monkeypatch):
-        import flash_attn_legacy.flash_attn as fa
-        self.calls = []
-        orig = fa.flash_attention
-
-        def wrapped(q, k, v, *args, **kwargs):
-            self.calls.append((q.shape[2], k.shape[2]))  # (q_len, kv_len)
-            return orig(q, k, v, *args, **kwargs)
-
-        monkeypatch.setattr(fa, "flash_attention", wrapped)
-
-    def reset(self):
-        self.calls.clear()
-
-
-def _set_impl(model, impl):
-    if hasattr(model, "set_attn_implementation"):
-        model.set_attn_implementation(impl)
-    else:  # older transformers
-        model.config._attn_implementation = impl
-    assert model.config._attn_implementation == impl, (
-        f"requested {impl}, model uses {model.config._attn_implementation}")
-
 
 @pytest.fixture(scope="module", params=MODELS)
 def model_and_tok(request):
@@ -86,31 +61,6 @@ def _num_layers(model):
     return model.config.num_hidden_layers
 
 
-@torch.no_grad()
-def _logits(model, impl, input_ids, **kw):
-    _set_impl(model, impl)
-    return model(input_ids=input_ids, **kw).logits.float()
-
-
-def _compare(a, b):
-    """Return (max_abs_diff, mean_cosine, top1_agreement) over positions."""
-    diff = (a - b).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(a, b, dim=-1).mean().item()
-    top1 = (a.argmax(-1) == b.argmax(-1)).float().mean().item()
-    return diff, cos, top1
-
-
-def _assert_within_noise(flash_cos, eager_cos, top1, label):
-    """FP16 logits of large models differ between *any* two attention backends
-    (eager vs sdpa included). Judge flash against that noise floor, measured on the
-    same input, instead of a fixed threshold: its error (1 - cos) may be at most 3x
-    eager's error w.r.t. the same reference."""
-    err_flash, err_eager = 1.0 - flash_cos, 1.0 - eager_cos
-    print(f"  {label}: 1-cos flash={err_flash:.2e} eager(noise floor)={err_eager:.2e} top1={top1:.4f}")
-    assert err_flash <= 3.0 * err_eager + 1e-5, f"{label}: flash error above FP16 noise floor"
-    assert top1 >= 0.99
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -121,19 +71,19 @@ def test_prefill_logits_match_and_use_kernel(model_and_tok, monkeypatch, n_token
     counter = KernelCounter(monkeypatch)
     ids = tok(PROMPT * 200, return_tensors="pt").input_ids[:, :n_tokens].cuda()
 
-    ref = _logits(model, "sdpa", ids)
-    eager = _logits(model, "eager", ids)
+    ref = logits(model, ids, "sdpa")
+    eager = logits(model, ids, "eager")
     counter.reset()
-    out = _logits(model, "flash_attn_legacy", ids)
+    out = logits(model, ids, "flash_attn_legacy")
 
     n_calls = len(counter.calls)
-    diff, cos, top1 = _compare(out[0], ref[0])
-    _, cos_eager, _ = _compare(eager[0], ref[0])
+    diff, cos, top1 = compare(out, ref)
+    _, cos_eager, _ = compare(eager, ref)
     print(f"\n  [{name}] N={ids.shape[1]}: kernel calls={n_calls}/{_num_layers(model)} "
           f"max|dlogit|={diff:.4f} cos={cos:.6f} top1={top1:.4f}")
 
     assert n_calls == _num_layers(model), "prefill did not run the flash kernel"
-    _assert_within_noise(cos, cos_eager, top1, "prefill vs sdpa")
+    assert_within_noise(cos, cos_eager, top1, "prefill vs sdpa")
 
 
 def test_greedy_generation_matches_sdpa(model_and_tok, monkeypatch):
@@ -142,10 +92,10 @@ def test_greedy_generation_matches_sdpa(model_and_tok, monkeypatch):
     ids = tok(PROMPT, return_tensors="pt").input_ids.cuda()
     gen = dict(max_new_tokens=64, do_sample=False, min_new_tokens=64)
 
-    _set_impl(model, "sdpa")
+    set_impl(model, "sdpa")
     ref = model.generate(ids, **gen)
     counter.reset()
-    _set_impl(model, "flash_attn_legacy")
+    set_impl(model, "flash_attn_legacy")
     out = model.generate(ids, **gen)
 
     new_ref, new_out = ref[0, ids.shape[1]:], out[0, ids.shape[1]:]
@@ -170,10 +120,10 @@ def test_left_padded_batch(model_and_tok, monkeypatch):
     batch = tok(prompts, return_tensors="pt", padding=True).to("cuda")
     gen = dict(max_new_tokens=24, do_sample=False, min_new_tokens=24)
 
-    _set_impl(model, "sdpa")
+    set_impl(model, "sdpa")
     ref = model.generate(**batch, **gen)
     counter.reset()
-    _set_impl(model, "flash_attn_legacy")
+    set_impl(model, "flash_attn_legacy")
     out = model.generate(**batch, **gen)
     print(f"\n  [{name}] padded batch: kernel calls={len(counter.calls)} "
           f"(shapes: {sorted(set(counter.calls))[:4]})")
@@ -201,20 +151,20 @@ def test_chunked_prefill_with_cache(model_and_tok, monkeypatch):
 
     @torch.no_grad()
     def chunked(impl):
-        _set_impl(model, impl)
+        set_impl(model, impl)
         cache = DynamicCache()
         model(input_ids=ids[:, :split], past_key_values=cache, use_cache=True)
         return model(input_ids=ids[:, split:], past_key_values=cache, use_cache=True).logits.float()
 
-    ref_full = _logits(model, "sdpa", ids)[:, split:]
+    ref_full = logits(model, ids, "sdpa")[split:]
     eager_chunk = chunked("eager")
     counter.reset()
     flash_chunk = chunked("flash_attn_legacy")
     second = [c for c in counter.calls if c[0] < c[1]]
-    diff, cos, top1 = _compare(flash_chunk[0], ref_full[0])
-    _, cos_eager, _ = _compare(eager_chunk[0], ref_full[0])
+    diff, cos, top1 = compare(flash_chunk[0], ref_full)
+    _, cos_eager, _ = compare(eager_chunk[0], ref_full)
     print(f"\n  [{name}] chunked: kernel calls with q_len<kv_len={len(second)} "
           f"max|dlogit|={diff:.4f} cos={cos:.6f} top1={top1:.4f}")
 
     assert len(second) == _num_layers(model), "second chunk did not use the flash kernel"
-    _assert_within_noise(cos, cos_eager, top1, "chunked vs single-pass sdpa")
+    assert_within_noise(cos, cos_eager, top1, "chunked vs single-pass sdpa")

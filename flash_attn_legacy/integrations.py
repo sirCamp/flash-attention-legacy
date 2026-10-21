@@ -15,12 +15,117 @@ Requires transformers >= 5.0 (uses ALL_ATTENTION_FUNCTIONS registry).
 For transformers < 5.0, use the monkey-patch approach in examples/hf_llama_patch.py.
 """
 
+import logging
 import math
+from collections import Counter
+from typing import Dict, NamedTuple, Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional
 
 from .utils import SUPPORTED_HEAD_DIMS
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fallback registry — the single place that lists why a call does not run our
+# kernel. Each reason either falls back to torch SDPA (correct result, no
+# kernel) or raises, when no available path would give a correct result
+# (better an explicit error than a silently wrong output).
+#
+# Counters and the warn-once set are plain module state: updates from several
+# threads may at worst lose a count or log a warning twice. Under torch.compile
+# they only run at trace time (see docs/PLAN.md, P6.5).
+# ---------------------------------------------------------------------------
+class FallbackReason(NamedTuple):
+    message: str
+    action: str = "sdpa"     # "sdpa": run SDPA instead; "raise": NotImplementedError
+    expected: bool = False   # expected by design: counted but not logged
+    hint: str = ""           # what to use instead (for action="raise")
+
+
+FALLBACK_REASONS: Dict[str, FallbackReason] = {
+    # -- not supported anywhere yet: SDPA would silently ignore them ----------
+    "cu_seq_lens": FallbackReason(
+        "packed/segmented attention via cu_seq_lens_q/k (e.g. VLM vision encoders)", "raise",
+        hint="attn_implementation='sdpa' handles it (for a VLM it can be set for the vision "
+             "sub-model only)"),
+    "softcap": FallbackReason("attention logit softcapping (e.g. Gemma 2)", "raise",
+                              hint="use attn_implementation='eager'"),
+    "s_aux": FallbackReason("attention sinks s_aux (e.g. gpt-oss)", "raise",
+                            hint="use attn_implementation='eager'"),
+    "position_bias": FallbackReason("additive position_bias", "raise",
+                                    hint="use attn_implementation='eager'"),
+    # -- correct on SDPA, the kernel does not handle them (yet) ---------------
+    "decode": FallbackReason("q_len == 1 (decode)", expected=True),
+    "attention_mask": FallbackReason(
+        "explicit attention mask (padding, sliding window, packing, ...)", expected=True),
+    "q_longer_than_kv": FallbackReason("q_len > kv_len"),
+    "head_dim": FallbackReason(f"head_dim not in {SUPPORTED_HEAD_DIMS}"),
+    "v_head_dim": FallbackReason("V head_dim != Q head_dim (e.g. MLA)"),
+    "dropout": FallbackReason("attention dropout in training mode"),
+}
+
+_fallback_counts: Counter = Counter()
+_warned_reasons: set = set()
+
+
+def _record_fallback(reason: str, detail: str = "") -> None:
+    """Count a fallback; warn once per reason (unless expected); raise if the
+    reason has no correct fallback."""
+    if reason not in FALLBACK_REASONS:
+        raise KeyError(f"unknown fallback reason {reason!r}")
+    info = FALLBACK_REASONS[reason]
+    _fallback_counts[reason] += 1
+    if info.action == "raise":
+        raise NotImplementedError(
+            f"flash_attn_legacy: {info.message}{detail} is not supported yet, and the SDPA "
+            f"fallback would silently ignore it: {info.hint}.")
+    if not info.expected and reason not in _warned_reasons:
+        _warned_reasons.add(reason)
+        logger.warning("flash_attn_legacy: falling back to SDPA: %s%s", info.message, detail)
+
+
+def fallback_stats() -> Dict[str, int]:
+    """Number of attention calls that did not run the kernel, per reason
+    (keys of FALLBACK_REASONS)."""
+    return dict(_fallback_counts)
+
+
+def reset_fallback_stats() -> None:
+    """Reset the counters returned by fallback_stats() and the warn-once state."""
+    _fallback_counts.clear()
+    _warned_reasons.clear()
+
+
+def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, kwargs):
+    """Decide per call (on the real tensors and kwargs, never on the model
+    config) whether the kernel can run. Returns (reason, detail) or (None, "")."""
+    for name in ("cu_seq_lens_q", "cu_seq_lens_k"):
+        if kwargs.get(name) is not None:
+            return "cu_seq_lens", ""
+    softcap = kwargs.get("softcap")
+    if softcap is not None and float(softcap) != 0.0:  # None or 0.0: no softcapping
+        return "softcap", f" (softcap={softcap})"
+    if kwargs.get("s_aux") is not None:
+        return "s_aux", ""
+    if kwargs.get("position_bias") is not None:
+        return "position_bias", ""
+
+    q_len, kv_len, d = query.shape[2], key.shape[2], query.shape[-1]
+    if q_len == 1:
+        return "decode", ""
+    if q_len > kv_len:
+        return "q_longer_than_kv", f" (q_len={q_len}, kv_len={kv_len})"
+    if d not in SUPPORTED_HEAD_DIMS:
+        return "head_dim", f" (head_dim={d})"
+    if value.shape[-1] != d:
+        return "v_head_dim", f" (q/k head_dim={d}, v head_dim={value.shape[-1]})"
+    if attention_mask is not None:
+        return "attention_mask", ""
+    if dropout > 0.0 and module.training:
+        return "dropout", ""
+    return None, ""
 
 
 def flash_attn_legacy_forward(
@@ -36,9 +141,10 @@ def flash_attn_legacy_forward(
     """Attention function compatible with transformers 5.x AttentionInterface.
 
     Signature matches what ALL_ATTENTION_FUNCTIONS expects.
-    Uses flash_attn_legacy for unmasked prefill (1 < q_len <= kv_len, no
-    attention_mask, no attention dropout) and falls back to PyTorch SDPA
-    otherwise (decode, padded/masked batches).
+    Runs the flash_attn_legacy kernel when _kernel_fallback_reason allows it
+    (no mask, 1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
+    Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
+    and the call either runs on PyTorch SDPA or raises NotImplementedError.
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
@@ -63,19 +169,12 @@ def flash_attn_legacy_forward(
         is_causal = False
 
     # The flash kernel knows "plain causal (bottom-right aligned) / no mask",
-    # including q_len < kv_len (chunked prefill with a KV cache). Decode (q_len=1)
-    # goes to SDPA: a single query row would not fill the tiles anyway.
-    # Any explicit attention_mask (padding, sliding window, ...) or a dropout
-    # during training must NOT be silently dropped, so those go to SDPA.
-    use_flash = (
-        q_len > 1
-        and q_len <= kv_len
-        and d in SUPPORTED_HEAD_DIMS
-        and attention_mask is None
-        and not (dropout > 0.0 and module.training)
-    )
+    # including q_len < kv_len (chunked prefill with a KV cache). Everything
+    # else goes to SDPA, with the reason recorded in the fallback registry.
+    reason, detail = _kernel_fallback_reason(module, query, key, value, attention_mask,
+                                             dropout, kwargs)
 
-    if use_flash:
+    if reason is None:
         # Prefill: use our flash kernel (O(N) memory)
         q_fp16 = query.half() if query.dtype != torch.float16 else query
         k_fp16 = key.half() if key.dtype != torch.float16 else key
@@ -90,17 +189,21 @@ def flash_attn_legacy_forward(
         if query.dtype != torch.float16:
             attn_output = attn_output.to(query.dtype)
     else:
-        # Decode (q_len=1), padded/masked batches, chunked prefill or an
-        # unsupported head_dim: use PyTorch SDPA (memory-efficient, mask-aware).
+        _record_fallback(reason, detail)  # raises for reasons without a correct fallback
+        # GQA via repeat_interleave, not enable_gqa: on sm_6x/7x there is no flash
+        # SDPA backend and enable_gqa would push mem-efficient SDPA to the O(N^2)
+        # math backend.
         H_kv = key.shape[1]
         if H_kv != H_q:
             rep = H_q // H_kv
             key = key.repeat_interleave(rep, dim=1)
             value = value.repeat_interleave(rep, dim=1)
 
-        mask = attention_mask
+        mask, sdpa_causal = attention_mask, False
         if mask is not None:
             mask = mask[..., :kv_len]
+        elif is_causal and q_len == kv_len:
+            sdpa_causal = True  # no N x N mask materialised
         elif is_causal and q_len > 1:
             # Bottom-right aligned causal mask: query i sees keys <= i + (kv_len - q_len)
             mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(
@@ -111,6 +214,7 @@ def flash_attn_legacy_forward(
             query, key, value,
             attn_mask=mask,
             dropout_p=dropout if module.training else 0.0,
+            is_causal=sdpa_causal,
             scale=scaling,
         )
 
@@ -166,8 +270,9 @@ def register():
     1b. Registers a mask builder (_flash_attn_legacy_mask) so padded batches
        get a real attention mask.
     2. Patches _check_and_adjust_attn_implementation to skip the flash
-       preload step for our implementation. This is needed because
-       transformers assumes any implementation with "flash" in the name
+       preload step for our implementation. It does not look at head_dim:
+       kernel support is decided per attention call (_kernel_fallback_reason).
+       The patch is needed because transformers assumes any implementation with "flash" in the name
        needs lazy_import_flash_attention(), which tries to load hub kernels
        or the flash_attn package — neither of which we use.
 
@@ -207,16 +312,6 @@ def register():
 
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
-                # Check if model's head_dim is supported by our kernels.
-                # If not, silently fall back to SDPA so mask preprocessing works correctly.
-                head_dim = getattr(self.config, 'head_dim', None)
-                if head_dim is None:
-                    hs = getattr(self.config, 'hidden_size', None)
-                    nh = getattr(self.config, 'num_attention_heads', None)
-                    if hs and nh:
-                        head_dim = hs // nh
-                if head_dim is not None and head_dim not in SUPPORTED_HEAD_DIMS:
-                    return original_check(self, "sdpa", is_init_check, allow_all_kernels)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)
 
