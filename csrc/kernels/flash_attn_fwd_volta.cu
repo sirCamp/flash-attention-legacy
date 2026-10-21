@@ -18,6 +18,10 @@
 
 #include "flash_attn_common.h"
 
+#include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
+
+#include <string>
+
 namespace flash_attn_legacy {
 
 // Guard all device code that uses WMMA intrinsics.
@@ -27,7 +31,6 @@ namespace flash_attn_legacy {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 
 // WMMA types only available for SM >= 7.0
-#include <mma.h>
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------
@@ -179,7 +182,7 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
 
     // P@V output chunk size: process d in chunks of Bc columns.
     // smem_PV reuses smem_S space, both are [Br, Bc] in their respective types.
-    // d=64, Bc=64 → 1 pass.  d=128, Bc=32 → 4 passes.
+    // d/Bc passes (Bc = 16: d=64 -> 4, d=128 -> 8).
     constexpr int PV_CHUNK = Bc;
 
     const int bh_idx = blockIdx.y;
@@ -215,7 +218,7 @@ flash_attn_fwd_volta_kernel(FlashAttnParams params) {
     //   smem_V:  [Bc, d]  half
     //   smem_S:  [Br, Bc] float  (also reused as smem_PV after P→half conversion)
     //   smem_P:  [Br, Bc] half   (P converted to half for WMMA P@V)
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
     half*  smem_K = smem_Q + Br * d;
     half*  smem_V = smem_K + Bc * d;
@@ -402,7 +405,7 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {
                            + h_idx * params.o_head_stride;
 
     // Shared memory layout (same as batched kernel)
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
     half*  smem_K = smem_Q + Br * d;
     half*  smem_V = smem_K + Bc * d;
@@ -540,68 +543,70 @@ flash_attn_fwd_volta_varlen_kernel(FlashAttnVarlenParams params) {}
 #endif  // __CUDA_ARCH__
 
 // ---------------------------------------------------------------------------
-// Host launcher (always compiled — runtime dispatch ensures correctness)
+// Host launchers (always compiled — runtime dispatch ensures correctness)
+//
+// Tile per head_dim, chosen by measurement (docs/PLAN.md P2.3): Bc=16 tiles
+// beat the previous Bc=32/64 ones on V100 and T4 (forward, causal, B=2 H=16
+// N=4096; V100 / T4 in ms: d=32 8.95 vs 13.3 / 22.7 vs 38.3; d=64 13.4 vs 21.0
+// / 37.4 vs 53.5; d=96 15.3 vs 23.4 / 43.1 vs 55.2; d=128 29.0 vs 33.0 / 64.6).
+// The dispatch checks the tile against the device's shared memory (clear
+// error) and gives the varlen host code its Br, so launch and block offsets
+// always agree.
 // ---------------------------------------------------------------------------
-// Helper macro to launch Volta forward kernel with a given tile type
-#define VOLTA_FWD_LAUNCH(TileType, params, stream, nbh)                         \
-    do {                                                                         \
-        using T = TileType;                                                      \
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)  \
-                           + T::Br * T::Bc * sizeof(float)                       \
-                           + T::Br * T::Bc * sizeof(half);                       \
-        dim3 grid(cdiv((params).seq_len_q, T::Br), nbh);                          \
-        dim3 block(T::kNumWarps * 32);                                           \
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                              \
-            flash_attn_fwd_volta_kernel<T>,                                      \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                  \
-        flash_attn_fwd_volta_kernel<T><<<grid, block, smem, stream>>>(params);   \
-    } while (0)
+template <typename F>
+static void dispatch_volta_fwd_tile(int head_dim, F&& f) {
+    const int limit = max_dynamic_smem_per_block();
+    bool ok = false;
+    switch (head_dim) {
+        case 32:  ok = with_first_fitting_tile<TileVolta_d32>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<TileVolta_d64>(limit, f); break;
+        case 96:  ok = with_first_fitting_tile<TileVolta_d96>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<TileVolta_d128>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<TileVolta_d256>(limit, f); break;
+        default:  throw std::runtime_error("Unsupported head_dim for the WMMA forward");
+    }
+    if (!ok) throw_no_tile("WMMA forward", head_dim, limit);
+}
+
+template <typename Tile>
+static void launch_volta_fwd(FlashAttnParams& params, cudaStream_t stream) {
+    constexpr int smem = Tile::smem_bytes();
+    dim3 grid(cdiv(params.seq_len_q, Tile::Br), params.batch_size * params.num_heads);
+    dim3 block(Tile::kNumWarps * 32);
+    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
+        flash_attn_fwd_volta_kernel<Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    flash_attn_fwd_volta_kernel<Tile><<<grid, block, smem, stream>>>(params);
+}
+
+template <typename Tile>
+static void launch_volta_fwd_varlen(FlashAttnVarlenParams& params, int total_q_blocks,
+                                    cudaStream_t stream) {
+    constexpr int smem = Tile::smem_bytes();
+    dim3 grid(total_q_blocks, params.num_heads);
+    dim3 block(Tile::kNumWarps * 32);
+    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
+        flash_attn_fwd_volta_varlen_kernel<Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    flash_attn_fwd_volta_varlen_kernel<Tile><<<grid, block, smem, stream>>>(params);
+}
 
 void flash_attn_fwd_volta(FlashAttnParams& params, cudaStream_t stream) {
-    const int nbh = params.batch_size * params.num_heads;
-
-    switch (params.head_dim) {
-        case 32:  VOLTA_FWD_LAUNCH(TileVolta_d32,  params, stream, nbh); break;
-        case 64:  VOLTA_FWD_LAUNCH(TileVolta_d64,  params, stream, nbh); break;
-        case 96:  VOLTA_FWD_LAUNCH(TileVolta_d96,  params, stream, nbh); break;
-        case 128: VOLTA_FWD_LAUNCH(TileVolta_d128, params, stream, nbh); break;
-        case 256: VOLTA_FWD_LAUNCH(TileVolta_d256, params, stream, nbh); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Volta forward");
-    }
+    dispatch_volta_fwd_tile(params.head_dim, [&](auto tile) {
+        launch_volta_fwd<decltype(tile)>(params, stream);
+    });
 }
-
-#undef VOLTA_FWD_LAUNCH
-
-// ---------------------------------------------------------------------------
-// Host launcher — variable-length
-// ---------------------------------------------------------------------------
-// Helper macro to launch Volta varlen forward kernel
-#define VOLTA_FWD_VARLEN_LAUNCH(TileType, params, stream, total_q_blocks)              \
-    do {                                                                                \
-        using T = TileType;                                                             \
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)         \
-                           + T::Br * T::Bc * sizeof(float)                              \
-                           + T::Br * T::Bc * sizeof(half);                              \
-        dim3 grid(total_q_blocks, (params).num_heads);                                  \
-        dim3 block(T::kNumWarps * 32);                                                  \
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                     \
-            flash_attn_fwd_volta_varlen_kernel<T>,                                      \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                         \
-        flash_attn_fwd_volta_varlen_kernel<T><<<grid, block, smem, stream>>>(params);   \
-    } while (0)
 
 void flash_attn_fwd_volta_varlen(FlashAttnVarlenParams& params,
-                                  int total_q_blocks, cudaStream_t stream) {
-    switch (params.head_dim) {
-        case 32:  VOLTA_FWD_VARLEN_LAUNCH(TileVolta_d32,  params, stream, total_q_blocks); break;
-        case 64:  VOLTA_FWD_VARLEN_LAUNCH(TileVolta_d64,  params, stream, total_q_blocks); break;
-        case 96:  VOLTA_FWD_VARLEN_LAUNCH(TileVolta_d96,  params, stream, total_q_blocks); break;
-        case 128: VOLTA_FWD_VARLEN_LAUNCH(TileVolta_d128, params, stream, total_q_blocks); break;
-        case 256: VOLTA_FWD_VARLEN_LAUNCH(TileVolta_d256, params, stream, total_q_blocks); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Volta varlen forward");
-    }
+                                 int total_q_blocks, cudaStream_t stream) {
+    dispatch_volta_fwd_tile(params.head_dim, [&](auto tile) {
+        launch_volta_fwd_varlen<decltype(tile)>(params, total_q_blocks, stream);
+    });
 }
 
-#undef VOLTA_FWD_VARLEN_LAUNCH
+// Q rows per block of the forward tile selected for head_dim on this device.
+int flash_attn_fwd_volta_block_rows(int head_dim) {
+    int rows = 0;
+    dispatch_volta_fwd_tile(head_dim, [&](auto tile) { rows = decltype(tile)::Br; });
+    return rows;
+}
 
 }  // namespace flash_attn_legacy

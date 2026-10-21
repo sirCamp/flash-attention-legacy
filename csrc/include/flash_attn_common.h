@@ -5,7 +5,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 
 // ============================================================================
 // Flash Attention Legacy — Common Types & Utilities
@@ -148,149 +151,111 @@ struct FlashAttnBwdParams {
 };
 
 // ---------------------------------------------------------------------------
-// Tile sizes — tuned per architecture and head dimension
+// Forward tile sizes
+//
+// One template per kernel family; smem_bytes() is the single source of truth
+// for the dynamic shared memory of a tile (used by the launches and by the
+// runtime tile selection). Br = threads per block: 1 thread owns 1 Q row.
 // ---------------------------------------------------------------------------
 
-// VOLTA (SM 7.0): tensor cores (wmma 16x16x16), up to 96 KB shared
-// Br = NUM_THREADS so every thread owns exactly one Q row →
-// 100% utilization during softmax and P@V phases.
-
-struct TileVolta_d32 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 32;    // Must be <= d for PV_CHUNK loop (PV_CHUNK = Bc)
-    static constexpr int d  = 32;
-    // Shared: Q[128,32] + K[32,32] + V[32,32] (half) + S[128,32](float) + P[128,32](half)
-    //       = (128*32 + 2*32*32)*2 + 128*32*4 + 128*32*2 = 12288 + 16384 + 8192 = 36 KB
-    static constexpr int kNumWarps = 4;
+// WMMA forward (Volta SM 7.0, Turing SM 7.5): Q[Br,d] + K[Bc,d] + V[Bc,d] (half),
+// S[Br,Bc] (float, reused for the P@V chunks), P[Br,Bc] (half).
+// Constraints: Br, Bc multiples of 16; d % Bc == 0 (P@V in chunks of Bc).
+template <int Br_, int Bc_, int d_>
+struct FwdTileWmma {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kNumWarps = Br_ / 32;
+    static constexpr int smem_bytes() {
+        return (Br * d + 2 * Bc * d) * 2 + Br * Bc * 4 + Br * Bc * 2;
+    }
+    static_assert(Br_ % 32 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA forward tile");
 };
 
-struct TileVolta_d64 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 64;
-    static constexpr int d  = 64;
-    // Shared: Q[128,64] + K[64,64] + V[64,64] + S[128,64]float
-    //       = (128*64 + 2*64*64)*2 + 128*64*4 = 32768 + 32768 = 64 KB
-    static constexpr int kNumWarps = 4;
+// CUDA-core forward (Pascal SM 6.x): Q[Br,d] + K[Bc,d] + V[Bc,d] (half), P[Br,Bc] (float).
+template <int Br_, int Bc_, int d_>
+struct FwdTileSimt {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kNumWarps = Br_ / 32;
+    static constexpr int smem_bytes() {
+        return (Br * d + 2 * Bc * d) * 2 + Br * Bc * 4;
+    }
+    static_assert(Br_ % 32 == 0, "invalid CUDA-core forward tile");
 };
 
-struct TileVolta_d96 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 32;
-    static constexpr int d  = 96;
-    // Shared: Q[128,96] + K[32,96] + V[32,96] (half) + S[128,32](float) + P[128,32](half)
-    //       = (128*96 + 2*32*96)*2 + 128*32*4 + 128*32*2 = 36864 + 16384 + 8192 = 60 KB
-    static constexpr int kNumWarps = 4;
-};
+// Forward tiles: Bc = 16 for every head_dim, measured fastest on V100 and T4
+// (smaller tiles -> more blocks per SM; see the WMMA launcher). Every WMMA tile
+// fits the 64 KB per block of Turing.
+using TileVolta_d32  = FwdTileWmma<128, 16, 32>;    // 22 KB
+using TileVolta_d64  = FwdTileWmma<128, 16, 64>;    // 32 KB
+using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 43 KB
+using TileVolta_d128 = FwdTileWmma<128, 16, 128>;   // 52 KB
+using TileVolta_d256 = FwdTileWmma<64, 16, 256>;    // 54 KB
 
-struct TileVolta_d128 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 32;
-    static constexpr int d  = 128;
-    // Shared: Q[128,128] + K[32,128] + V[32,128] + S[128,32]float
-    //       = (128*128 + 2*32*128)*2 + 128*32*4 = 49152 + 16384 = 64 KB
-    static constexpr int kNumWarps = 4;
-};
+using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 28 KB
+using TilePascal_d64  = FwdTileSimt<128, 32, 64>;   // 40 KB
+using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 22 KB
+using TilePascal_d128 = FwdTileSimt<64, 16, 128>;   // 28 KB
+using TilePascal_d256 = FwdTileSimt<32, 16, 256>;   // 34 KB
 
-struct TileVolta_d256 {
-    static constexpr int Br = 64;    // = 2 warps × 32
-    static constexpr int Bc = 16;
-    static constexpr int d  = 256;
-    // Shared: Q[64,256] + K[16,256] + V[16,256] (half) + S[64,16](float) + P[64,16](half)
-    //       = (64*256 + 2*16*256)*2 + 64*16*4 + 64*16*2 = 49152 + 4096 + 2048 = 54 KB
-    static constexpr int kNumWarps = 2;
-};
-
-// PASCAL (SM 6.x): no tensor cores, 48 KB shared memory
-// Use half2 packed FP16 on CUDA cores.
-// Br = NUM_THREADS for 100% thread utilization during softmax/P@V.
-
-struct TilePascal_d32 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 32;
-    static constexpr int d  = 32;
-    // Shared: Q[128,32] + K[32,32] + V[32,32] + P[128,32]float
-    //       = (128*32 + 2*32*32)*2 + 128*32*4 = 12288 + 16384 = 28 KB
-    static constexpr int kNumWarps = 4;
-};
-
-struct TilePascal_d64 {
-    static constexpr int Br = 128;   // = 4 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 32;
-    static constexpr int d  = 64;
-    // Shared: Q[128,64] + K[32,64] + V[32,64] + P[128,32]float
-    //       = (128*64 + 2*32*64)*2 + 128*32*4 = 24576 + 16384 = 40 KB
-    static constexpr int kNumWarps = 4;
-};
-
-struct TilePascal_d96 {
-    static constexpr int Br = 64;    // = 2 warps × 32
-    static constexpr int Bc = 16;
-    static constexpr int d  = 96;
-    // Shared: Q[64,96] + K[16,96] + V[16,96] + P[64,16]float
-    //       = (64*96 + 2*16*96)*2 + 64*16*4 = 18432 + 4096 = 22 KB
-    static constexpr int kNumWarps = 2;
-};
-
-struct TilePascal_d128 {
-    static constexpr int Br = 64;    // = 2 warps × 32 → 100% thread utilization
-    static constexpr int Bc = 16;
-    static constexpr int d  = 128;
-    // Shared: Q[64,128] + K[16,128] + V[16,128] + P[64,16]float
-    //       = (64*128 + 2*16*128)*2 + 64*16*4 = 24576 + 4096 = 28 KB
-    static constexpr int kNumWarps = 2;  // 64 threads — keeps register pressure manageable
-};
-
-struct TilePascal_d256 {
-    static constexpr int Br = 32;    // = 1 warp × 32
-    static constexpr int Bc = 16;
-    static constexpr int d  = 256;
-    // Shared: Q[32,256] + K[16,256] + V[16,256] + P[32,16]float
-    //       = (32*256 + 2*16*256)*2 + 32*16*4 = 32768 + 2048 = 34 KB
-    static constexpr int kNumWarps = 1;
-};
+// First tile of the list whose smem_bytes() fits `smem_limit`: calls f(Tile{})
+// and returns true, or returns false if none fits. Shared by every launcher and
+// by the host code that needs the selected Br (varlen block offsets), so the
+// selection can never disagree between them. Today every list has one tile
+// (it fits all supported GPUs); the lists exist for per-device candidates
+// (e.g. the forward redesign, docs/PLAN.md P2.8).
+template <typename First, typename... Rest, typename F>
+inline bool with_first_fitting_tile(int smem_limit, F& f) {
+    if (First::smem_bytes() <= smem_limit) {
+        f(First{});
+        return true;
+    }
+    if constexpr (sizeof...(Rest) > 0) {
+        return with_first_fitting_tile<Rest...>(smem_limit, f);
+    } else {
+        return false;
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Backward tile sizes — same for both archs, conservative
-// All dimensions must be multiples of 16 for WMMA compatibility.
-// THREADS_PER_KV = (kNumWarps*32) / Bc must be a power of 2.
+// Backward tile sizes — same template scheme as the forward.
+// Br, Bc, d multiples of 16 (WMMA); d % Bc == 0 (dQ in chunks of Bc);
+// THREADS_PER_KV = (kNumWarps*32) / Bc must be a power of 2 (CUDA-core kernel).
 // ---------------------------------------------------------------------------
-struct TileBwd_d32 {
-    static constexpr int Br = 32;
-    static constexpr int Bc = 32;    // Must be <= d for DQ_CHUNK loop (DQ_CHUNK = Bc)
-    static constexpr int d  = 32;
-    static constexpr int kNumWarps = 4;
-    // THREADS_PER_KV = 128/32 = 4
+
+// WMMA backward (Volta / Turing): K, V [Bc,d], Q, dO [Br,d] (half); S/P and
+// dP/dS [Br,Bc] (float); P/dS [Br,Bc] (half); one 16x16 float staging tile per
+// warp for writing back dK/dV, which are accumulated in registers (WMMA
+// accumulator fragments) for the whole block, not in shared memory.
+template <int Br_, int Bc_, int d_, int kNumWarps_ = 4>
+struct BwdTileWmma {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kNumWarps = kNumWarps_;
+    static constexpr int smem_bytes() {
+        return (2 * Bc * d + 2 * Br * d) * 2 + 2 * Br * Bc * 4 + Br * Bc * 2 + kNumWarps * 256 * 4;
+    }
+    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA backward tile");
 };
 
-struct TileBwd_d64 {
-    static constexpr int Br = 32;
-    static constexpr int Bc = 32;
-    static constexpr int d  = 64;
-    static constexpr int kNumWarps = 4;
+// CUDA-core backward (Pascal): K, V [Bc,d], Q, dO [Br,d] (half); dK/dV in registers.
+template <int Br_, int Bc_, int d_, int kNumWarps_ = 4>
+struct BwdTileSimt {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kNumWarps = kNumWarps_;
+    static constexpr int smem_bytes() { return (2 * Bc * d + 2 * Br * d) * 2; }
 };
 
-struct TileBwd_d96 {
-    static constexpr int Br = 32;
-    static constexpr int Bc = 16;
-    static constexpr int d  = 96;
-    static constexpr int kNumWarps = 4;
-    // THREADS_PER_KV = 128/16 = 8
-};
-
-struct TileBwd_d128 {
-    static constexpr int Br = 16;
-    static constexpr int Bc = 16;
-    static constexpr int d  = 128;
-    static constexpr int kNumWarps = 4;
-};
-
-struct TileBwd_d256 {
-    static constexpr int Br = 16;
-    static constexpr int Bc = 16;
-    static constexpr int d  = 256;
-    static constexpr int kNumWarps = 4;
-    // THREADS_PER_KV = 128/16 = 8
-};
+// Backward tile of either family with the same sizes (the sizes per head_dim
+// are listed once, in the backward dispatcher).
+template <bool kWmma, int Br, int Bc, int d>
+using BwdTile = std::conditional_t<kWmma, BwdTileWmma<Br, Bc, d>, BwdTileSimt<Br, Bc, d>>;
 
 // ---------------------------------------------------------------------------
 // Error checking macro
@@ -304,6 +269,32 @@ struct TileBwd_d256 {
             throw std::runtime_error(cudaGetErrorString(err));                \
         }                                                                     \
     } while (0)
+
+// ---------------------------------------------------------------------------
+// Maximum dynamic shared memory per block of the current device (opt-in limit:
+// 48 KB Pascal, 96 KB Volta, 64 KB Turing). Queried per launch: a host-side
+// attribute read, no device sync, and no shared cache to race on.
+// FLASH_ATTN_LEGACY_SMEM_LIMIT=<bytes> lowers it (testing only: exercises the
+// selection and its "no tile fits" error on any GPU).
+// ---------------------------------------------------------------------------
+inline int max_dynamic_smem_per_block() {
+    int dev = 0;
+    FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&dev));
+    int limit = 0;
+    FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    if (const char* env = std::getenv("FLASH_ATTN_LEGACY_SMEM_LIMIT")) {
+        const int forced = std::atoi(env);
+        if (forced > 0 && forced < limit) limit = forced;
+    }
+    return limit;
+}
+
+// The single error for "no candidate tile fits this device" (all dispatchers).
+[[noreturn]] inline void throw_no_tile(const char* kernel, int head_dim, int smem_limit) {
+    throw std::runtime_error(std::string("flash_attn_legacy: no ") + kernel + " tile for head_dim " +
+                             std::to_string(head_dim) + " fits " + std::to_string(smem_limit) +
+                             " bytes of shared memory per block");
+}
 
 // ---------------------------------------------------------------------------
 // Utility: ceiling division

@@ -11,6 +11,8 @@
 
 #include "flash_attn_common.h"
 
+#include <string>
+
 namespace flash_attn_legacy {
 
 // ---------------------------------------------------------------------------
@@ -116,7 +118,7 @@ flash_attn_fwd_pascal_kernel(FlashAttnParams params) {
                             + q_row_start;
 
     // Shared memory
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];  // aligned for vector (128-bit) accesses
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
     half*  smem_K = smem_Q + Br * d;
     half*  smem_V = smem_K + Bc * d;
@@ -283,7 +285,7 @@ flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
                            + h_idx * params.o_head_stride;
 
     // Shared memory
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];  // aligned for vector (128-bit) accesses
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
     half*  smem_K = smem_Q + Br * d;
     half*  smem_V = smem_K + Bc * d;
@@ -395,60 +397,59 @@ flash_attn_fwd_pascal_varlen_kernel(FlashAttnVarlenParams params) {
 }
 
 // ---------------------------------------------------------------------------
-// Host launcher
+// Host launchers — same dispatch scheme as the WMMA forward (one candidate per
+// head_dim: every Pascal tile fits the 48 KB of shared memory per block).
 // ---------------------------------------------------------------------------
-// Helper macro to launch Pascal forward kernel
-#define PASCAL_FWD_LAUNCH(TileType, params, stream, nbh)                          \
-    do {                                                                           \
-        using T = TileType;                                                        \
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)    \
-                           + T::Br * T::Bc * sizeof(float);                        \
-        dim3 grid(cdiv((params).seq_len_q, T::Br), nbh);                            \
-        dim3 block(T::kNumWarps * 32);                                             \
-        flash_attn_fwd_pascal_kernel<T><<<grid, block, smem, stream>>>(params);    \
-    } while (0)
+template <typename F>
+static void dispatch_pascal_fwd_tile(int head_dim, F&& f) {
+    const int limit = max_dynamic_smem_per_block();
+    bool ok = false;
+    switch (head_dim) {
+        case 32:  ok = with_first_fitting_tile<TilePascal_d32>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<TilePascal_d64>(limit, f); break;
+        case 96:  ok = with_first_fitting_tile<TilePascal_d96>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<TilePascal_d128>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<TilePascal_d256>(limit, f); break;
+        default:  throw std::runtime_error("Unsupported head_dim for the CUDA-core forward");
+    }
+    if (!ok) throw_no_tile("CUDA-core forward", head_dim, limit);
+}
+
+template <typename Tile>
+static void launch_pascal_fwd(FlashAttnParams& params, cudaStream_t stream) {
+    constexpr int smem = Tile::smem_bytes();
+    dim3 grid(cdiv(params.seq_len_q, Tile::Br), params.batch_size * params.num_heads);
+    dim3 block(Tile::kNumWarps * 32);
+    flash_attn_fwd_pascal_kernel<Tile><<<grid, block, smem, stream>>>(params);
+}
+
+template <typename Tile>
+static void launch_pascal_fwd_varlen(FlashAttnVarlenParams& params, int total_q_blocks,
+                                     cudaStream_t stream) {
+    constexpr int smem = Tile::smem_bytes();
+    dim3 grid(total_q_blocks, params.num_heads);
+    dim3 block(Tile::kNumWarps * 32);
+    flash_attn_fwd_pascal_varlen_kernel<Tile><<<grid, block, smem, stream>>>(params);
+}
 
 void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream) {
-    const int nbh = params.batch_size * params.num_heads;
-
-    switch (params.head_dim) {
-        case 32:  PASCAL_FWD_LAUNCH(TilePascal_d32,  params, stream, nbh); break;
-        case 64:  PASCAL_FWD_LAUNCH(TilePascal_d64,  params, stream, nbh); break;
-        case 96:  PASCAL_FWD_LAUNCH(TilePascal_d96,  params, stream, nbh); break;
-        case 128: PASCAL_FWD_LAUNCH(TilePascal_d128, params, stream, nbh); break;
-        case 256: PASCAL_FWD_LAUNCH(TilePascal_d256, params, stream, nbh); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Pascal forward");
-    }
+    dispatch_pascal_fwd_tile(params.head_dim, [&](auto tile) {
+        launch_pascal_fwd<decltype(tile)>(params, stream);
+    });
 }
-
-#undef PASCAL_FWD_LAUNCH
-
-// ---------------------------------------------------------------------------
-// Host launcher — variable-length
-// ---------------------------------------------------------------------------
-// Helper macro to launch Pascal varlen forward kernel
-#define PASCAL_FWD_VARLEN_LAUNCH(TileType, params, stream, total_q_blocks)               \
-    do {                                                                                  \
-        using T = TileType;                                                               \
-        constexpr int smem = (T::Br * T::d + 2 * T::Bc * T::d) * sizeof(half)           \
-                           + T::Br * T::Bc * sizeof(float);                               \
-        dim3 grid(total_q_blocks, (params).num_heads);                                    \
-        dim3 block(T::kNumWarps * 32);                                                    \
-        flash_attn_fwd_pascal_varlen_kernel<T><<<grid, block, smem, stream>>>(params);    \
-    } while (0)
 
 void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params,
-                                   int total_q_blocks, cudaStream_t stream) {
-    switch (params.head_dim) {
-        case 32:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d32,  params, stream, total_q_blocks); break;
-        case 64:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d64,  params, stream, total_q_blocks); break;
-        case 96:  PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d96,  params, stream, total_q_blocks); break;
-        case 128: PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d128, params, stream, total_q_blocks); break;
-        case 256: PASCAL_FWD_VARLEN_LAUNCH(TilePascal_d256, params, stream, total_q_blocks); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Pascal varlen forward");
-    }
+                                  int total_q_blocks, cudaStream_t stream) {
+    dispatch_pascal_fwd_tile(params.head_dim, [&](auto tile) {
+        launch_pascal_fwd_varlen<decltype(tile)>(params, total_q_blocks, stream);
+    });
 }
 
-#undef PASCAL_FWD_VARLEN_LAUNCH
+// Q rows per block of the forward tile selected for head_dim.
+int flash_attn_fwd_pascal_block_rows(int head_dim) {
+    int rows = 0;
+    dispatch_pascal_fwd_tile(head_dim, [&](auto tile) { rows = decltype(tile)::Br; });
+    return rows;
+}
 
 }  // namespace flash_attn_legacy

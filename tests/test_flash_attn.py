@@ -812,6 +812,17 @@ class TestValidation:
         cu_k = torch.tensor([0, 10], dtype=torch.int32, device="cuda")
         assert flash_attn_varlen_func(q, k, k, cu_q, cu_k, 0, 10).shape == (0, 4, 64)
 
+    @pytest.mark.parametrize("arch", ["native", "pascal"])
+    def test_no_tile_fits_raises_clear_error(self, monkeypatch, arch):
+        """FLASH_ATTN_LEGACY_SMEM_LIMIT below every d=256 tile: explicit error, no failed launch."""
+        from flash_attn_legacy import flash_attention
+        if arch == "pascal":
+            monkeypatch.setenv("FLASH_ATTN_LEGACY_FORCE_ARCH", "pascal")
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_SMEM_LIMIT", "32768")
+        q, k, v = self._qkv(d=256)
+        with pytest.raises(RuntimeError, match="no .* tile for head_dim 256 fits 32768"):
+            flash_attention(q, k, v)
+
     def test_nan_does_not_hide_overflow(self):
         from flash_attn_legacy import flash_attention
         from flash_attn_legacy.flash_attn import FP16RangeError

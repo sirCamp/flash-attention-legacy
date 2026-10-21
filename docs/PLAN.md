@@ -58,6 +58,29 @@ Dimensioni: **S** = qualche ora, **M** = 1–3 giorni, **L** = più di 3 giorni.
 
 ---
 
+## 1b. Prestazioni misurate (2026-10-21)
+
+Il forward è corretto ma **da circa 6× a 10× più lento di SDPA memory-efficient** di PyTorch, su tutte le architetture (anche dopo le tile Bc=16 di P2.3). I benchmark del README lo mostrano "più veloce" perché confrontano con eager, che materializza la matrice N×N.
+
+| Forward causale, B=2, H=16, N=4096 | nostro (tile iniziali) | nostro (Bc=16, P2.3) | SDPA |
+|---|---|---|---|
+| V100, d=64 | 22.1 ms | 13.4 ms | 2.34 ms |
+| V100, d=128 | 33.0 ms | 29.0 ms | 3.74 ms |
+| T4, d=64 | 53.6 ms | 37.4 ms | 4.59 ms |
+| T4, d=128 | 64.6 ms | 64.5 ms | 10.4 ms |
+
+Nsight Compute sulla T4 (d=64, N=4096):
+- tensor core attivi il **2.1%** del picco;
+- **92%** delle letture e delle scritture in shared memory in conflitto di banco;
+- stallo principale l'attesa della shared memory (44%);
+- occupancy 12.5% (1 blocco da 4 warp per SM, 168 registri per thread).
+
+Causa: il disegno "un thread per riga". Softmax, conversione di P e accumulo di O leggono e scrivono la propria riga di S/P/O in shared memory con passo di 32 float, quindi tutti i thread del warp colpiscono lo stesso banco.
+
+Interventi:
+1. **P5.3, anticipata**: padding e accessi a 128 bit, una correzione contenuta.
+2. **P2.8**: forward alla FA2, con S/P nei registri e i warp che si dividono le righe; è il passo necessario per arrivare al livello di SDPA.
+
 ## 2. Principi
 
 1. **Nessun risultato sbagliato in silenzio.** Ogni caso non supportato passa a un fallback **che lo applica correttamente** o dà un errore esplicito. La decisione si prende per ogni chiamata, mai sulla config.
@@ -100,7 +123,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
-| P1.1 | **Harness di benchmark fisso** [R12]: kernel e modelli, prefill, training e memoria, con media e deviazione standard su almeno 10 ripetizioni. Riferimenti: SDPA mem-efficient e math selezionati esplicitamente, più eager. Risultati versionati in `docs/bench/`. | M | Baseline registrata su V100, T4 e 1080 Ti prima di P2. |
+| P1.1 | **Harness di benchmark fisso** [R12]: kernel e modelli, prefill, training e memoria, con media e deviazione standard su almeno 10 ripetizioni. Riferimento principale: **SDPA memory-efficient** selezionato esplicitamente (non eager: §1b mostra che il confronto con eager nasconde un ritardo di circa 10×), più math ed eager. Risultati versionati in `docs/bench/`. | M | Baseline registrata su V100, T4 e 1080 Ti prima di P2.8. |
 | P1.2 | **Host varlen**: griglia `(cdiv(max_seqlen_q, Br), num_seqs, H)` senza `block_offsets`, senza `.to(CPU)` e senza la tabella Br hardcoded per SM. Tocca solo il lancio, non la logica del kernel. | S–M | Nessuna sync CPU-GPU nel forward varlen (profiler); test verdi. |
 
 ### P2 — Fondamenta dei kernel, Turing e build — **L**
@@ -108,12 +131,13 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
 | P2.1 | **Refactor**: un solo kernel forward e un solo backward con policy `SeqInfo` (batched/varlen) e `Mma` (WMMA sm_70/75, SIMT sm_60/61). Funzione `constexpr` unica per la shared memory e helper comuni. Le feature diventano rami a runtime uniformi, non flag di template, per contenere le istanziazioni. | L | Forward identico bit a bit prima e dopo; nessuna regressione oltre il rumore misurato con l'harness P1.1. |
-| P2.2 | **Tile scelte a runtime** in base alla shared memory per blocco del device (con cache). L'SM serve solo per tensor core e FP16 lento. Toglie la guardia temporanea di P0.6. | M | Su T4 tutti gli head_dim girano sul kernel. |
-| P2.3 | **Tile Turing** (d=64 e d=128: `128×16`; buffer K/V condiviso). Backward d=256 con accumulatori dK/dV in frammenti WMMA. Includere anche le voci dimenticate del report [R15]: tile V100 d=64 a 48 KB (2 blocchi per SM), load a 128 bit, spill del forward d=256 su sm_70. | M | `test_flash_attn.py` completo su T4 e V100; tempi con l'harness. |
+| P2.2 | **Fatto (branch p2-turing)**: tile scelte a runtime con `with_first_fitting_tile` sulla shared memory per blocco del device (`cudaDevAttrMaxSharedMemoryPerBlockOptin`, con cache; hook di test `FLASH_ATTN_LEGACY_SMEM_LIMIT`). Template di tile con `smem_bytes()` unico; il varlen prende `Br` dalla stessa selezione. | M | T4: 525 test verdi (prima 198 fallimenti); V100 con limite 64 KB: 397 test verdi. |
+| P2.3 | **Fatto (branch p2-turing)**: tile forward misurate e unificate a **Bc=16 per ogni head_dim** (`<128,16,d>` per d=32–128, `<64,16,256>`): più veloci delle precedenti su V100 e T4 (forward causale, B=2 H=16 N=4096, V100: d=32 da 13.3 a 8.95 ms, d=64 da 21.0 a 13.4, d=96 da 23.4 a 15.3, d=128 da 33.0 a 29.0; T4: d=32 da 38.3 a 22.7, d=64 da 53.5 a 37.4, d=96 da 55.2 a 43.1) e tutte entro i 64 KB di Turing. Backward con accumulatori dK/dV in frammenti WMMA nei registri (d=256 da 66,5 a ~38,5 KB; 0 spill misurati su sm_70/75). Resta: buffer K/V condiviso, staging del backward su `smem_S`, scrittura `half2`, da valutare con P2.8. | M | Fatto: T4, V100 e 1080 Ti verdi. |
 | P2.4 | **Native varlen backward** in un solo lancio, sopra il kernel unificato di P2.1 [R6]. | M | Gradienti come il riferimento; nessuna sync; tempo misurato. |
 | P2.5 | **int64 e griglia**: offset a int64, B·H fuori da `gridDim.y`, `#include <mma.h>` fuori dal namespace. | S | Test con B·H > 65535 e, dove la memoria basta, oltre 2^31 elementi. |
 | P2.6 | **Build** — *architetture configurabili anticipata (richiesta utente 2026-10-21)*: `TORCH_CUDA_ARCH_LIST` / `FLASH_ATTN_LEGACY_ARCHS` per scegliere le architetture; di default solo quelle supportate dal `nvcc` installato (`nvcc --list-gpu-arch`), con un avviso per quelle escluse (CUDA 13 non compila più sm_60/61/70). Poi: file divisi per (famiglia, head_dim); il build di release compila Pascal solo per sm_60/61, un **build di test** mantiene Pascal anche per sm_70/75 così il percorso forzato resta testabile [R5]. | S–M | CUDA 13 compila per la sola T4 senza errori; con `TORCH_CUDA_ARCH_LIST="7.5"` build in pochi minuti; build di release sotto i 3 minuti; test con Pascal forzato nel build di test. |
 | P2.7 | **head_dim 72 e 80** (verificati sulle config). d=80 è già multiplo di 16 (Bc=16); d=72 si porta a 80 con zeri in shared memory per WMMA. Su Pascal servono multipli di 8 per i load vettoriali [R14]. Il costo in tempo di build va misurato. | M | Test unitari per d=72 e d=80; encoder di visione di Qwen2-VL e SigLIP sul kernel. |
+| P2.8 | **Forward riprogettato alla FA2** (unito a P2.1, sostituisce P6.6). S e P restano nei registri dei frammenti (`mma`/WMMA), ogni warp si occupa di una fascia di 16 righe invece di un thread per riga, softmax con riduzioni a livello di warp, O accumulato nei frammenti, niente andata e ritorno in shared memory. Su Pascal lo stesso schema a livello di warp con FMA FP32. Motivo: vedi §1b. | L | Forward a 4096 token entro 1.5× da SDPA memory-efficient su V100 e T4 (oggi circa 10× più lento); stessi test di correttezza. |
 
 ### P3 — Padding, packing e VLM nativi (dopo P2) — **M–L**
 
@@ -138,7 +162,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 |---|---|---|---|
 | P5.1 | Percorso FP32 per sm_61. **In parte anticipato in P0.5**: il prodotto Q·K del forward Pascal è in FP32 (FFMA), 2.3–2.9× più veloce sulla 1080 Ti. Resta: K/V in FP32 in shared memory (meno conversioni), P@V, scelta a runtime per sm_60 vs sm_61, misurata anche su P100 | M | 1080 Ti e P100: forward misurato prima e dopo con l'harness |
 | P5.2 | Backward CUDA-core: fette di colonne di dK/dV e dQ ridotto in shared memory. In alternativa, un kernel dQ separato che risolve insieme le atomic Pascal e il determinismo (P6.3) [R15] | M | 1080 Ti: backward misurato; niente spill a d≤128 |
-| P5.3 | Padding delle righe in shared memory contro i bank conflict (tutte le architetture) | S | Profiler e harness |
+| P5.3 | **Anticipata come prossimo passo (2026-10-21)**: padding delle righe in shared memory (+4 float / +8 half) e accessi vettoriali a 128 bit nei loop per riga, su Volta, Turing e Pascal: elimina i conflitti di banco misurati in §1b. | S | Nsight Compute: conflitti di banco da circa 92% a circa 0%; tempi prima e dopo su T4, V100 e 1080 Ti. |
 
 ### P6 — Estensioni (da prioritizzare)
 
@@ -149,7 +173,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P6.3 | dQ deterministico (kernel dQ separato, vedi P5.2) | M |
 | P6.4 | Dropout con Philox | L |
 | P6.5 | `torch.compile` e CUDA graph: registrare le operazioni con `torch.library` e togliere le sincronizzazioni host: nel builder della maschera `bool(pad.all())` e `int(q_offset)`; nella funzione di attention `bool(mask.all())` quando il marcatore della maschera 2D si perde (una sync per strato, es. Gemma 3 con cache statica); il controllo di range FP16 per input BF16/FP32 (`amax`, una sync per chiamata nel percorso kernel); la lettura dei segmenti (una sync per forward) [R10] | M |
-| P6.6 | `mma.sync` su sm_75, solo se l'harness lo giustifica | L |
+| P6.6 | ~~`mma.sync` su sm_75~~ → confluito in P2.8 | — |
 | P6.7 | **Llama 4: chunked attention** (attention locale a blocchi; transformers solleva un errore per i backend con "flash" nel nome, quindi serve anche un adattamento nel registro HF), dopo P4.1 window nel kernel | M |
 
 ---

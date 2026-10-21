@@ -33,6 +33,10 @@
 
 #include "flash_attn_common.h"
 
+#include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
+
+#include <string>
+
 namespace flash_attn_legacy {
 
 // ---------------------------------------------------------------------------
@@ -153,7 +157,7 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     //   smem_V  [Bc, D]  half
     //   smem_Q  [Br, D]  half   — reloaded each Q block
     //   smem_dO [Br, D]  half   — reloaded each Q block
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];  // aligned for vector (128-bit) accesses
     half* smem_K  = reinterpret_cast<half*>(smem_raw);
     half* smem_V  = smem_K + Bc * D;
     half* smem_Q  = smem_V + Bc * D;
@@ -321,7 +325,6 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 // ============================================================================
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 
-#include <mma.h>
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------
@@ -384,40 +387,64 @@ __device__ __forceinline__ void bwd_wmma_gemm_AB(
     }
 }
 
-// C[OUT_R, OUT_C] += A^T[OUT_R, M] @ B[M, OUT_C]
-// A is [M, OUT_R] row-major (stride OUT_R). Loaded as col_major for transpose.
-// B is [M, OUT_C] row-major (stride B_stride).
-// C is [OUT_R, OUT_C] float, accumulated in-place.
-template <int OUT_R, int OUT_C, int M, int NUM_WARPS>
-__device__ __forceinline__ void bwd_wmma_gemm_AtB_accum(
-    const half* smem_A, int A_stride,
-    const half* smem_B, int B_stride,
-    float* smem_C, int C_stride,
-    int warp_id
-) {
-    constexpr int T = 16;
-    constexpr int ntr = OUT_R / T, ntc = OUT_C / T, total = ntr * ntc;
-    constexpr int per_warp = (total + NUM_WARPS - 1) / NUM_WARPS;
-    #pragma unroll
-    for (int t = 0; t < per_warp; t++) {
-        int idx = warp_id + t * NUM_WARPS;
-        if (idx >= total) break;
-        int tr = idx / ntc, tc = idx % ntc;
-        wmma::fragment<wmma::matrix_a, T,T,T, half, wmma::col_major> a;
-        wmma::fragment<wmma::matrix_b, T,T,T, half, wmma::row_major> b;
-        wmma::fragment<wmma::accumulator, T,T,T, float> c;
-        // Load existing accumulator
-        wmma::load_matrix_sync(c, smem_C + tr*T*C_stride + tc*T, C_stride, wmma::mem_row_major);
+// Accumulator fragments of a [OUT_R, OUT_C] float matrix spread over the warps
+// of a block: tile idx = warp_id + t * NUM_WARPS (t < PER_WARP), row-major tiles.
+template <int OUT_R, int OUT_C, int NUM_WARPS>
+struct WarpAccum {
+    static constexpr int T = 16;
+    static constexpr int kCols = OUT_C / T;
+    static constexpr int kTiles = (OUT_R / T) * kCols;
+    static constexpr int kPerWarp = (kTiles + NUM_WARPS - 1) / NUM_WARPS;
+    wmma::fragment<wmma::accumulator, T, T, T, float> frag[kPerWarp];
+
+    __device__ __forceinline__ void zero() {
         #pragma unroll
-        for (int m = 0; m < M; m += T) {
-            // A^T tile: A is [M, OUT_R] stride A_stride. col_major load transposes.
-            wmma::load_matrix_sync(a, smem_A + m*A_stride + tr*T, A_stride);
-            wmma::load_matrix_sync(b, smem_B + m*B_stride + tc*T, B_stride);
-            wmma::mma_sync(c, a, b, c);
-        }
-        wmma::store_matrix_sync(smem_C + tr*T*C_stride + tc*T, c, C_stride, wmma::mem_row_major);
+        for (int t = 0; t < kPerWarp; t++) wmma::fill_fragment(frag[t], 0.0f);
     }
-}
+
+    // frag += A^T @ B, A [M, OUT_R] row-major (stride A_stride, loaded col_major
+    // to transpose), B [M, OUT_C] row-major (stride B_stride).
+    template <int M>
+    __device__ __forceinline__ void add_AtB(const half* smem_A, int A_stride,
+                                            const half* smem_B, int B_stride, int warp_id) {
+        #pragma unroll
+        for (int t = 0; t < kPerWarp; t++) {
+            const int idx = warp_id + t * NUM_WARPS;
+            if (idx >= kTiles) break;  // warp-uniform
+            const int tr = idx / kCols, tc = idx % kCols;
+            wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::col_major> a;
+            wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::row_major> b;
+            #pragma unroll
+            for (int m = 0; m < M; m += T) {
+                wmma::load_matrix_sync(a, smem_A + m * A_stride + tr * T, A_stride);
+                wmma::load_matrix_sync(b, smem_B + m * B_stride + tc * T, B_stride);
+                wmma::mma_sync(frag[t], a, b, frag[t]);
+            }
+        }
+    }
+
+    // Write the first `valid_rows` rows as half to out (row stride out_stride),
+    // through a per-warp 16x16 float staging tile in shared memory.
+    __device__ __forceinline__ void store_half(half* out, int out_stride, int valid_rows,
+                                               float* warp_staging, int warp_id, int lane) {
+        #pragma unroll
+        for (int t = 0; t < kPerWarp; t++) {
+            const int idx = warp_id + t * NUM_WARPS;
+            if (idx >= kTiles) break;
+            const int tr = idx / kCols, tc = idx % kCols;
+            wmma::store_matrix_sync(warp_staging, frag[t], T, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int e = lane; e < T * T; e += 32) {
+                const int row = tr * T + e / T;
+                if (row < valid_rows) {
+                    out[row * out_stride + tc * T + e % T] = __float2half(warp_staging[e]);
+                }
+            }
+            __syncwarp();
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Backward kernel — Volta WMMA
@@ -454,36 +481,29 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                                  + kv_h_idx * params.v_head_stride
                                  + kv_start * params.v_seq_stride;
 
-    // Shared memory layout:
+    // Shared memory layout (size: Tile::smem_bytes()):
     //   smem_K:    [Bc, D] half
     //   smem_V:    [Bc, D] half
     //   smem_Q:    [Br, D] half   (reloaded per Q block)
     //   smem_dO:   [Br, D] half   (reloaded per Q block)
-    //   dK_acc:    [Bc, D] float  (WMMA accumulates directly)
-    //   dV_acc:    [Bc, D] float  (WMMA accumulates directly)
     //   smem_S:    [Br, Bc] float (S → P, then reused for dQ chunks)
     //   smem_dP:   [Br, Bc] float (dP → dS)
     //   smem_half: [Br, Bc] half  (P_half → dS_half)
-    extern __shared__ char smem_raw[];
+    //   staging:   [NUM_WARPS, 16*16] float (dK/dV write-back)
+    // dK, dV are accumulated in registers (WarpAccum fragments) for the whole block.
+    extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_K    = reinterpret_cast<half*>(smem_raw);
     half*  smem_V    = smem_K + Bc * D;
     half*  smem_Q    = smem_V + Bc * D;
     half*  smem_dO   = smem_Q + Br * D;
-    float* dK_acc    = reinterpret_cast<float*>(smem_dO + Br * D);
-    float* dV_acc    = dK_acc + Bc * D;
-    float* smem_S    = dV_acc + Bc * D;
+    float* smem_S    = reinterpret_cast<float*>(smem_dO + Br * D);
     float* smem_dP   = smem_S + Br * Bc;
     half*  smem_half = reinterpret_cast<half*>(smem_dP + Br * Bc);
+    float* staging   = reinterpret_cast<float*>(smem_half + Br * Bc);
 
-    // Zero dK_acc, dV_acc
-    {
-        constexpr int total_dk = Bc * D;
-        #pragma unroll
-        for (int i = tid; i < total_dk; i += NUM_THREADS) {
-            dK_acc[i] = 0.0f;
-            dV_acc[i] = 0.0f;
-        }
-    }
+    WarpAccum<Bc, D, NUM_WARPS> dK_acc, dV_acc;
+    dK_acc.zero();
+    dV_acc.zero();
 
     // Load K, V (stay for entire block)
     bwd_load_tile<Bc, D, NUM_THREADS>(K_blk, params.k_seq_stride, smem_K, valid_kv);
@@ -550,12 +570,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         }
         __syncthreads();
 
-        // ---- Step 4: dV_acc += P_half^T @ dO via WMMA ----
-        bwd_wmma_gemm_AtB_accum<Bc, D, Br, NUM_WARPS>(
-            smem_half, Bc,   // A = P_half [Br, Bc], stride Bc
-            smem_dO, D,      // B = dO [Br, D], stride D
-            dV_acc, D,       // C = dV_acc [Bc, D], stride D
-            warp_id);
+        // ---- Step 4: dV_acc += P_half^T @ dO via WMMA (registers) ----
+        dV_acc.template add_AtB<Br>(smem_half, Bc,   // A = P_half [Br, Bc], stride Bc
+                           smem_dO, D,      // B = dO [Br, D], stride D
+                           warp_id);
         __syncthreads();
 
         // ---- Step 5: dP = dO @ V^T via WMMA ----
@@ -588,12 +606,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         }
         __syncthreads();
 
-        // ---- Step 8: dK_acc += dS_half^T @ Q via WMMA ----
-        bwd_wmma_gemm_AtB_accum<Bc, D, Br, NUM_WARPS>(
-            smem_half, Bc,   // A = dS_half [Br, Bc], stride Bc
-            smem_Q, D,       // B = Q [Br, D], stride D
-            dK_acc, D,       // C = dK_acc [Bc, D], stride D
-            warp_id);
+        // ---- Step 8: dK_acc += dS_half^T @ Q via WMMA (registers) ----
+        dK_acc.template add_AtB<Br>(smem_half, Bc,   // A = dS_half [Br, Bc], stride Bc
+                           smem_Q, D,       // B = Q [Br, D], stride D
+                           warp_id);
         __syncthreads();
 
         // ---- Step 9: dQ += dS @ K (atomicAdd to global FP32 buffer) ----
@@ -625,7 +641,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     }  // end q_blk
     }  // end qh (GQA)
 
-    // Write dK, dV from shared accumulators to global memory
+    // Write dK, dV from the register accumulators to global memory
     {
         half* dK_out = params.dK + b_idx * params.dk_batch_stride
                                  + kv_h_idx * params.dk_head_stride
@@ -633,19 +649,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         half* dV_out = params.dV + b_idx * params.dv_batch_stride
                                  + kv_h_idx * params.dv_head_stride
                                  + kv_start * params.dv_seq_stride;
-
-        constexpr int total_dk = Bc * D;
-        #pragma unroll
-        for (int i = tid; i < total_dk; i += NUM_THREADS) {
-            int row = i / D;
-            int col = i % D;
-            if (row < valid_kv) {
-                reinterpret_cast<half*>(dK_out + row * params.dk_seq_stride)[col] =
-                    __float2half(dK_acc[i]);
-                reinterpret_cast<half*>(dV_out + row * params.dv_seq_stride)[col] =
-                    __float2half(dV_acc[i]);
-            }
-        }
+        float* warp_staging = staging + warp_id * 16 * 16;
+        const int lane = tid % 32;
+        dK_acc.store_half(dK_out, params.dk_seq_stride, valid_kv, warp_staging, warp_id, lane);
+        dV_acc.store_half(dV_out, params.dv_seq_stride, valid_kv, warp_staging, warp_id, lane);
     }
 }
 
@@ -676,65 +683,46 @@ void precompute_D(
     );
 }
 
-// Helper macro to launch Volta WMMA backward kernel
-#define VOLTA_BWD_LAUNCH(TileType, params, stream, nbh)                                  \
-    do {                                                                                  \
-        using T = TileType;                                                               \
-        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d)       \
-                                * sizeof(half)                                             \
-                           + (T::Bc*T::d + T::Bc*T::d + T::Br*T::Bc + T::Br*T::Bc)      \
-                                * sizeof(float)                                            \
-                           + T::Br * T::Bc * sizeof(half);                                \
-        dim3 grid(cdiv((params).seq_len_k, T::Bc), nbh);                                   \
-        dim3 block(T::kNumWarps * 32);                                                    \
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                       \
-            flash_attn_bwd_volta_kernel<T>,                                               \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                           \
-        flash_attn_bwd_volta_kernel<T><<<grid, block, smem, stream>>>(params);            \
-    } while (0)
+// Same dispatch scheme as the forward launchers, with one tile per head_dim,
+// checked against the device's shared memory per block (clear error instead of
+// a failed launch). With dK/dV in registers every WMMA backward tile fits 48 KB.
+template <bool kWmma, typename F>
+static void dispatch_bwd_tile(int head_dim, F&& f) {
+    const int limit = max_dynamic_smem_per_block();
+    bool ok = false;
+    switch (head_dim) {
+        case 32:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 32, 32>>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 32, 64>>(limit, f); break;
+        case 96:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 16, 96>>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<BwdTile<kWmma, 16, 16, 128>>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<BwdTile<kWmma, 16, 16, 256>>(limit, f); break;
+        default:  throw std::runtime_error("Unsupported head_dim for the backward");
+    }
+    if (!ok) throw_no_tile(kWmma ? "WMMA backward" : "CUDA-core backward", head_dim, limit);
+}
+
+template <typename Tile, typename Kernel>
+static void launch_bwd(Kernel kernel, FlashAttnBwdParams& params, cudaStream_t stream) {
+    constexpr int smem = Tile::smem_bytes();
+    dim3 grid(cdiv(params.seq_len_k, Tile::Bc), params.batch_size * params.num_heads_k);
+    dim3 block(Tile::kNumWarps * 32);
+    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<grid, block, smem, stream>>>(params);
+}
 
 void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    const int nbh = params.batch_size * params.num_heads_k;
-
-    switch (params.head_dim) {
-        case 32:  VOLTA_BWD_LAUNCH(TileBwd_d32,  params, stream, nbh); break;
-        case 64:  VOLTA_BWD_LAUNCH(TileBwd_d64,  params, stream, nbh); break;
-        case 96:  VOLTA_BWD_LAUNCH(TileBwd_d96,  params, stream, nbh); break;
-        case 128: VOLTA_BWD_LAUNCH(TileBwd_d128, params, stream, nbh); break;
-        case 256: VOLTA_BWD_LAUNCH(TileBwd_d256, params, stream, nbh); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Volta backward");
-    }
+    dispatch_bwd_tile<true>(params.head_dim, [&](auto tile) {
+        using T = decltype(tile);
+        launch_bwd<T>(flash_attn_bwd_volta_kernel<T>, params, stream);
+    });
 }
-
-#undef VOLTA_BWD_LAUNCH
-
-// Helper macro to launch Pascal backward kernel
-#define PASCAL_BWD_LAUNCH(TileType, params, stream, nbh)                                  \
-    do {                                                                                   \
-        using T = TileType;                                                                \
-        constexpr int smem = (T::Bc*T::d + T::Bc*T::d + T::Br*T::d + T::Br*T::d)        \
-                                * sizeof(half);                                             \
-        dim3 grid(cdiv((params).seq_len_k, T::Bc), nbh);                                    \
-        dim3 block(T::kNumWarps * 32);                                                     \
-        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(                                        \
-            flash_attn_bwd_kernel<T>,                                                      \
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));                            \
-        flash_attn_bwd_kernel<T><<<grid, block, smem, stream>>>(params);                   \
-    } while (0)
 
 void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    const int nbh = params.batch_size * params.num_heads_k;
-
-    switch (params.head_dim) {
-        case 32:  PASCAL_BWD_LAUNCH(TileBwd_d32,  params, stream, nbh); break;
-        case 64:  PASCAL_BWD_LAUNCH(TileBwd_d64,  params, stream, nbh); break;
-        case 96:  PASCAL_BWD_LAUNCH(TileBwd_d96,  params, stream, nbh); break;
-        case 128: PASCAL_BWD_LAUNCH(TileBwd_d128, params, stream, nbh); break;
-        case 256: PASCAL_BWD_LAUNCH(TileBwd_d256, params, stream, nbh); break;
-        default:  throw std::runtime_error("Unsupported head_dim for Pascal backward");
-    }
+    dispatch_bwd_tile<false>(params.head_dim, [&](auto tile) {
+        using T = decltype(tile);
+        launch_bwd<T>(flash_attn_bwd_kernel<T>, params, stream);
+    });
 }
-
-#undef PASCAL_BWD_LAUNCH
 
 }  // namespace flash_attn_legacy

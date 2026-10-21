@@ -21,6 +21,8 @@ void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream);
 // Forward declarations — variable-length
 void flash_attn_fwd_volta_varlen(FlashAttnVarlenParams& params, int total_q_blocks, cudaStream_t stream);
 void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params, int total_q_blocks, cudaStream_t stream);
+int flash_attn_fwd_volta_block_rows(int head_dim);
+int flash_attn_fwd_pascal_block_rows(int head_dim);
 void precompute_D(
     const half* dO, const half* O, float* D,
     int B, int H, int N, int d,
@@ -339,17 +341,8 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     }
 
     int sm = get_sm_version();
-    // Br depends on arch and head_dim — must match tile configs in flash_attn_common.h
-    int Br;
-    if (sm >= 70) {
-        // Volta: Br from TileVolta_dN
-        Br = (d <= 128) ? 128 : 64;  // d=32/64/96/128 → 128, d=256 → 64
-    } else {
-        // Pascal: Br from TilePascal_dN
-        if (d <= 64) Br = 128;       // d=32/64 → 128
-        else if (d <= 128) Br = 64;  // d=96/128 → 64
-        else Br = 32;                // d=256 → 32
-    }
+    // Br of the tile the launcher will select (same dispatch: they cannot disagree)
+    const int Br = (sm >= 70) ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
 
     std::vector<int> block_offsets_vec(num_seqs + 1);
     block_offsets_vec[0] = 0;
