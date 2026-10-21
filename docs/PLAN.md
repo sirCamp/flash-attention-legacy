@@ -130,7 +130,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
-| P1.1 | **Harness di benchmark fisso** [R12]: kernel e modelli, prefill, training e memoria, con media e deviazione standard su almeno 10 ripetizioni. Riferimento principale: **SDPA memory-efficient** selezionato esplicitamente (non eager: §1b mostra che il confronto con eager nasconde un ritardo di circa 10×), più math ed eager. Risultati versionati in `docs/bench/`. | M | Baseline registrata su V100, T4 e 1080 Ti prima di P2.8. |
+| P1.1 | **Fatto (kernel; branch p2-turing)**: `benchmarks/benchmark.py` misura forward e fwd+bwd contro SDPA memory-efficient e math (backend selezionati esplicitamente) ed eager, con media e deviazione standard su 20 ripetizioni (minimo 10) e memoria di picco; `--save` scrive `docs/bench/<gpu>.json`. Baseline registrata su V100, T4, P100 e 1080 Ti (causale, B=2 H=16, N=512–4096, d=64/128). Rapporto legacy/mem-efficient a N=4096: forward V100 4.0×/6.2× (d=64/128), T4 4.9×/4.7×, P100 1.9×/4.6×, 1080 Ti 0.29×/0.37× (SDPA mem-efficient su sm_61 è lentissimo: FP16 a 1/64); fwd+bwd V100 2.8×/4.3×, T4 3.5×/4.5×, P100 0.88×/1.25×, 1080 Ti 0.13×/0.15×. Resta: benchmark a livello di modello (prefill, training), oggi in `tests/test_generation_benchmark.py`. | M | Fatto: baseline su 4 GPU prima di P2.8. |
 | P1.2 | **Host varlen**: griglia `(cdiv(max_seqlen_q, Br), num_seqs, H)` senza `block_offsets`, senza `.to(CPU)` e senza la tabella Br hardcoded per SM. Tocca solo il lancio, non la logica del kernel. | S–M | Nessuna sync CPU-GPU nel forward varlen (profiler); test verdi. |
 
 ### P2 — Fondamenta dei kernel, Turing e build — **L**
