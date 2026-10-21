@@ -31,11 +31,11 @@ constexpr int kBandRows = 16;  // query rows per warp
 // One Q block: its rows start at Q / O / L (row strides q_stride / o_stride /
 // l_stride); K and V start at key 0 of the sequence.
 struct FwdBlockArgs {
-    const half* __restrict__ Q; int q_stride;
-    const half* __restrict__ K; int k_stride;
-    const half* __restrict__ V; int v_stride;
-    half* __restrict__ O; int o_stride;
-    float* __restrict__ L; int l_stride;
+    const half* __restrict__ Q; index_t q_stride;
+    const half* __restrict__ K; index_t k_stride;
+    const half* __restrict__ V; index_t v_stride;
+    half* __restrict__ O; index_t o_stride;
+    float* __restrict__ L; index_t l_stride;
     int q_row_start, valid_q, seq_len_q, seq_len_k;
     float softmax_scale;
     bool is_causal;
@@ -183,11 +183,14 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
 template <typename Tile, typename Body>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_batched_kernel(FlashAttnParams p) {
-    const int bh_idx = blockIdx.y;
+    // Flat grid: x = (batch * heads) * q_blocks + q_block (no 65535 limit on
+    // B * H; the Q blocks of one head are adjacent, sharing its K/V in L2).
+    const int q_blocks = cdiv(p.seq_len_q, Tile::Br);
+    const int bh_idx = blockIdx.x / q_blocks;
     const int b_idx = bh_idx / p.num_heads;
     const int h_idx = bh_idx % p.num_heads;
     const int kv_h_idx = h_idx / (p.num_heads / p.num_heads_k);
-    const int q_row_start = blockIdx.x * Tile::Br;
+    const int q_row_start = (blockIdx.x % q_blocks) * Tile::Br;
     if (q_row_start >= p.seq_len_q) return;
 
     FwdBlockArgs a;
@@ -233,7 +236,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.v_stride = p.v_token_stride;
     a.O = p.O + (q_start_tok + q_row_start) * p.o_token_stride + h_idx * p.o_head_stride;
     a.o_stride = p.o_token_stride;
-    a.L = p.L + (q_start_tok + q_row_start) * p.num_heads + h_idx;  // L is [total_q, H_q]
+    a.L = p.L + index_t(q_start_tok + q_row_start) * p.num_heads + h_idx;  // L is [total_q, H_q]
     a.l_stride = p.num_heads;
     a.q_row_start = q_row_start;
     a.valid_q = min(Tile::Br, seq_len_q - q_row_start);
@@ -250,7 +253,9 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
 template <typename Tile, typename Body>
 void launch_fwd(FlashAttnParams& params, cudaStream_t stream) {
     constexpr int smem = Tile::smem_bytes();
-    dim3 grid(cdiv(params.seq_len_q, Tile::Br), params.batch_size * params.num_heads);
+    const int64_t blocks = int64_t(cdiv(params.seq_len_q, Tile::Br)) * params.batch_size * params.num_heads;
+    if (blocks > INT32_MAX) throw std::runtime_error("flash_attn_legacy: batch * heads * query blocks exceeds the grid limit");
+    dim3 grid(static_cast<unsigned>(blocks));
     FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
         fwd_batched_kernel<Tile, Body>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     fwd_batched_kernel<Tile, Body><<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);

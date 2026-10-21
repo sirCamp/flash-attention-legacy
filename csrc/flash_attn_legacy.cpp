@@ -26,8 +26,8 @@ int flash_attn_fwd_pascal_block_rows(int head_dim);
 void precompute_D(
     const half* dO, const half* O, float* D,
     int B, int H, int N, int d,
-    int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride, int l_seq_stride,
+    index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
+    index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
     cudaStream_t stream);
 void flash_attn_bwd_launch(FlashAttnBwdParams& params, bool wmma, int total_k_blocks, cudaStream_t stream);
 int flash_attn_bwd_block_cols(int head_dim, bool wmma);
@@ -123,6 +123,9 @@ static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, 
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 && cu_seqlens_k.dtype() == torch::kInt32,
                 "cu_seqlens_q/k must be int32");
     TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.size(0) >= 2, "cu_seqlens must have at least 2 entries");
+    // Token counts must fit the int32 cu_seqlens; heads go in gridDim.y
+    TORCH_CHECK(Q.size(0) <= INT32_MAX && K.size(0) <= INT32_MAX, "total tokens must fit in int32");
+    TORCH_CHECK(H_q <= 65535, "num_heads must be <= 65535 for varlen, got ", H_q);
     TORCH_CHECK(cu_seqlens_k.sizes() == cu_seqlens_q.sizes(), "cu_seqlens_k length mismatch");
 }
 
@@ -205,6 +208,8 @@ std::vector<torch::Tensor> flash_attn_forward(
     TORCH_CHECK(Q.dim() == 4, "Q must be [B, H_q, N, d]");
     TORCH_CHECK(K.dim() == 4 && V.dim() == 4, "K,V must be 4D");
 
+    TORCH_CHECK(Q.size(0) <= INT32_MAX && Q.size(2) <= INT32_MAX && K.size(2) <= INT32_MAX,
+                "batch and sequence lengths must fit in int32");
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
     const int Nk = K.size(2);
@@ -245,7 +250,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     p.k_batch_stride = K.stride(0); p.k_head_stride = K.stride(1); p.k_seq_stride = K.stride(2);
     p.v_batch_stride = V.stride(0); p.v_head_stride = V.stride(1); p.v_seq_stride = V.stride(2);
     p.o_batch_stride = O.stride(0); p.o_head_stride = O.stride(1); p.o_seq_stride = O.stride(2);
-    p.l_batch_stride = H_q * N; p.l_head_stride = N;
+    p.l_batch_stride = index_t(H_q) * N; p.l_head_stride = N;
 
     int sm = get_sm_version();
     if (sm >= 70) {
@@ -283,6 +288,8 @@ std::vector<torch::Tensor> flash_attn_backward(
     TORCH_CHECK(Q.dim() == 4 && K.dim() == 4 && V.dim() == 4, "Q, K, V must be 4D");
     TORCH_CHECK(dO.sizes() == Q.sizes() && O.sizes() == Q.sizes(), "dO and O shapes must match Q");
 
+    TORCH_CHECK(Q.size(0) <= INT32_MAX && Q.size(2) <= INT32_MAX && K.size(2) <= INT32_MAX,
+                "batch and sequence lengths must fit in int32");
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
     TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
@@ -313,8 +320,8 @@ std::vector<torch::Tensor> flash_attn_backward(
     torch::Tensor dV = torch::empty({B, H_kv, Nk, d}, V.options());
 
     // Precompute D = rowsum(dO * O) → [B, H_q, N]
-    const int l_batch_stride = H_q * N;
-    const int l_head_stride = N;
+    const index_t l_batch_stride = index_t(H_q) * N;
+    const index_t l_head_stride = N;
     torch::Tensor D_tensor = torch::empty({B, H_q, N}, Q.options().dtype(torch::kFloat32));
 
     precompute_D(

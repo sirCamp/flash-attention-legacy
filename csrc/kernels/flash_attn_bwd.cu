@@ -26,16 +26,15 @@ __global__ void precompute_D_kernel(
     const half* __restrict__ O,    // [B, H, N, d]
     float* __restrict__ D,         // [B, H, N]
     int batch_size, int num_heads, int seq_len, int head_dim,
-    int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride, int l_seq_stride
+    index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
+    index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = batch_size * num_heads * seq_len;
-    if (idx >= total) return;
+    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= int64_t(batch_size) * num_heads * seq_len) return;
 
-    const int n = idx % seq_len;
-    const int h = (idx / seq_len) % num_heads;
-    const int b = idx / (num_heads * seq_len);
+    const int n = static_cast<int>(idx % seq_len);
+    const int h = static_cast<int>((idx / seq_len) % num_heads);
+    const int b = static_cast<int>(idx / (int64_t(num_heads) * seq_len));
 
     const half* dO_row = dO + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
     const half* O_row  = O  + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
@@ -65,8 +64,8 @@ struct BwdBlockArgs {
     const float* __restrict__ L; const float* __restrict__ D; float* __restrict__ dQ;
     const half* __restrict__ K; const half* __restrict__ V;
     half* __restrict__ dK; half* __restrict__ dV;
-    int q_head_stride, o_head_stride, l_head_stride, dq_head_stride;
-    int q_stride, o_stride, l_stride, dq_stride, k_stride, v_stride, dk_stride, dv_stride;
+    index_t q_head_stride, o_head_stride, l_head_stride, dq_head_stride;
+    index_t q_stride, o_stride, l_stride, dq_stride, k_stride, v_stride, dk_stride, dv_stride;
     int heads_per_kv, kv_start, seq_len_q, seq_len_k;
     float softmax_scale;
     bool is_causal;
@@ -102,13 +101,15 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     return a;
 }
 
-// Grid (key blocks of Bc, B * H_kv).
+// Flat grid: x = (batch * KV heads) * key_blocks + key_block (as the forward).
 template <typename Tile, typename Body>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 bwd_batched_kernel(FlashAttnBwdParams p) {
-    const int b = blockIdx.y / p.num_heads_k;
-    const int kv_h = blockIdx.y % p.num_heads_k;
-    const int kv_start = blockIdx.x * Tile::Bc;
+    const int key_blocks = cdiv(p.seq_len_k, Tile::Bc);
+    const int bh = blockIdx.x / key_blocks;
+    const int b = bh / p.num_heads_k;
+    const int kv_h = bh % p.num_heads_k;
+    const int kv_start = (blockIdx.x % key_blocks) * Tile::Bc;
     if (kv_start >= p.seq_len_k) return;
     Body::template run<Tile>(bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, kv_h, kv_start));
 }
@@ -204,7 +205,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             load_tile_g2s<Br, D, NT, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
                                           smem_dO, valid_q);
             if (tid < Br) {
-                const int lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
+                const index_t lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
                 smem_L[tid] = (tid < valid_q) ? a.L[lrow] : 0.0f;
                 smem_D[tid] = (tid < valid_q) ? a.D[lrow] : 0.0f;
             }
@@ -377,7 +378,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                                                    smem_dO, valid_q);
             for (int i = tid; i < Br; i += NUM_THREADS) {
                 // Rows past the sequence: P = 0 through the mask, D never used
-                const int lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
+                const index_t lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
                 smem_L[i] = (i < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
                 smem_D[i] = (i < valid_q) ? a.D[lrow] : 0.0f;
             }
@@ -495,7 +496,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     half* dK_out = a.dK + (kv_start + band * T) * a.dk_stride + part * DP;
     half* dV_out = a.dV + (kv_start + band * T) * a.dv_stride + part * DP;
     const int band_valid = valid_kv - band * T;  // may be <= 0 for the last block
-    auto store = [&](Acc& frag, half* out, int stride) {
+    auto store = [&](Acc& frag, half* out, index_t stride) {
         wmma::store_matrix_sync(wstage, frag, T, wmma::mem_row_major);
         __syncwarp();
         #pragma unroll
@@ -527,13 +528,14 @@ struct BwdWmma {
 void precompute_D(
     const half* dO, const half* O, float* D,
     int B, int H, int N, int d,
-    int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride, int l_seq_stride,
+    index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
+    index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
     cudaStream_t stream
 ) {
-    const int total = B * H * N;
+    const int64_t total = int64_t(B) * H * N;
     const int block_size = 256;
-    const int grid_size = cdiv(total, block_size);
+    const int64_t grid_size = (total + block_size - 1) / block_size;
+    if (grid_size > INT32_MAX) throw std::runtime_error("flash_attn_legacy: too many rows for precompute_D");
     precompute_D_kernel<<<grid_size, block_size, 0, stream>>>(
         dO, O, D, B, H, N, d,
         o_batch_stride, o_head_stride, o_seq_stride,
@@ -581,8 +583,11 @@ static void launch_bwd(FlashAttnBwdParams& params, int total_k_blocks, cudaStrea
     constexpr int smem = Tile::smem_bytes();
     const bool varlen = params.cu_seqlens_q != nullptr;
     auto kernel = varlen ? bwd_varlen_kernel<Tile, Body> : bwd_batched_kernel<Tile, Body>;
-    const dim3 grid = varlen ? dim3(total_k_blocks, params.num_heads_k)
-                             : dim3(cdiv(params.seq_len_k, Tile::Bc), params.batch_size * params.num_heads_k);
+    const int64_t batched_blocks = int64_t(cdiv(params.seq_len_k, Tile::Bc)) * params.batch_size * params.num_heads_k;
+    if (!varlen && batched_blocks > INT32_MAX) {
+        throw std::runtime_error("flash_attn_legacy: batch * heads * key blocks exceeds the grid limit");
+    }
+    const dim3 grid = varlen ? dim3(total_k_blocks, params.num_heads_k) : dim3(static_cast<unsigned>(batched_blocks));
     FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
 }

@@ -17,6 +17,11 @@
 
 namespace flash_attn_legacy {
 
+// Element offsets and strides: 64-bit, so that tensors beyond 2^31 elements
+// (large packed varlen batches) address correctly; products of an int row
+// index and an index_t stride are computed in 64 bits.
+using index_t = int64_t;
+
 // ---------------------------------------------------------------------------
 // Compile-time architecture detection
 // ---------------------------------------------------------------------------
@@ -42,28 +47,28 @@ struct FlashAttnParams {
     int head_dim;        // 32, 64, 96, 128, or 256
 
     // Strides (in elements) for Q
-    int q_batch_stride;
-    int q_head_stride;
-    int q_seq_stride;    // == head_dim for contiguous
+    index_t q_batch_stride;
+    index_t q_head_stride;
+    index_t q_seq_stride;    // == head_dim for contiguous
 
     // Strides for K
-    int k_batch_stride;
-    int k_head_stride;
-    int k_seq_stride;
+    index_t k_batch_stride;
+    index_t k_head_stride;
+    index_t k_seq_stride;
 
     // Strides for V
-    int v_batch_stride;
-    int v_head_stride;
-    int v_seq_stride;
+    index_t v_batch_stride;
+    index_t v_head_stride;
+    index_t v_seq_stride;
 
     // Strides for O
-    int o_batch_stride;
-    int o_head_stride;
-    int o_seq_stride;
+    index_t o_batch_stride;
+    index_t o_head_stride;
+    index_t o_seq_stride;
 
     // Strides for L (logsumexp)
-    int l_batch_stride;
-    int l_head_stride;
+    index_t l_batch_stride;
+    index_t l_head_stride;
 
     // Softmax scale  (typically 1/sqrt(d))
     float softmax_scale;
@@ -94,14 +99,14 @@ struct FlashAttnVarlenParams {
     int head_dim;        // 32, 64, 96, 128, or 256
 
     // Strides (in elements) — layout is [total, H, d]
-    int q_token_stride;  // H_q * d
-    int q_head_stride;   // d
-    int k_token_stride;  // H_kv * d
-    int k_head_stride;   // d
-    int v_token_stride;
-    int v_head_stride;
-    int o_token_stride;
-    int o_head_stride;
+    index_t q_token_stride;  // H_q * d
+    index_t q_head_stride;   // d
+    index_t k_token_stride;  // H_kv * d
+    index_t k_head_stride;   // d
+    index_t v_token_stride;
+    index_t v_head_stride;
+    index_t o_token_stride;
+    index_t o_head_stride;
 
     float softmax_scale;
     bool is_causal;
@@ -133,21 +138,21 @@ struct FlashAttnBwdParams {
     bool is_causal;
 
     // Strides for Q/dQ
-    int q_batch_stride, q_head_stride, q_seq_stride;
+    index_t q_batch_stride, q_head_stride, q_seq_stride;
     // Strides for K/dK
-    int k_batch_stride, k_head_stride, k_seq_stride;
+    index_t k_batch_stride, k_head_stride, k_seq_stride;
     // Strides for V/dV
-    int v_batch_stride, v_head_stride, v_seq_stride;
+    index_t v_batch_stride, v_head_stride, v_seq_stride;
     // Strides for O/dO
-    int o_batch_stride, o_head_stride, o_seq_stride;
+    index_t o_batch_stride, o_head_stride, o_seq_stride;
     // Strides for L and D (batched [B, H, N]: seq stride 1; varlen [total, H]: num_heads)
-    int l_batch_stride, l_head_stride, l_seq_stride;
+    index_t l_batch_stride, l_head_stride, l_seq_stride;
     // Strides for dQ (FP32, same layout as Q but float)
-    int dq_batch_stride, dq_head_stride, dq_seq_stride;
+    index_t dq_batch_stride, dq_head_stride, dq_seq_stride;
     // Strides for dK (same layout as K)
-    int dk_batch_stride, dk_head_stride, dk_seq_stride;
+    index_t dk_batch_stride, dk_head_stride, dk_seq_stride;
     // Strides for dV (same layout as V)
-    int dv_batch_stride, dv_head_stride, dv_seq_stride;
+    index_t dv_batch_stride, dv_head_stride, dv_seq_stride;
 
     // Varlen only (nullptr / 0 for batched): packed [total, H, d] tensors with
     // batch strides 0; sequence i spans rows [cu_seqlens[i], cu_seqlens[i+1]);
@@ -374,7 +379,9 @@ __host__ __device__ __forceinline__ int cdiv(int a, int b) {
 // (>= COLS, padded against bank conflicts), as half or converted to fp32.
 // load_tile_g2s does both directly.
 // Rows must start 16-byte aligned (COLS, strides multiples of 8 halves;
-// contiguous_aligned() on the host).
+// contiguous_aligned() on the host). The row stride is an int (one row of a
+// tensor fits in 32 bits; 64-bit math here costs a lot in small-tile loops):
+// callers advance `src` with 64-bit offsets first.
 // ---------------------------------------------------------------------------
 template <int ROWS, int COLS, int NUM_THREADS>
 struct TileRegs {

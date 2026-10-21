@@ -1048,6 +1048,60 @@ class TestForwardContract:
         for t in (q, k, v):
             assert t.grad.shape == t.shape and not t.grad.any()
 
+    def test_many_heads_grid(self):
+        """B * H = 66000 > 65535 (the old gridDim.y limit), forward and backward,
+        several query blocks per head."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(1100, 60, 200, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+                   for _ in range(3))  # N=200: two query blocks per head
+        out = flash_attention(q, k, v, causal=True)
+        out.backward(torch.ones_like(out))
+        scale = 32 ** -0.5
+        for b in (0, 1099):  # spot-check the first and last batch
+            sl = slice(b, b + 1)
+            torch.testing.assert_close(out[sl], ref_attention(q[sl].detach(), k[sl].detach(), v[sl].detach(),
+                                                              scale, True), atol=2e-2, rtol=2e-2)
+            rdq, rdk, rdv = ref_backward(q[sl].detach(), k[sl].detach(), v[sl].detach(),
+                                         torch.ones_like(out[sl]), scale, True)
+            for g, r in ((q.grad[sl], rdq), (k.grad[sl], rdk), (v.grad[sl], rdv)):
+                torch.testing.assert_close(g, r, atol=5e-2, rtol=5e-2)
+
+    def test_over_2_31_elements_varlen(self):
+        """Packed varlen tensors with more than 2^31 elements (64-bit offsets);
+        checks the last sequences, whose offsets overflow 32-bit math."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        free, _ = torch.cuda.mem_get_info()
+        if free < 10 * 2**30:
+            pytest.skip("needs about 10 GB of free GPU memory")
+        H, d, seq = 32, 64, 16
+        total = (2**31 // (H * d)) + 4 * seq  # just past 2^31 elements per tensor
+        total -= total % seq
+        cu = torch.arange(0, total + 1, seq, dtype=torch.int32, device="cuda")
+        torch.manual_seed(0)
+        q = torch.randn(total, H, d, device="cuda", dtype=torch.float16)
+        out = flash_attn_varlen_func(q, q, q, cu, cu, seq, seq, causal=True)
+        tail = q[-2 * seq:].view(2, seq, H, d).transpose(1, 2)  # last two sequences as [2, H, seq, d]
+        ref = ref_attention(tail, tail, tail, d ** -0.5, True).transpose(1, 2).reshape(2 * seq, H, d)
+        torch.testing.assert_close(out[-2 * seq:], ref, atol=2e-2, rtol=2e-2)
+
+    def test_over_2_31_elements_batched(self):
+        """Batched Q / O beyond 2^31 elements (64-bit batch / head offsets) with a
+        short K/V; checks the last batch and head."""
+        from flash_attn_legacy import flash_attention
+        free, _ = torch.cuda.mem_get_info()
+        if free < 10 * 2**30:
+            pytest.skip("needs about 10 GB of free GPU memory")
+        B, H, d, n_k = 2, 32, 128, 16
+        n_q = 2**31 // (B * H * d) + 128  # just past 2^31 elements
+        torch.manual_seed(0)
+        q = torch.randn(B, H, n_q, d, device="cuda", dtype=torch.float16)
+        k, v = (torch.randn(B, H, n_k, d, device="cuda", dtype=torch.float16) for _ in range(2))
+        out = flash_attention(q, k, v)
+        sl = (slice(B - 1, B), slice(H - 1, H), slice(n_q - 300, n_q))
+        ref = ref_attention(q[sl], k[sl[:2]], v[sl[:2]], d ** -0.5)
+        torch.testing.assert_close(out[sl], ref, atol=2e-2, rtol=2e-2)
+
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
         import flash_attn_legacy_cuda
