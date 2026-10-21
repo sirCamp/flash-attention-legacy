@@ -339,39 +339,79 @@ __host__ __device__ __forceinline__ int cdiv(int a, int b) {
 // ---------------------------------------------------------------------------
 #ifdef __CUDACC__
 // ---------------------------------------------------------------------------
-// Vectorized global → shared memory load using half2 (4-byte transactions).
-// Destination rows have stride DST_STRIDE (>= COLS, padded to avoid bank
-// conflicts on per-row accesses); rows >= num_valid_rows are zero-filled.
+// Global -> shared tile copies with 128-bit transactions, split in two halves so
+// that a kernel can issue the global loads of the next tile early (into
+// registers) and store them to shared memory later: load_tile_g2r reads a
+// [ROWS, COLS] half tile (row stride src_row_stride) into TileRegs, rows >=
+// num_valid_rows as zeros; store_tile_r2s writes it with row stride DST_STRIDE
+// (>= COLS, padded against bank conflicts). load_tile_g2s does both directly.
+// Rows must start 16-byte aligned (COLS, strides multiples of 8 halves;
+// contiguous_aligned() on the host).
 // ---------------------------------------------------------------------------
+template <int ROWS, int COLS, int NUM_THREADS>
+struct TileRegs {
+    static_assert(COLS % 8 == 0, "128-bit tile copies need COLS % 8 == 0");
+    static constexpr int kVecPerRow = COLS / 8;
+    static constexpr int kVecs = ROWS * kVecPerRow;
+    static constexpr int kThreads = NUM_THREADS;
+    static constexpr int kPerThread = (kVecs + NUM_THREADS - 1) / NUM_THREADS;
+    uint4 v[kPerThread];
+};
+
+// Vector idx of a tile copy: row idx / kVecPerRow, 8 halves at column 8 * (idx % kVecPerRow).
+template <typename R>
+__device__ __forceinline__ uint4 tile_vec_load(const half* __restrict__ src, int src_row_stride,
+                                               int idx, int num_valid_rows) {
+    const int row = idx / R::kVecPerRow;
+    if ((R::kVecs % R::kThreads != 0 && idx >= R::kVecs) || row >= num_valid_rows) {
+        return make_uint4(0u, 0u, 0u, 0u);
+    }
+    return *reinterpret_cast<const uint4*>(src + row * src_row_stride + (idx % R::kVecPerRow) * 8);
+}
+
+template <typename R, int DST_STRIDE>
+__device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, uint4 v) {
+    static_assert(DST_STRIDE % 8 == 0, "128-bit tile copies need DST_STRIDE % 8 == 0");
+    if (R::kVecs % R::kThreads == 0 || idx < R::kVecs) {
+        *reinterpret_cast<uint4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
+                                  + (idx % R::kVecPerRow) * 8) = v;
+    }
+}
+
+template <int ROWS, int COLS, int NUM_THREADS>
+__device__ __forceinline__ void load_tile_g2r(
+    const half* __restrict__ src, int src_row_stride,
+    TileRegs<ROWS, COLS, NUM_THREADS>& regs, int num_valid_rows
+) {
+    using R = TileRegs<ROWS, COLS, NUM_THREADS>;
+    #pragma unroll
+    for (int i = 0; i < R::kPerThread; i++) {
+        regs.v[i] = tile_vec_load<R>(src, src_row_stride, threadIdx.x + i * NUM_THREADS, num_valid_rows);
+    }
+}
+
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
+__device__ __forceinline__ void store_tile_r2s(
+    const TileRegs<ROWS, COLS, NUM_THREADS>& regs, half* __restrict__ dst
+) {
+    using R = TileRegs<ROWS, COLS, NUM_THREADS>;
+    #pragma unroll
+    for (int i = 0; i < R::kPerThread; i++) {
+        tile_vec_store<R, DST_STRIDE>(dst, threadIdx.x + i * NUM_THREADS, regs.v[i]);
+    }
+}
+
+// One vector at a time (no tile-sized register buffer).
 template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS>
 __device__ __forceinline__ void load_tile_g2s(
-    const half* __restrict__ src,
-    int src_row_stride,
-    half* __restrict__ dst,
-    int num_valid_rows
+    const half* __restrict__ src, int src_row_stride,
+    half* __restrict__ dst, int num_valid_rows
 ) {
-    static_assert(COLS % 2 == 0 && DST_STRIDE % 2 == 0, "half2 loads need even sizes");
-    constexpr int COLS2 = COLS / 2;
-    constexpr int TOTAL2 = ROWS * COLS2;
-    constexpr int PER_THREAD = (TOTAL2 + NUM_THREADS - 1) / NUM_THREADS;
-
-    const int tid = threadIdx.x;
-    const half2 zero2 = {__float2half(0.0f), __float2half(0.0f)};
-
+    using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
-    for (int i = 0; i < PER_THREAD; i++) {
-        int idx = tid + i * NUM_THREADS;
-        if (idx < TOTAL2) {
-            int row = idx / COLS2;
-            int col2 = idx % COLS2;
-            half2* dst2 = reinterpret_cast<half2*>(dst + row * DST_STRIDE);
-            if (row < num_valid_rows) {
-                const half2* src2 = reinterpret_cast<const half2*>(src + row * src_row_stride);
-                dst2[col2] = src2[col2];
-            } else {
-                dst2[col2] = zero2;
-            }
-        }
+    for (int i = 0; i < R::kPerThread; i++) {
+        const int idx = threadIdx.x + i * NUM_THREADS;
+        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load<R>(src, src_row_stride, idx, num_valid_rows));
     }
 }
 

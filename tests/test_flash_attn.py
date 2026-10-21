@@ -961,6 +961,49 @@ class TestForwardContract:
         self.test_output_and_lse(d, 130, 200, True)
         self.test_varlen_short_segments(d, True)
 
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_misaligned_views(self, causal):
+        """Contiguous views starting 2 bytes into their storage (not 16-byte
+        aligned): the host copies them, results are unchanged."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        shape, n = (2, 4, 77, 64), 2 * 4 * 77 * 64
+        q, k, v, go = (torch.randn(n + 1, device="cuda", dtype=torch.float16)[1:].view(shape)
+                       for _ in range(4))
+        assert q.data_ptr() % 16 != 0 and q.is_contiguous()
+        q, k, v = (t.requires_grad_() for t in (q, k, v))
+        out = flash_attention(q, k, v, causal=causal)
+        out.backward(go)
+        ref = ref_attention(q.detach(), k.detach(), v.detach(), 1 / 8, causal)
+        rdq, rdk, rdv = ref_backward(q.detach(), k.detach(), v.detach(), go, 1 / 8, causal)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        for g, r in ((q.grad, rdq), (k.grad, rdk), (v.grad, rdv)):
+            torch.testing.assert_close(g, r, atol=5e-2, rtol=5e-2)
+
+    def test_misaligned_varlen(self):
+        """Packed varlen input starting 2 bytes into its storage, with GQA."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        lens = [5, 40, 17]
+        total = sum(lens)
+        cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+
+        def packed(h):
+            return torch.randn(total * h * 64 + 1, device="cuda", dtype=torch.float16)[1:].view(total, h, 64)
+        q, k, v = packed(4), packed(2), packed(2)
+        assert q.data_ptr() % 16 != 0
+        q, k, v = (t.requires_grad_() for t in (q, k, v))
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max(lens), max(lens), softmax_scale=1 / 8, causal=True)
+        go = torch.randn_like(out)
+        out.backward(go)
+        for s, e in zip(cu[:-1].tolist(), cu[1:].tolist()):
+            qi, ki, vi, gi = (t.detach()[s:e].transpose(0, 1).unsqueeze(0) for t in (q, k, v, go))
+            ref = ref_attention(qi, ki, vi, 1 / 8, True)
+            rdq, rdk, rdv = ref_backward(qi, ki, vi, gi, 1 / 8, True)
+            torch.testing.assert_close(out[s:e], ref[0].transpose(0, 1), atol=2e-2, rtol=2e-2)
+            for g, r in ((q.grad[s:e], rdq), (k.grad[s:e], rdk), (v.grad[s:e], rdv)):
+                torch.testing.assert_close(g, r[0].transpose(0, 1), atol=5e-2, rtol=5e-2)
+
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
         import flash_attn_legacy_cuda

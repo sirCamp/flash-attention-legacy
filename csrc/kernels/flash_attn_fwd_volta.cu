@@ -119,7 +119,6 @@ __device__ __forceinline__ void volta_fwd_block(
     float m = -INFINITY;   // running max of this row, log2 domain
     float row_sum = 0.0f;  // partial sum of this lane's columns
 
-    load_tile_g2s<Br, d, NUM_THREADS, LDH>(Q_ptr, q_stride, smem_Q, valid_q);
 
     // One K/V block for this warp's band; kMask: block needs tail/causal masking.
     auto band_step = [&](auto mask_tag, int kv_start) {
@@ -219,12 +218,23 @@ __device__ __forceinline__ void volta_fwd_block(
                                                   seq_len_q, seq_len_k);
     // Last key any row of this band can see (causal): later blocks are skipped by the warp.
     const int band_last_key = q_row_start + band_row0 + T - 1 + causal_off;
-    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
+    // K/V prefetch: the global loads of block j+1 are issued before computing
+    // block j and land in shared memory after the barrier that ends it.
+    TileRegs<Bc, d, NUM_THREADS> next_K, next_V;
+    auto fetch_kv = [&](int kv_blk) {
         const int kv_start = kv_blk * Bc;
         const int valid_kv = min(Bc, seq_len_k - kv_start);
-        load_tile_g2s<Bc, d, NUM_THREADS, LDH>(K_ptr + kv_start * k_stride, k_stride, smem_K, valid_kv);
-        load_tile_g2s<Bc, d, NUM_THREADS, LDH>(V_ptr + kv_start * v_stride, v_stride, smem_V, valid_kv);
+        load_tile_g2r(K_ptr + kv_start * k_stride, k_stride, next_K, valid_kv);
+        load_tile_g2r(V_ptr + kv_start * v_stride, v_stride, next_V, valid_kv);
+    };
+    if (kv_limit > 0) fetch_kv(0);  // in flight while Q is loaded
+    load_tile_g2s<Br, d, NUM_THREADS, LDH>(Q_ptr, q_stride, smem_Q, valid_q);
+    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
+        const int kv_start = kv_blk * Bc;
+        store_tile_r2s<Bc, d, NUM_THREADS, LDH>(next_K, smem_K);
+        store_tile_r2s<Bc, d, NUM_THREADS, LDH>(next_V, smem_V);
         __syncthreads();
+        if (kv_blk + 1 < kv_limit) fetch_kv(kv_blk + 1);
         if (band_active && !(is_causal && kv_start > band_last_key)) {  // warp-uniform
             if (kv_blk < nomask_limit) band_step(std::false_type{}, kv_start);
             else                       band_step(std::true_type{}, kv_start);

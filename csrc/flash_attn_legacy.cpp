@@ -32,6 +32,16 @@ void precompute_D(
 void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream);
 void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream);
 
+// Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
+// accesses (row strides are multiples of 8 halves since head_dim is). A view
+// whose start is not 16-byte aligned (e.g. offset by an odd number of halves)
+// is cloned.
+static torch::Tensor contiguous_aligned(const torch::Tensor& t) {
+    torch::Tensor c = t.contiguous();
+    if (reinterpret_cast<uintptr_t>(c.data_ptr()) % 16 != 0) c = c.clone();
+    return c;
+}
+
 // FLASH_ATTN_LEGACY_FORCE_ARCH=pascal|volta forces the kernel family regardless of
 // the GPU (testing only: e.g. run the Pascal CUDA-core kernels on a T4/Ampere card;
 // correctness is checked, performance numbers are not representative).
@@ -101,7 +111,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     float softmax_scale, bool is_causal
 ) {
-    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
+    Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
     TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(),
@@ -177,9 +187,9 @@ std::vector<torch::Tensor> flash_attn_backward(
     torch::Tensor O, torch::Tensor L,
     float softmax_scale, bool is_causal
 ) {
-    dO = dO.contiguous();
-    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
-    O = O.contiguous();
+    dO = contiguous_aligned(dO);
+    Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
+    O = contiguous_aligned(O);
 
     for (const auto* t : {&dO, &Q, &K, &V, &O}) {
         TORCH_CHECK(t->is_cuda() && t->dtype() == torch::kFloat16,
@@ -286,7 +296,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     int max_seqlen_q, int max_seqlen_k,
     float softmax_scale, bool is_causal
 ) {
-    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
+    Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
     TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda() &&
