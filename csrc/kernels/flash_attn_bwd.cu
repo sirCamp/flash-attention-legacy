@@ -229,212 +229,236 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 
 // ---------------------------------------------------------------------------
-// Backward kernel — Volta WMMA
+// Backward kernel — WMMA (Volta / Turing), FA2-style.
+// Grid: (key blocks of Bc, B * H_kv). The block keeps its K, V and loops over
+// the Q heads of its KV head (GQA) and the query blocks of Br rows that can see
+// its keys. Warp w owns the 16 keys of band w / kSplitD and the d / kSplitD
+// columns of slice w % kSplitD of dK / dV, accumulated in WMMA fragments. Per
+// query block, each warp on its own computes, as transposed [16 keys, Br]
+// fragments,
+//   S^T = K_band Q^T,  P^T = exp(S^T * scale - L)  (masked to 0)
+//   dV += P^T dO,  dP^T = V_band dO^T,  dS^T = P^T (dP^T - D) * scale,  dK += dS^T Q
+// with the element-wise steps done on the fragments themselves (the row and
+// column of each element come from wmma_acc_layout). P^T / dS^T reach the
+// next WMMA as half through the warp's buffer, and dS^T also goes to a shared
+// [Bc, Br] buffer: after one block barrier all warps compute dQ = dS K for the
+// query block and add it to the fp32 dQ buffer with coalesced atomics (one per
+// element and key block). Two block barriers per query block.
 // ---------------------------------------------------------------------------
 template <typename Tile>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
-
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int D  = Tile::d;
     constexpr int NUM_THREADS = Tile::kNumWarps * 32;
     constexpr int NUM_WARPS = Tile::kNumWarps;
-    constexpr int DQ_CHUNK = Bc;  // dQ computed in chunks of Bc columns
+    constexpr int SPLIT = Tile::kSplitD;
+    constexpr int LDH = Tile::kLdH;
+    constexpr int LDB = Tile::kLdB;
+    constexpr int T = 16;
+    constexpr int QT = Br / T;            // query tiles of a band's S^T / dP^T
+    constexpr int DP = D / SPLIT;         // dK / dV columns of a warp
+    constexpr int DPT = DP / T;           // dK / dV fragments of a warp
+    constexpr int NE = kAccElems;
+    using Acc = wmma::fragment<wmma::accumulator, T, T, T, float>;
+    using FragA = wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::row_major>;
+    using FragAt = wmma::fragment<wmma::matrix_a, T, T, T, half, wmma::col_major>;
+    using FragB = wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::row_major>;
+    using FragBt = wmma::fragment<wmma::matrix_b, T, T, T, half, wmma::col_major>;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    const int band = warp_id / SPLIT;      // keys [16 band, 16 band + 16) of the block
+    const int part = warp_id % SPLIT;      // dK / dV columns [part DP, part DP + DP)
 
-    // Grid: (num_kv_blocks, B * H_kv)
     const int bh_idx = blockIdx.y;
     const int b_idx = bh_idx / params.num_heads_k;
     const int kv_h_idx = bh_idx % params.num_heads_k;
     const int heads_per_kv = params.num_heads / params.num_heads_k;
-    const int kv_blk = blockIdx.x;
-    const int kv_start = kv_blk * Bc;
+    const int kv_start = blockIdx.x * Bc;
     if (kv_start >= params.seq_len_k) return;
     const int valid_kv = min(Bc, params.seq_len_k - kv_start);
+    const int causal_off = params.seq_len_k - params.seq_len_q;
+    const float scale_log2 = params.softmax_scale * kLog2e;
 
-    // K, V base pointers
-    const half* K_blk = params.K + b_idx * params.k_batch_stride
-                                 + kv_h_idx * params.k_head_stride
-                                 + kv_start * params.k_seq_stride;
-    const half* V_blk = params.V + b_idx * params.v_batch_stride
-                                 + kv_h_idx * params.v_head_stride
-                                 + kv_start * params.v_seq_stride;
-
-    // Shared memory layout (size: Tile::smem_bytes()):
-    //   smem_K:    [Bc, D] half
-    //   smem_V:    [Bc, D] half
-    //   smem_Q:    [Br, D] half   (reloaded per Q block)
-    //   smem_dO:   [Br, D] half   (reloaded per Q block)
-    //   smem_S:    [Br, Bc] float (S → P, then reused for dQ chunks)
-    //   smem_dP:   [Br, Bc] float (dP → dS)
-    //   smem_half: [Br, Bc] half  (P_half → dS_half)
-    //   staging:   [NUM_WARPS, 16*16] float (dK/dV write-back)
-    // dK, dV are accumulated in registers (WarpAccum fragments) for the whole block.
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
-    half*  smem_K    = reinterpret_cast<half*>(smem_raw);
-    half*  smem_V    = smem_K + Bc * D;
-    half*  smem_Q    = smem_V + Bc * D;
-    half*  smem_dO   = smem_Q + Br * D;
-    float* smem_S    = reinterpret_cast<float*>(smem_dO + Br * D);
-    float* smem_dP   = smem_S + Br * Bc;
-    half*  smem_half = reinterpret_cast<half*>(smem_dP + Br * Bc);
-    float* staging   = reinterpret_cast<float*>(smem_half + Br * Bc);
+    half*  smem_K  = reinterpret_cast<half*>(smem_raw);
+    half*  smem_V  = smem_K + Bc * LDH;
+    half*  smem_Q  = smem_V + Bc * LDH;
+    half*  smem_dO = smem_Q + Br * LDH;
+    float* smem_L  = reinterpret_cast<float*>(smem_dO + Br * LDH);  // L * log2(e)
+    float* smem_D  = smem_L + Br;
+    half*  smem_dSt = reinterpret_cast<half*>(smem_D + Br);           // dS^T [Bc, LDB]
+    half*  wbuf = smem_dSt + Bc * LDB + warp_id * (16 * LDB);         // this warp's [16, LDB]
+    float* wstage = reinterpret_cast<float*>(wbuf);                   // same bytes, as 16x16 float
 
-    WarpAccum<Bc, D, NUM_WARPS> dK_acc, dV_acc;
-    dK_acc.zero();
-    dV_acc.zero();
+    int e_row[NE], e_col[NE];  // position of each accumulator element in its 16x16 tile
+    wmma_acc_layout(wstage, lane, e_row, e_col);
 
-    // Load K, V (stay for entire block)
-    load_tile_g2s<Bc, D, NUM_THREADS>(K_blk, params.k_seq_stride, smem_K, valid_kv);
-    load_tile_g2s<Bc, D, NUM_THREADS>(V_blk, params.v_seq_stride, smem_V, valid_kv);
-    __syncthreads();
+    Acc dK[DPT], dV[DPT];
+    #pragma unroll
+    for (int t = 0; t < DPT; t++) {
+        wmma::fill_fragment(dK[t], 0.0f);
+        wmma::fill_fragment(dV[t], 0.0f);
+    }
+
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride
+                                           + kv_start * params.k_seq_stride, params.k_seq_stride, smem_K, valid_kv);
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride
+                                           + kv_start * params.v_seq_stride, params.v_seq_stride, smem_V, valid_kv);
 
     const int num_q_blocks = cdiv(params.seq_len_q, Br);
+    const int q_first_blk = bwd_first_q_block(params.is_causal, kv_start, Br, params.seq_len_q, params.seq_len_k);
+    const half* K_band = smem_K + band * T * LDH;
+    const half* V_band = smem_V + band * T * LDH;
 
-    // Loop over Q heads that map to this KV head
     for (int qh = 0; qh < heads_per_kv; qh++) {
         const int h_idx = kv_h_idx * heads_per_kv + qh;
-        const int q_start_blk = bwd_first_q_block(params.is_causal, kv_start, Br, params.seq_len_q, params.seq_len_k);
-
-    for (int q_blk = q_start_blk; q_blk < num_q_blocks; q_blk++) {
-        const int q_start = q_blk * Br;
-        const int valid_q = min(Br, params.seq_len_q - q_start);
-
-        // Load Q, dO
-        const half* Q_ptr = params.Q + b_idx * params.q_batch_stride
-                                     + h_idx * params.q_head_stride
-                                     + q_start * params.q_seq_stride;
-        const half* dO_ptr = params.dO + b_idx * params.o_batch_stride
-                                       + h_idx * params.o_head_stride
-                                       + q_start * params.o_seq_stride;
-
-        load_tile_g2s<Br, D, NUM_THREADS>(Q_ptr, params.q_seq_stride, smem_Q, valid_q);
-        load_tile_g2s<Br, D, NUM_THREADS>(dO_ptr, params.o_seq_stride, smem_dO, valid_q);
-        __syncthreads();
-
-        // L, D pointers (Q head indexed)
-        const float* L_ptr = params.L + b_idx * params.l_batch_stride
-                                      + h_idx * params.l_head_stride + q_start;
-        const float* D_ptr = params.D + b_idx * params.l_batch_stride
-                                      + h_idx * params.l_head_stride + q_start;
-
-        // ---- Step 1: S = Q @ K^T via WMMA ----
-        wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_Q, smem_K, smem_S, warp_id);
-        __syncthreads();
-
-        // ---- Step 2: P = exp(S * scale - L), with masking ----
-        {
-            constexpr int total_elems = Br * Bc;
-            #pragma unroll
-            for (int i = tid; i < total_elems; i += NUM_THREADS) {
-                int qi = i / Bc;
-                int kj = i % Bc;
-                float s = smem_S[i] * params.softmax_scale;
-                bool invalid = (q_start + qi >= params.seq_len_q) ||
-                               (kv_start + kj >= params.seq_len_k) ||
-                               (params.is_causal &&
-                                (kv_start + kj) > (q_start + qi + (params.seq_len_k - params.seq_len_q)));
-                float p = invalid ? 0.0f : expf(s - L_ptr[qi]);
-                smem_S[i] = p;  // S now holds P
+        for (int q_blk = q_first_blk; q_blk < num_q_blocks; q_blk++) {
+            const int q_start = q_blk * Br;
+            const int valid_q = min(Br, params.seq_len_q - q_start);
+            load_tile_g2s<Br, D, NUM_THREADS, LDH>(params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
+                                                   + q_start * params.q_seq_stride, params.q_seq_stride, smem_Q, valid_q);
+            load_tile_g2s<Br, D, NUM_THREADS, LDH>(params.dO + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
+                                                   + q_start * params.o_seq_stride, params.o_seq_stride, smem_dO, valid_q);
+            const int lse_off = b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_start;
+            for (int i = tid; i < Br; i += NUM_THREADS) {
+                // Rows past the sequence: P = 0 through the mask, D never used
+                smem_L[i] = (i < valid_q) ? params.L[lse_off + i] * kLog2e : 0.0f;
+                smem_D[i] = (i < valid_q) ? params.D[lse_off + i] : 0.0f;
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // ---- Step 3: P_half for WMMA ----
-        {
-            constexpr int total_P = Br * Bc;
+            // S^T and dP^T for the band: [16 keys, Br queries] as QT fragments
+            Acc S[QT], dP[QT];
             #pragma unroll
-            for (int i = tid; i < total_P; i += NUM_THREADS)
-                smem_half[i] = __float2half(smem_S[i]);
-        }
-        __syncthreads();
-
-        // ---- Step 4: dV_acc += P_half^T @ dO via WMMA (registers) ----
-        dV_acc.template add_AtB<Br>(smem_half, Bc,   // A = P_half [Br, Bc], stride Bc
-                           smem_dO, D,      // B = dO [Br, D], stride D
-                           warp_id);
-        __syncthreads();
-
-        // ---- Step 5: dP = dO @ V^T via WMMA ----
-        wmma_gemm_ABt<Br, Bc, D, NUM_WARPS>(smem_dO, smem_V, smem_dP, warp_id);
-        __syncthreads();
-
-        // ---- Step 6: dS_scaled = P * (dP - D) * scale ----
-        {
-            constexpr int total_elems = Br * Bc;
-            #pragma unroll
-            for (int i = tid; i < total_elems; i += NUM_THREADS) {
-                int qi = i / Bc;
-                float p = smem_S[i];     // P from step 2
-                float dp = smem_dP[i];
-                // Padding rows (qi >= valid_q) have P == 0; don't read D past the
-                // sequence end (OOB, and 0 * NaN would poison dK).
-                float ds = (qi < valid_q) ? p * (dp - D_ptr[qi]) : 0.0f;
-                smem_dP[i] = ds * params.softmax_scale;  // dS_scaled
+            for (int qt = 0; qt < QT; qt++) {
+                wmma::fill_fragment(S[qt], 0.0f);
+                wmma::fill_fragment(dP[qt], 0.0f);
             }
-        }
-        // smem_S (P) is now free!
-        __syncthreads();
-
-        // ---- Step 7: dS_half ----
-        {
-            constexpr int total_dS = Br * Bc;
             #pragma unroll
-            for (int i = tid; i < total_dS; i += NUM_THREADS)
-                smem_half[i] = __float2half(smem_dP[i]);
+            for (int k = 0; k < D; k += T) {
+                FragA ka, va;
+                wmma::load_matrix_sync(ka, K_band + k, LDH);
+                wmma::load_matrix_sync(va, V_band + k, LDH);
+                #pragma unroll
+                for (int qt = 0; qt < QT; qt++) {
+                    FragBt qb, ob;  // Q^T, dO^T: [k, queries] = rows of Q / dO read column-major
+                    wmma::load_matrix_sync(qb, smem_Q + qt * T * LDH + k, LDH);
+                    wmma::load_matrix_sync(ob, smem_dO + qt * T * LDH + k, LDH);
+                    wmma::mma_sync(S[qt], ka, qb, S[qt]);
+                    wmma::mma_sync(dP[qt], va, ob, dP[qt]);
+                }
+            }
+
+            // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as
+            // half into the warp buffer for dV += P^T dO
+            #pragma unroll
+            for (int qt = 0; qt < QT; qt++) {
+                #pragma unroll
+                for (int i = 0; i < NE; i++) {
+                    const int key = kv_start + band * T + e_row[i];
+                    const int q = qt * T + e_col[i];  // row within the query block
+                    const bool masked = q >= valid_q || key >= params.seq_len_k ||
+                                        (params.is_causal && key > q_start + q + causal_off);
+                    const float p = masked ? 0.0f : exp2f(S[qt].x[i] * scale_log2 - smem_L[q]);
+                    S[qt].x[i] = p;
+                    dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * params.softmax_scale;
+                    wbuf[e_row[i] * LDB + q] = __float2half(p);
+                }
+            }
+            __syncwarp();
+            #pragma unroll
+            for (int k = 0; k < Br; k += T) {
+                FragA pa;
+                wmma::load_matrix_sync(pa, wbuf + k, LDB);
+                #pragma unroll
+                for (int t = 0; t < DPT; t++) {
+                    FragB ob;
+                    wmma::load_matrix_sync(ob, smem_dO + k * LDH + part * DP + t * T, LDH);
+                    wmma::mma_sync(dV[t], pa, ob, dV[t]);
+                }
+            }
+            __syncwarp();  // P^T reads done before dS^T overwrites the buffer
+
+            // dS^T: into the warp buffer (dK += dS^T Q) and, once per band, into the
+            // shared dS^T for dQ
+            #pragma unroll
+            for (int qt = 0; qt < QT; qt++) {
+                #pragma unroll
+                for (int i = 0; i < NE; i++) {
+                    const half ds = __float2half(dP[qt].x[i]);
+                    wbuf[e_row[i] * LDB + qt * T + e_col[i]] = ds;
+                    if (part == 0) smem_dSt[(band * T + e_row[i]) * LDB + qt * T + e_col[i]] = ds;
+                }
+            }
+            __syncwarp();
+            #pragma unroll
+            for (int k = 0; k < Br; k += T) {
+                FragA dsa;
+                wmma::load_matrix_sync(dsa, wbuf + k, LDB);
+                #pragma unroll
+                for (int t = 0; t < DPT; t++) {
+                    FragB qb;
+                    wmma::load_matrix_sync(qb, smem_Q + k * LDH + part * DP + t * T, LDH);
+                    wmma::mma_sync(dK[t], dsa, qb, dK[t]);
+                }
+            }
+            __syncthreads();  // shared dS^T complete; warp buffers free for staging
+
+            // dQ[Br, D] += dS K: output tiles spread over the warps, staged per warp
+            // and added with coalesced atomics
+            float* dQ_blk = params.dQ + b_idx * params.dq_batch_stride + h_idx * params.dq_head_stride
+                                      + q_start * params.dq_seq_stride;
+            constexpr int DQ_TILES = QT * (D / T);
+            #pragma unroll
+            for (int tile = warp_id; tile < DQ_TILES; tile += NUM_WARPS) {
+                const int qr = tile / (D / T), dc = tile % (D / T);
+                Acc acc;
+                wmma::fill_fragment(acc, 0.0f);
+                #pragma unroll
+                for (int k = 0; k < Bc; k += T) {
+                    FragAt dsa;  // dS [queries, keys] = shared dS^T read column-major
+                    FragB kb;
+                    wmma::load_matrix_sync(dsa, smem_dSt + k * LDB + qr * T, LDB);
+                    wmma::load_matrix_sync(kb, smem_K + k * LDH + dc * T, LDH);
+                    wmma::mma_sync(acc, dsa, kb, acc);
+                }
+                wmma::store_matrix_sync(wstage, acc, T, wmma::mem_row_major);
+                __syncwarp();
+                #pragma unroll
+                for (int e = lane; e < T * T; e += 32) {
+                    const int row = qr * T + e / T;
+                    if (row < valid_q) ::atomicAdd(dQ_blk + row * params.dq_seq_stride + dc * T + e % T, wstage[e]);
+                }
+                __syncwarp();
+            }
+            // No barrier here: the next query block first writes Q, dO, L, D (not
+            // read by the dQ step) and writes dS^T only after its first barrier.
         }
-        __syncthreads();
+    }
 
-        // ---- Step 8: dK_acc += dS_half^T @ Q via WMMA (registers) ----
-        dK_acc.template add_AtB<Br>(smem_half, Bc,   // A = dS_half [Br, Bc], stride Bc
-                           smem_Q, D,       // B = Q [Br, D], stride D
-                           warp_id);
-        __syncthreads();
-
-        // ---- Step 9: dQ += dS @ K (atomicAdd to global FP32 buffer) ----
-        float* dQ_ptr = params.dQ + b_idx * params.dq_batch_stride
-                                  + h_idx * params.dq_head_stride
-                                  + q_start * params.dq_seq_stride;
-
+    // dK, dV of the warp's band and slice, through the 16x16 float staging
+    half* dK_out = params.dK + b_idx * params.dk_batch_stride + kv_h_idx * params.dk_head_stride
+                             + (kv_start + band * T) * params.dk_seq_stride + part * DP;
+    half* dV_out = params.dV + b_idx * params.dv_batch_stride + kv_h_idx * params.dv_head_stride
+                             + (kv_start + band * T) * params.dv_seq_stride + part * DP;
+    const int band_valid = valid_kv - band * T;  // may be <= 0 for the last block
+    auto store = [&](Acc& frag, half* out, int stride) {
+        wmma::store_matrix_sync(wstage, frag, T, wmma::mem_row_major);
+        __syncwarp();
         #pragma unroll
-        for (int dn = 0; dn < D; dn += DQ_CHUNK) {
-            // dQ_chunk[Br, DQ_CHUNK] = dS_half[Br, Bc] @ K[Bc, dn:dn+DQ_CHUNK]
-            wmma_gemm_AB<Br, DQ_CHUNK, Bc, NUM_WARPS>(
-                smem_half,          // A = dS_half [Br, Bc]
-                smem_K + dn, D,     // B = K[:, dn:], stride D
-                smem_S,             // C = reuse smem_S [Br, DQ_CHUNK]
-                warp_id);
-            __syncthreads();
-
-            // AtomicAdd to global dQ
-            constexpr int chunk_elems = Br * DQ_CHUNK;
-            #pragma unroll
-            for (int i = tid; i < chunk_elems; i += NUM_THREADS) {
-                int qi = i / DQ_CHUNK;
-                int dj = i % DQ_CHUNK;
-                if (qi < valid_q)
-                    ::atomicAdd(&dQ_ptr[qi * params.dq_seq_stride + dn + dj], smem_S[i]);
-            }
-            __syncthreads();
+        for (int e = lane; e < T * T; e += 32) {
+            if (e / T < band_valid) out[(e / T) * stride + e % T] = __float2half(wstage[e]);
         }
-    }  // end q_blk
-    }  // end qh (GQA)
-
-    // Write dK, dV from the register accumulators to global memory
-    {
-        half* dK_out = params.dK + b_idx * params.dk_batch_stride
-                                 + kv_h_idx * params.dk_head_stride
-                                 + kv_start * params.dk_seq_stride;
-        half* dV_out = params.dV + b_idx * params.dv_batch_stride
-                                 + kv_h_idx * params.dv_head_stride
-                                 + kv_start * params.dv_seq_stride;
-        float* warp_staging = staging + warp_id * 16 * 16;
-        const int lane = tid % 32;
-        dK_acc.store_half(dK_out, params.dk_seq_stride, valid_kv, warp_staging, warp_id, lane);
-        dV_acc.store_half(dV_out, params.dv_seq_stride, valid_kv, warp_staging, warp_id, lane);
+        __syncwarp();
+    };
+    #pragma unroll
+    for (int t = 0; t < DPT; t++) {
+        store(dK[t], dK_out + t * T, params.dk_seq_stride);
+        store(dV[t], dV_out + t * T, params.dv_seq_stride);
     }
 }
 
@@ -465,22 +489,37 @@ void precompute_D(
     );
 }
 
-// Same dispatch scheme as the forward launchers, with one tile per head_dim,
-// checked against the device's shared memory per block (clear error instead of
-// a failed launch). With dK/dV in registers every WMMA backward tile fits 48 KB.
-template <bool kWmma, typename F>
-static void dispatch_bwd_tile(int head_dim, F&& f) {
+// Tiles per head_dim. CUDA-core: sizes measured in P5.2. WMMA: kSplitD keeps
+// dK / dV in registers (d / kSplitD columns per warp); lists in order of
+// preference, the first that fits the device's shared memory per block is used.
+template <typename F>
+static void dispatch_bwd_simt_tile(int head_dim, F&& f) {
     const int limit = max_dynamic_smem_per_block();
     bool ok = false;
     switch (head_dim) {
-        case 32:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 32, 32>>(limit, f); break;
-        case 64:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 32, 64>>(limit, f); break;
-        case 96:  ok = with_first_fitting_tile<BwdTile<kWmma, 32, 16, 96>>(limit, f); break;
-        case 128: ok = with_first_fitting_tile<BwdTile<kWmma, 16, 16, 128>>(limit, f); break;
-        case 256: ok = with_first_fitting_tile<BwdTile<kWmma, 16, 16, 256>>(limit, f); break;
+        case 32:  ok = with_first_fitting_tile<BwdTileSimt<32, 32, 32>>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<BwdTileSimt<32, 32, 64>>(limit, f); break;
+        case 96:  ok = with_first_fitting_tile<BwdTileSimt<32, 16, 96>>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 128>>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 256>>(limit, f); break;
         default:  throw std::runtime_error("Unsupported head_dim for the backward");
     }
-    if (!ok) throw_no_tile(kWmma ? "WMMA backward" : "CUDA-core backward", head_dim, limit);
+    if (!ok) throw_no_tile("CUDA-core backward", head_dim, limit);
+}
+
+template <typename F>
+static void dispatch_bwd_wmma_tile(int head_dim, F&& f) {
+    const int limit = max_dynamic_smem_per_block();
+    bool ok = false;
+    switch (head_dim) {
+        case 32:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 32>>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 64>>(limit, f); break;
+        case 96:  ok = with_first_fitting_tile<BwdTileWmma<32, 64, 96, 2>, BwdTileWmma<32, 32, 96, 2>>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<BwdTileWmma<32, 64, 128, 2>, BwdTileWmma<32, 32, 128, 2>>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<BwdTileWmma<32, 32, 256, 4>, BwdTileWmma<32, 16, 256, 4>>(limit, f); break;
+        default:  throw std::runtime_error("Unsupported head_dim for the backward");
+    }
+    if (!ok) throw_no_tile("WMMA backward", head_dim, limit);
 }
 
 template <typename Tile, typename Kernel>
@@ -494,14 +533,14 @@ static void launch_bwd(Kernel kernel, FlashAttnBwdParams& params, cudaStream_t s
 }
 
 void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    dispatch_bwd_tile<true>(params.head_dim, [&](auto tile) {
+    dispatch_bwd_wmma_tile(params.head_dim, [&](auto tile) {
         using T = decltype(tile);
         launch_bwd<T>(flash_attn_bwd_volta_kernel<T>, params, stream);
     });
 }
 
 void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    dispatch_bwd_tile<false>(params.head_dim, [&](auto tile) {
+    dispatch_bwd_simt_tile(params.head_dim, [&](auto tile) {
         using T = decltype(tile);
         launch_bwd<T>(flash_attn_bwd_kernel<T>, params, stream);
     });

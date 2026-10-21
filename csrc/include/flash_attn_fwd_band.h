@@ -26,8 +26,6 @@ namespace flash_attn_legacy {
 
 #ifdef __CUDACC__
 
-constexpr float kLog2e = 1.4426950408889634f;
-constexpr float kLn2 = 0.6931471805599453f;
 constexpr int kBandRows = 16;  // query rows per warp
 
 // One Q block: its rows start at Q / O / L (row strides q_stride / o_stride /

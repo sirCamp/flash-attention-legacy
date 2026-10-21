@@ -373,41 +373,23 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 
 ### Forward pass
 
-**Volta (SM 7.0):**
-- S = Q @ K^T via `wmma::mma_sync` (16x16x16 tensor core fragments)
-- P stored in shared memory as float, converted to half for WMMA
-- O += P @ V via `wmma::mma_sync` (P converted to half, output in float registers)
-- Tiles: Br=128, Bc=64 (d=64) / Br=128, Bc=32 (d=128)
+Both families share one band forward (`csrc/include/flash_attn_fwd_band.h`): each warp owns 16 query rows of the block, the online softmax runs in the log2 domain with warp-shuffle reductions, K/V blocks are prefetched into registers while the current one is computed, masking is applied only to the blocks that need it (sequence tail, causal diagonal) and causal blocks a warp cannot see are skipped.
 
-**Pascal (SM 6.0/6.1):**
-- S = Q @ K^T: `half2` vectorized loads, products and sums in FP32 (`fmaf`). FP16 products could overflow (|q_i k_i| > 65504) and FP16 math runs at 1/64 rate on SM 6.1 (GTX 1080/Ti)
-- Same shared-memory P buffer strategy as Volta
-- Tiles: Br=128, Bc=32 (d=64) / Br=64, Bc=16 (d=128)
-- Vectorized `half2` loads/stores throughout
+**Volta / Turing (SM 7.0 / 7.5):** S = Q @ K^T and O += P @ V with `wmma::mma_sync` (16x16x16 tensor cores); S goes through a small per-warp staging tile for the softmax, P is written back as half, O stays in accumulator fragments (registers). Tiles of 128 query rows (8 warps); d=128/256 use larger tiles where the GPU has 96 KB of shared memory per block (V100) and 64 KB ones otherwise (T4).
+
+**Pascal (SM 6.0 / 6.1):** fp32 register micro-tiles on CUDA cores: each lane holds 4 rows x Bc/8 keys and d/8 output columns; Q, K, V are converted to fp32 once, when stored to shared memory, so the inner products have no conversions and no fp16 products (no overflow; fp16 math runs at 1/64 rate on SM 6.1).
+
+Tiles per head_dim are chosen by measurement (comments next to `TileVolta_*` / `TilePascal_*` in `csrc/include/flash_attn_common.h`).
 
 ### Backward pass
 
-**Volta (SM 7.0):**
-- **D = rowsum(dO * O)** precomputed in a separate kernel
-- All 5 matmuls use `wmma::mma_sync` (16x16x16 tensor core fragments):
-  - S = Q @ K^T (recompute), dP = dO @ V^T, dV += P^T @ dO, dK += dS^T @ Q, dQ += dS @ K
-- **dK, dV** accumulated in shared memory FP32 buffers with WMMA in-place accumulation
-- **dQ** accumulated in global FP32 buffer with `atomicAdd`
+**D = rowsum(dO * O)** is precomputed in a separate kernel; each block owns Bc keys and loops over the query blocks (and the Q heads of its KV head, GQA).
 
-**Pascal (SM 6.0/6.1):**
-- Same algorithm on CUDA cores (FP32 math, no tensor cores)
-- **dQ** accumulated in FP32 with `atomicAdd`
-- **dK, dV** accumulated in per-thread FP32 registers, converted to FP16 on writeback
-- Multi-thread per KV row with warp shuffle reduction
+**Volta / Turing:** each warp owns a band of 16 keys (and a slice of d for d >= 96) and computes S^T, P^T, dP^T, dS^T as WMMA fragments, with the element-wise steps done on the fragments; dK, dV accumulate in registers; dS^T is shared through shared memory so that all warps compute dQ = dS @ K, added to an FP32 buffer with one coalesced `atomicAdd` per element and key block.
 
-### Register budget
+**Pascal:** the [Br, Bc] tile of S / P / dP / dS is computed cooperatively in FP32 (128-bit loads), dK, dV accumulate in registers, dQ with one `atomicAdd` per element and key block.
 
-| Config | Regs/thread | Shared mem | Thread util |
-|---|---|---|---|
-| Pascal d=64, Br=128 | 256 bytes | 40 KB | 100% |
-| Pascal d=128, Br=64 | 512 bytes | 28 KB | 100% |
-| Volta d=64, Br=128 | 256 bytes | 64 KB | 100% |
-| Volta d=128, Br=128 | 512 bytes | 64 KB | 100% |
+Performance against PyTorch SDPA (memory-efficient backend) on every supported GPU: `python benchmarks/benchmark.py`, results in `docs/bench/`.
 
 ## Testing
 

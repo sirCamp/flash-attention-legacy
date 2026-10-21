@@ -255,26 +255,32 @@ inline bool with_first_fitting_tile(int smem_limit, F& f) {
 }
 
 // ---------------------------------------------------------------------------
-// Backward tile sizes — same template scheme as the forward.
-// WMMA: Br, Bc, d multiples of 16; d % Bc == 0 (dQ in chunks of Bc).
-// CUDA-core: threads % Br == 0 and % Bc == 0, with an even number of columns
-// per thread for dK/dV and dQ (static_asserts in the kernel).
+// Backward tile sizes — same template scheme as the forward. A block owns Bc
+// keys (dK/dV for them) and loops over the query blocks of Br rows.
 // ---------------------------------------------------------------------------
 
-// WMMA backward (Volta / Turing): K, V [Bc,d], Q, dO [Br,d] (half); S/P and
-// dP/dS [Br,Bc] (float); P/dS [Br,Bc] (half); one 16x16 float staging tile per
-// warp for writing back dK/dV, which are accumulated in registers (WMMA
-// accumulator fragments) for the whole block, not in shared memory.
-template <int Br_, int Bc_, int d_, int kNumWarps_ = 4>
+// WMMA backward (Volta / Turing), FA2-style: warp w owns the band of 16 keys
+// (w / kSplitD) and the slice (w % kSplitD) of d / kSplitD columns of dK / dV,
+// accumulated in WMMA fragments (registers). Shared memory: K, V [Bc,kLdH],
+// Q, dO [Br,kLdH] (half, rows padded by 8), L, D [Br] (float), dS^T [Bc,kLdB]
+// (half, key-major, for dQ = dS K), and per warp a [16,kLdB] half buffer (P^T,
+// then dS^T, as WMMA operands; also the float staging of dQ / dK / dV tiles and
+// the one-time fragment layout probe, hence Br >= 32).
+template <int Br_, int Bc_, int d_, int kSplitD_ = 1>
 struct BwdTileWmma {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
-    static constexpr int kNumWarps = kNumWarps_;
+    static constexpr int kSplitD = kSplitD_;
+    static constexpr int kNumWarps = (Bc_ / 16) * kSplitD_;
+    static constexpr int kLdH = d_ + 8;
+    static constexpr int kLdB = Br_ + 8;
+    static constexpr int kWarpBufBytes = 16 * kLdB * 2;
     static constexpr int smem_bytes() {
-        return (2 * Bc * d + 2 * Br * d) * 2 + 2 * Br * Bc * 4 + Br * Bc * 2 + kNumWarps * 256 * 4;
+        return (2 * Bc + 2 * Br) * kLdH * 2 + 2 * Br * 4 + Bc * kLdB * 2 + kNumWarps * kWarpBufBytes;
     }
-    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % Bc_ == 0, "invalid WMMA backward tile");
+    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % (16 * kSplitD_) == 0, "invalid WMMA backward tile");
+    static_assert(kWarpBufBytes >= 256 * 4 + 256, "warp buffer too small for the layout probe (Br >= 32)");
 };
 
 // CUDA-core backward (Pascal): K, V [Bc,kLdH], Q, dO [Br,kLdH] (half, rows padded
@@ -296,11 +302,6 @@ struct BwdTileSimt {
     static_assert((kNumWarps_ * 32) % Br_ == 0 && (kNumWarps_ * 32) % Bc_ == 0,
                   "invalid CUDA-core backward tile");
 };
-
-// Backward tile of either family with the same sizes (the sizes per head_dim
-// are listed once, in the backward dispatcher).
-template <bool kWmma, int Br, int Bc, int d>
-using BwdTile = std::conditional_t<kWmma, BwdTileWmma<Br, Bc, d>, BwdTileSimt<Br, Bc, d>>;
 
 // ---------------------------------------------------------------------------
 // Error checking macro
@@ -340,6 +341,10 @@ inline int max_dynamic_smem_per_block() {
                              std::to_string(head_dim) + " fits " + std::to_string(smem_limit) +
                              " bytes of shared memory per block");
 }
+
+// Softmax in the log2 domain (exp2 is one instruction): scores * scale * log2(e).
+constexpr float kLog2e = 1.4426950408889634f;
+constexpr float kLn2 = 0.6931471805599453f;
 
 // ---------------------------------------------------------------------------
 // Utility: ceiling division

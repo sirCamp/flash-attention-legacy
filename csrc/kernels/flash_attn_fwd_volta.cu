@@ -36,7 +36,7 @@ namespace flash_attn_legacy {
 // chunks, and P is written back in place as half (row stride 2*LDS) for the
 // P @ V fragments. To rescale O rows without assuming the accumulator layout,
 // each lane learns once which row each of its fragment elements belongs to
-// (store_matrix_sync of a fragment holding its own element ids).
+// (wmma_acc_layout).
 // ---------------------------------------------------------------------------
 struct VoltaFwd {
 template <typename Tile>
@@ -53,8 +53,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int O_TILES = d / T;    // O fragments per warp
     constexpr int CHUNKS = Bc / 8;    // float4 chunks of S per lane (two lanes per row)
     using Acc = wmma::fragment<wmma::accumulator, T, T, T, float>;
-    constexpr int NE = Acc::num_elements;
-    static_assert(NE * 32 == T * T, "unexpected WMMA accumulator size");
+    constexpr int NE = kAccElems;
 
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_Q = reinterpret_cast<half*>(smem_raw);
@@ -75,24 +74,8 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     const float scale_log2 = a.softmax_scale * kLog2e;
 
     // Row of each accumulator element of this lane (identical for every fragment).
-    int row_of[NE];
-    {
-        Acc probe;
-        #pragma unroll
-        for (int i = 0; i < NE; i++) probe.x[i] = static_cast<float>(lane * NE + i);
-        wmma::store_matrix_sync(stage, probe, T, wmma::mem_row_major);
-        __syncwarp();
-        unsigned char* table = reinterpret_cast<unsigned char*>(stage + T * T);
-        #pragma unroll
-        for (int k = 0; k < NE; k++) {
-            const int e = lane + 32 * k;
-            table[static_cast<int>(stage[e])] = static_cast<unsigned char>(e / T);
-        }
-        __syncwarp();
-        #pragma unroll
-        for (int i = 0; i < NE; i++) row_of[i] = table[lane * NE + i];
-        __syncwarp();
-    }
+    int row_of[NE], col_unused[NE];
+    wmma_acc_layout(stage, lane, row_of, col_unused);
 
     Acc O[O_TILES];
     #pragma unroll
