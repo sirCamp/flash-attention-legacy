@@ -376,8 +376,8 @@ static void dispatch_volta_fwd_tile(int head_dim, F&& f) {
         case 32:  ok = with_first_fitting_tile<TileVolta_d32>(limit, f); break;
         case 64:  ok = with_first_fitting_tile<TileVolta_d64>(limit, f); break;
         case 96:  ok = with_first_fitting_tile<TileVolta_d96>(limit, f); break;
-        case 128: ok = with_first_fitting_tile<TileVolta_d128>(limit, f); break;
-        case 256: ok = with_first_fitting_tile<TileVolta_d256>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<TileVolta_d128, TileVolta_d128_64k>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<TileVolta_d256, TileVolta_d256_64k>(limit, f); break;
         default:  throw std::runtime_error("Unsupported head_dim for the WMMA forward");
     }
     if (!ok) throw_no_tile("WMMA forward", head_dim, limit);

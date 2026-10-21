@@ -200,13 +200,20 @@ struct FwdTileSimt {
     static_assert(kLdQ % 8 == 0, "128-bit row reads need 16-byte aligned Q rows");
 };
 
-// WMMA forward tiles: 4 warps (64 rows); Bc as large as registers and the 64 KB
-// per block of Turing allow (docs/analysis/kernels/p2_8_design.md).
-using TileVolta_d32  = FwdTileWmma<64, 64, 32>;     // 34 KB
-using TileVolta_d64  = FwdTileWmma<64, 64, 64>;     // 45 KB
-using TileVolta_d96  = FwdTileWmma<64, 32, 96>;     // 36 KB
-using TileVolta_d128 = FwdTileWmma<64, 32, 128>;    // 44 KB
-using TileVolta_d256 = FwdTileWmma<64, 16, 256>;    // 56 KB
+// WMMA forward tiles, in order of preference (the first that fits the device's
+// shared memory per block is used: V100 96 KB, T4 64 KB). Measured, forward
+// causal B=2 H=16 N=4096 (P2.8): 8 warps (128 rows) beat 4 warps everywhere
+// (more warps share each K/V tile load); V100 / T4 in ms vs <64,Bc,d>:
+// d=32 2.2 / 4.1 vs 3.1 / 7.9; d=64 3.0 / 6.8 vs 5.6 / 14.2; d=96 4.6 / 10.0
+// vs 8.4 / 20.7; d=128 8.2 (Bc=32) / 12.5 (Bc=16) vs 11.6 / 27.9; d=256 15.2
+// (V100) vs 35.9; on T4 d=256 stays at 4 warps (55 ms; 8 warps do not fit).
+using TileVolta_d32  = FwdTileWmma<128, 32, 32>;    // 36 KB
+using TileVolta_d64  = FwdTileWmma<128, 32, 64>;    // 48 KB
+using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 45 KB
+using TileVolta_d128 = FwdTileWmma<128, 32, 128>;   // 72 KB (V100)
+using TileVolta_d128_64k = FwdTileWmma<128, 16, 128>;  // 55 KB
+using TileVolta_d256 = FwdTileWmma<128, 16, 256>;   // 95 KB (V100)
+using TileVolta_d256_64k = FwdTileWmma<64, 16, 256>;   // 56 KB
 
 using TilePascal_d32  = FwdTileSimt<128, 32, 32>;   // 14 KB
 using TilePascal_d64  = FwdTileSimt<128, 32, 64>;   // 26 KB

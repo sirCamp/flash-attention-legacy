@@ -953,6 +953,14 @@ class TestForwardContract:
             torch.testing.assert_close(out[s:e], ref, atol=2e-2, rtol=2e-2)
             assert_lse_close(lse[s:e].transpose(0, 1), ref_lse(qi, ki, scale, causal)[0])
 
+    @pytest.mark.parametrize("d", [128, 256])
+    def test_64k_fallback_tile(self, monkeypatch, d):
+        """The 64 KB fallback tiles (what a T4 runs) also on GPUs with more shared
+        memory, so every tile of every list is exercised on every test box."""
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_SMEM_LIMIT", "65536")
+        self.test_output_and_lse(d, 130, 200, True)
+        self.test_varlen_short_segments(d, True)
+
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
         import flash_attn_legacy_cuda
