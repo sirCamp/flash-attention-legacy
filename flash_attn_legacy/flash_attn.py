@@ -162,8 +162,7 @@ def flash_attention(
 class FlashAttnVarlenFunc(Function):
     """
     Autograd function for variable-length (packed) Flash Attention.
-    Forward uses native CUDA kernel (single launch for all sequences).
-    Backward unpacks and calls per-sequence backward.
+    Forward and backward use native CUDA kernels (one launch for all sequences).
     """
 
     @staticmethod
@@ -184,6 +183,7 @@ class FlashAttnVarlenFunc(Function):
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.max_seqlen_q, ctx.max_seqlen_k = max_seqlen_q, max_seqlen_k
         return o
 
     @staticmethod
@@ -191,40 +191,10 @@ class FlashAttnVarlenFunc(Function):
         q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        batch_size = cu_seqlens_q.shape[0] - 1
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-
-        # Per-sequence backward using the batched backward kernel (one host sync
-        # for the boundaries; native varlen backward: docs/PLAN.md P2.4)
-        cu_q, cu_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
-        for i in range(batch_size):
-            qs, qe = cu_q[i], cu_q[i + 1]
-            ks, ke = cu_k[i], cu_k[i + 1]
-            if qe == qs:
-                continue
-
-            # Extract per-sequence tensors: [seq, H, d] → [1, H, seq, d]
-            qi = q[qs:qe].permute(1, 0, 2).unsqueeze(0).contiguous()
-            ki = k[ks:ke].permute(1, 0, 2).unsqueeze(0).contiguous()
-            vi = v[ks:ke].permute(1, 0, 2).unsqueeze(0).contiguous()
-            oi = o[qs:qe].permute(1, 0, 2).unsqueeze(0).contiguous()
-            doi = grad_output[qs:qe].permute(1, 0, 2).unsqueeze(0).contiguous()
-
-            # LSE: [total_q, H_q] → extract [seq_q, H_q] → reshape to [1, H_q, seq_q]
-            lse_i = lse[qs:qe].permute(1, 0).unsqueeze(0).contiguous()  # [1, H_q, seq_q]
-
-            dqi, dki, dvi = flash_attn_legacy_cuda.backward(
-                doi, qi, ki, vi, oi, lse_i,
-                ctx.softmax_scale, ctx.causal,
-            )
-
-            # [1, H, seq, d] → [seq, H, d]
-            dq[qs:qe] = dqi.squeeze(0).permute(1, 0, 2)
-            dk[ks:ke] += dki.squeeze(0).permute(1, 0, 2)
-            dv[ks:ke] += dvi.squeeze(0).permute(1, 0, 2)
-
+        dq, dk, dv = flash_attn_legacy_cuda.backward_varlen(
+            grad_output, q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k,
+            ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal,
+        )
         return dq, dk, dv, None, None, None, None, None, None
 
 
@@ -247,7 +217,7 @@ def flash_attn_varlen_func(
     boundaries. This avoids wasting compute/memory on padding tokens.
 
     Forward uses a native CUDA kernel (single launch for all sequences).
-    Backward uses per-sequence calls to the batched backward kernel.
+    Forward and backward each run as one kernel launch for all sequences.
 
     Args:
         q: [total_q, num_heads, head_dim] float16 (bfloat16 / float32 for inference,

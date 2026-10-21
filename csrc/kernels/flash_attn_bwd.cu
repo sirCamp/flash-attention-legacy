@@ -1,10 +1,11 @@
 // ============================================================================
 // Flash Attention v2 — Backward kernels
-//   - flash_attn_bwd_kernel: CUDA cores (Pascal; FORCE_ARCH=pascal elsewhere)
-//   - flash_attn_bwd_volta_kernel: WMMA tensor cores (Volta / Turing)
+//   - BwdSimt: CUDA cores (Pascal; FORCE_ARCH=pascal elsewhere)
+//   - BwdWmma: WMMA tensor cores (Volta / Turing)
+//   - bwd_batched_kernel / bwd_varlen_kernel: locate the key block, run a Body
 //   - precompute_D_kernel: D = rowsum(dO * O)
 // Both backward kernels use the KV-outer loop of FlashAttention-2: one block
-// per KV block, dK/dV accumulated in registers for the whole block, dQ
+// per KV block (of one sequence, for varlen), dK/dV accumulated in registers for the whole block, dQ
 // accumulated in an FP32 buffer with one atomicAdd per element and KV block.
 // ============================================================================
 
@@ -18,7 +19,7 @@ namespace flash_attn_legacy {
 
 // ---------------------------------------------------------------------------
 // Precompute D = rowsum(dO * O) — launched as a separate kernel
-// D is [B, H, N] float
+// D has the layout of L: [B, H, N] (batched) or [total, H] (varlen, B = 1)
 // ---------------------------------------------------------------------------
 __global__ void precompute_D_kernel(
     const half* __restrict__ dO,   // [B, H, N, d]
@@ -26,7 +27,7 @@ __global__ void precompute_D_kernel(
     float* __restrict__ D,         // [B, H, N]
     int batch_size, int num_heads, int seq_len, int head_dim,
     int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride
+    int l_batch_stride, int l_head_stride, int l_seq_stride
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = batch_size * num_heads * seq_len;
@@ -50,7 +51,81 @@ __global__ void precompute_D_kernel(
              + __half2float(a.y) * __half2float(b_val.y);
     }
 
-    D[b * l_batch_stride + h * l_head_stride + n] = sum;
+    D[b * l_batch_stride + h * l_head_stride + n * l_seq_stride] = sum;
+}
+
+// ---------------------------------------------------------------------------
+// One key block of the backward, from the batched or the varlen grid: pointers
+// at the first row of the sequence, for the first Q head of the KV head's group
+// (Q, dO, L, D, dQ; add qh * *_head_stride for the others, GQA) and for the KV
+// head (K, V, dK, dV); row strides; key block start and sequence lengths.
+// ---------------------------------------------------------------------------
+struct BwdBlockArgs {
+    const half* __restrict__ Q; const half* __restrict__ dO;
+    const float* __restrict__ L; const float* __restrict__ D; float* __restrict__ dQ;
+    const half* __restrict__ K; const half* __restrict__ V;
+    half* __restrict__ dK; half* __restrict__ dV;
+    int q_head_stride, o_head_stride, l_head_stride, dq_head_stride;
+    int q_stride, o_stride, l_stride, dq_stride, k_stride, v_stride, dk_stride, dv_stride;
+    int heads_per_kv, kv_start, seq_len_q, seq_len_k;
+    float softmax_scale;
+    bool is_causal;
+};
+
+// b: batch (0 for varlen); q_tok0 / k_tok0: first row of the sequence (0 for batched).
+__device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams& p, int b, int q_tok0,
+                                                       int k_tok0, int seq_len_q, int seq_len_k,
+                                                       int kv_h, int kv_start) {
+    const int heads_per_kv = p.num_heads / p.num_heads_k;
+    const int h0 = kv_h * heads_per_kv;
+    BwdBlockArgs a;
+    a.Q  = p.Q  + b * p.q_batch_stride + h0 * p.q_head_stride + q_tok0 * p.q_seq_stride;
+    a.dO = p.dO + b * p.o_batch_stride + h0 * p.o_head_stride + q_tok0 * p.o_seq_stride;
+    a.L  = p.L  + b * p.l_batch_stride + h0 * p.l_head_stride + q_tok0 * p.l_seq_stride;
+    a.D  = p.D  + b * p.l_batch_stride + h0 * p.l_head_stride + q_tok0 * p.l_seq_stride;
+    a.dQ = p.dQ + b * p.dq_batch_stride + h0 * p.dq_head_stride + q_tok0 * p.dq_seq_stride;
+    a.K  = p.K  + b * p.k_batch_stride + kv_h * p.k_head_stride + k_tok0 * p.k_seq_stride;
+    a.V  = p.V  + b * p.v_batch_stride + kv_h * p.v_head_stride + k_tok0 * p.v_seq_stride;
+    a.dK = p.dK + b * p.dk_batch_stride + kv_h * p.dk_head_stride + k_tok0 * p.dk_seq_stride;
+    a.dV = p.dV + b * p.dv_batch_stride + kv_h * p.dv_head_stride + k_tok0 * p.dv_seq_stride;
+    a.q_head_stride = p.q_head_stride; a.o_head_stride = p.o_head_stride;
+    a.l_head_stride = p.l_head_stride; a.dq_head_stride = p.dq_head_stride;
+    a.q_stride = p.q_seq_stride; a.o_stride = p.o_seq_stride; a.l_stride = p.l_seq_stride;
+    a.dq_stride = p.dq_seq_stride; a.k_stride = p.k_seq_stride; a.v_stride = p.v_seq_stride;
+    a.dk_stride = p.dk_seq_stride; a.dv_stride = p.dv_seq_stride;
+    a.heads_per_kv = heads_per_kv;
+    a.kv_start = kv_start;
+    a.seq_len_q = seq_len_q;
+    a.seq_len_k = seq_len_k;
+    a.softmax_scale = p.softmax_scale;
+    a.is_causal = p.is_causal;
+    return a;
+}
+
+// Grid (key blocks of Bc, B * H_kv).
+template <typename Tile, typename Body>
+__global__ void __launch_bounds__(Tile::kNumWarps * 32)
+bwd_batched_kernel(FlashAttnBwdParams p) {
+    const int b = blockIdx.y / p.num_heads_k;
+    const int kv_h = blockIdx.y % p.num_heads_k;
+    const int kv_start = blockIdx.x * Tile::Bc;
+    if (kv_start >= p.seq_len_k) return;
+    Body::template run<Tile>(bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, kv_h, kv_start));
+}
+
+// Grid (key blocks of all sequences, H_kv): the sequence comes from
+// key_block_offsets (varlen_seq_of_block).
+template <typename Tile, typename Body>
+__global__ void __launch_bounds__(Tile::kNumWarps * 32)
+bwd_varlen_kernel(FlashAttnBwdParams p) {
+    const int seq = varlen_seq_of_block(p.key_block_offsets, p.num_seqs, blockIdx.x);
+    if (seq >= p.num_seqs) return;
+    const int q_tok0 = p.cu_seqlens_q[seq], k_tok0 = p.cu_seqlens_k[seq];
+    const int seq_len_k = p.cu_seqlens_k[seq + 1] - k_tok0;
+    const int kv_start = (blockIdx.x - p.key_block_offsets[seq]) * Tile::Bc;
+    if (kv_start >= seq_len_k) return;
+    Body::template run<Tile>(bwd_block_args(p, 0, q_tok0, k_tok0, p.cu_seqlens_q[seq + 1] - q_tok0,
+                                            seq_len_k, blockIdx.y, kv_start));
 }
 
 // ---------------------------------------------------------------------------
@@ -72,9 +147,9 @@ __global__ void precompute_D_kernel(
 //   K, V [Bc, kLdH] half; Q, dO [Br, kLdH] half (kLdH = d + 8)
 //   P, dS [Br, kLdF] float (kLdF = Bc + 1); L, D [Br] float
 // ---------------------------------------------------------------------------
+struct BwdSimt {
 template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_bwd_kernel(FlashAttnBwdParams params) {
+static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int D  = Tile::d;
@@ -91,14 +166,9 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     static_assert(NT % Br == 0 && D % Q_GROUPS == 0 && Q_COLS % 2 == 0, "dQ split");
 
     const int tid = threadIdx.x;
-    const int bh_idx = blockIdx.y;
-    const int b_idx = bh_idx / params.num_heads_k;
-    const int kv_h_idx = bh_idx % params.num_heads_k;
-    const int heads_per_kv = params.num_heads / params.num_heads_k;
-    const int kv_start = blockIdx.x * Bc;
-    if (kv_start >= params.seq_len_k) return;
-    const int valid_kv = min(Bc, params.seq_len_k - kv_start);
-    const int causal_off = params.seq_len_k - params.seq_len_q;
+    const int kv_start = a.kv_start;
+    const int valid_kv = min(Bc, a.seq_len_k - kv_start);
+    const int causal_off = a.seq_len_k - a.seq_len_q;
 
     extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
     half*  smem_K  = reinterpret_cast<half*>(smem_raw);
@@ -110,12 +180,8 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     float* smem_L  = smem_dS + Br * LDF;
     float* smem_D  = smem_L + Br;
 
-    load_tile_g2s<Bc, D, NT, LDH>(params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride
-                                           + kv_start * params.k_seq_stride,
-                                  params.k_seq_stride, smem_K, valid_kv);
-    load_tile_g2s<Bc, D, NT, LDH>(params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride
-                                           + kv_start * params.v_seq_stride,
-                                  params.v_seq_stride, smem_V, valid_kv);
+    load_tile_g2s<Bc, D, NT, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv);
+    load_tile_g2s<Bc, D, NT, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv);
 
     const int kv_j = tid % Bc, kv_c0 = (tid / Bc) * KV_COLS;
     const int q_i = tid % Br, q_c0 = (tid / Br) * Q_COLS;
@@ -123,28 +189,24 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
     #pragma unroll
     for (int c = 0; c < KV_COLS; c++) { acc_dK[c] = 0.0f; acc_dV[c] = 0.0f; }
 
-    const int num_q_blocks = cdiv(params.seq_len_q, Br);
-    const int q_start_blk = bwd_first_q_block(params.is_causal, kv_start, Br,
-                                              params.seq_len_q, params.seq_len_k);
+    const int num_q_blocks = cdiv(a.seq_len_q, Br);
+    const int q_start_blk = bwd_first_q_block(a.is_causal, kv_start, Br, a.seq_len_q, a.seq_len_k);
 
-    for (int qh = 0; qh < heads_per_kv; qh++) {
-        const int h_idx = kv_h_idx * heads_per_kv + qh;
+    for (int qh = 0; qh < a.heads_per_kv; qh++) {
         for (int q_blk = q_start_blk; q_blk < num_q_blocks; q_blk++) {
             const int q_start = q_blk * Br;
-            const int valid_q = min(Br, params.seq_len_q - q_start);
+            const int valid_q = min(Br, a.seq_len_q - q_start);
 
             // The previous iteration's readers of Q/dO/P/dS passed the barrier
             // at the end of the loop body.
-            load_tile_g2s<Br, D, NT, LDH>(params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
-                                                   + q_start * params.q_seq_stride,
-                                          params.q_seq_stride, smem_Q, valid_q);
-            load_tile_g2s<Br, D, NT, LDH>(params.dO + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
-                                                    + q_start * params.o_seq_stride,
-                                          params.o_seq_stride, smem_dO, valid_q);
+            load_tile_g2s<Br, D, NT, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
+                                          smem_Q, valid_q);
+            load_tile_g2s<Br, D, NT, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
+                                          smem_dO, valid_q);
             if (tid < Br) {
-                const int lrow = b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_start + tid;
-                smem_L[tid] = (tid < valid_q) ? params.L[lrow] : 0.0f;
-                smem_D[tid] = (tid < valid_q) ? params.D[lrow] : 0.0f;
+                const int lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
+                smem_L[tid] = (tid < valid_q) ? a.L[lrow] : 0.0f;
+                smem_D[tid] = (tid < valid_q) ? a.D[lrow] : 0.0f;
             }
             __syncthreads();
 
@@ -154,12 +216,12 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
                 const int i = e / Bc, j = e % Bc;
                 float p = 0.0f, ds = 0.0f;
                 const bool valid = i < valid_q && j < valid_kv &&
-                    !(params.is_causal && (kv_start + j) > (q_start + i + causal_off));
+                    !(a.is_causal && (kv_start + j) > (q_start + i + causal_off));
                 if (valid) {
-                    const float s = half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH) * params.softmax_scale;
+                    const float s = half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH) * a.softmax_scale;
                     p = expf(s - smem_L[i]);
                     const float dp = half_dot<D>(smem_dO + i * LDH, smem_V + j * LDH);
-                    ds = p * (dp - smem_D[i]) * params.softmax_scale;
+                    ds = p * (dp - smem_D[i]) * a.softmax_scale;
                 }
                 smem_P[i * LDF + j] = p;
                 smem_dS[i * LDF + j] = ds;
@@ -200,8 +262,7 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
                         acc_dQ[2 * c + 1] = fmaf(ds, kf.y, acc_dQ[2 * c + 1]);
                     }
                 }
-                float* dq_row = params.dQ + b_idx * params.dq_batch_stride + h_idx * params.dq_head_stride
-                                          + (q_start + q_i) * params.dq_seq_stride + q_c0;
+                float* dq_row = a.dQ + qh * a.dq_head_stride + (q_start + q_i) * a.dq_stride + q_c0;
                 #pragma unroll
                 for (int c = 0; c < Q_COLS; c++) atomicAdd(&dq_row[c], acc_dQ[c]);
             }
@@ -211,10 +272,8 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 
     // Write dK, dV (row j of this KV block, column slice)
     if (kv_j < valid_kv) {
-        half2* dk2 = reinterpret_cast<half2*>(params.dK + b_idx * params.dk_batch_stride
-            + kv_h_idx * params.dk_head_stride + (kv_start + kv_j) * params.dk_seq_stride + kv_c0);
-        half2* dv2 = reinterpret_cast<half2*>(params.dV + b_idx * params.dv_batch_stride
-            + kv_h_idx * params.dv_head_stride + (kv_start + kv_j) * params.dv_seq_stride + kv_c0);
+        half2* dk2 = reinterpret_cast<half2*>(a.dK + (kv_start + kv_j) * a.dk_stride + kv_c0);
+        half2* dv2 = reinterpret_cast<half2*>(a.dV + (kv_start + kv_j) * a.dv_stride + kv_c0);
         #pragma unroll
         for (int c = 0; c < KV_COLS / 2; c++) {
             dk2[c] = __floats2half2_rn(acc_dK[2 * c], acc_dK[2 * c + 1]);
@@ -222,6 +281,7 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
         }
     }
 }
+};
 
 // ============================================================================
 // VOLTA WMMA Backward — SM >= 7.0
@@ -245,9 +305,9 @@ flash_attn_bwd_kernel(FlashAttnBwdParams params) {
 // query block and add it to the fp32 dQ buffer with coalesced atomics (one per
 // element and key block). Two block barriers per query block.
 // ---------------------------------------------------------------------------
+struct BwdWmma {
 template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
+static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int D  = Tile::d;
@@ -273,15 +333,10 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     const int band = warp_id / SPLIT;      // keys [16 band, 16 band + 16) of the block
     const int part = warp_id % SPLIT;      // dK / dV columns [part DP, part DP + DP)
 
-    const int bh_idx = blockIdx.y;
-    const int b_idx = bh_idx / params.num_heads_k;
-    const int kv_h_idx = bh_idx % params.num_heads_k;
-    const int heads_per_kv = params.num_heads / params.num_heads_k;
-    const int kv_start = blockIdx.x * Bc;
-    if (kv_start >= params.seq_len_k) return;
-    const int valid_kv = min(Bc, params.seq_len_k - kv_start);
-    const int causal_off = params.seq_len_k - params.seq_len_q;
-    const float scale_log2 = params.softmax_scale * kLog2e;
+    const int kv_start = a.kv_start;
+    const int valid_kv = min(Bc, a.seq_len_k - kv_start);
+    const int causal_off = a.seq_len_k - a.seq_len_q;
+    const float scale_log2 = a.softmax_scale * kLog2e;
 
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_K  = reinterpret_cast<half*>(smem_raw);
@@ -304,30 +359,27 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
         wmma::fill_fragment(dV[t], 0.0f);
     }
 
-    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(params.K + b_idx * params.k_batch_stride + kv_h_idx * params.k_head_stride
-                                           + kv_start * params.k_seq_stride, params.k_seq_stride, smem_K, valid_kv);
-    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(params.V + b_idx * params.v_batch_stride + kv_h_idx * params.v_head_stride
-                                           + kv_start * params.v_seq_stride, params.v_seq_stride, smem_V, valid_kv);
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv);
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv);
 
-    const int num_q_blocks = cdiv(params.seq_len_q, Br);
-    const int q_first_blk = bwd_first_q_block(params.is_causal, kv_start, Br, params.seq_len_q, params.seq_len_k);
+    const int num_q_blocks = cdiv(a.seq_len_q, Br);
+    const int q_first_blk = bwd_first_q_block(a.is_causal, kv_start, Br, a.seq_len_q, a.seq_len_k);
     const half* K_band = smem_K + band * T * LDH;
     const half* V_band = smem_V + band * T * LDH;
 
-    for (int qh = 0; qh < heads_per_kv; qh++) {
-        const int h_idx = kv_h_idx * heads_per_kv + qh;
+    for (int qh = 0; qh < a.heads_per_kv; qh++) {
         for (int q_blk = q_first_blk; q_blk < num_q_blocks; q_blk++) {
             const int q_start = q_blk * Br;
-            const int valid_q = min(Br, params.seq_len_q - q_start);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(params.Q + b_idx * params.q_batch_stride + h_idx * params.q_head_stride
-                                                   + q_start * params.q_seq_stride, params.q_seq_stride, smem_Q, valid_q);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(params.dO + b_idx * params.o_batch_stride + h_idx * params.o_head_stride
-                                                   + q_start * params.o_seq_stride, params.o_seq_stride, smem_dO, valid_q);
-            const int lse_off = b_idx * params.l_batch_stride + h_idx * params.l_head_stride + q_start;
+            const int valid_q = min(Br, a.seq_len_q - q_start);
+            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
+                                                   smem_Q, valid_q);
+            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
+                                                   smem_dO, valid_q);
             for (int i = tid; i < Br; i += NUM_THREADS) {
                 // Rows past the sequence: P = 0 through the mask, D never used
-                smem_L[i] = (i < valid_q) ? params.L[lse_off + i] * kLog2e : 0.0f;
-                smem_D[i] = (i < valid_q) ? params.D[lse_off + i] : 0.0f;
+                const int lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
+                smem_L[i] = (i < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
+                smem_D[i] = (i < valid_q) ? a.D[lrow] : 0.0f;
             }
             __syncthreads();
 
@@ -361,11 +413,11 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                 for (int i = 0; i < NE; i++) {
                     const int key = kv_start + band * T + e_row[i];
                     const int q = qt * T + e_col[i];  // row within the query block
-                    const bool masked = q >= valid_q || key >= params.seq_len_k ||
-                                        (params.is_causal && key > q_start + q + causal_off);
+                    const bool masked = q >= valid_q || key >= a.seq_len_k ||
+                                        (a.is_causal && key > q_start + q + causal_off);
                     const float p = masked ? 0.0f : exp2f(S[qt].x[i] * scale_log2 - smem_L[q]);
                     S[qt].x[i] = p;
-                    dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * params.softmax_scale;
+                    dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * a.softmax_scale;
                     wbuf[e_row[i] * LDB + q] = __float2half(p);
                 }
             }
@@ -410,8 +462,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
 
             // dQ[Br, D] += dS K: output tiles spread over the warps, staged per warp
             // and added with coalesced atomics
-            float* dQ_blk = params.dQ + b_idx * params.dq_batch_stride + h_idx * params.dq_head_stride
-                                      + q_start * params.dq_seq_stride;
+            float* dQ_blk = a.dQ + qh * a.dq_head_stride + q_start * a.dq_stride;
             constexpr int DQ_TILES = QT * (D / T);
             #pragma unroll
             for (int tile = warp_id; tile < DQ_TILES; tile += NUM_WARPS) {
@@ -431,7 +482,7 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
                 #pragma unroll
                 for (int e = lane; e < T * T; e += 32) {
                     const int row = qr * T + e / T;
-                    if (row < valid_q) ::atomicAdd(dQ_blk + row * params.dq_seq_stride + dc * T + e % T, wstage[e]);
+                    if (row < valid_q) ::atomicAdd(dQ_blk + row * a.dq_stride + dc * T + e % T, wstage[e]);
                 }
                 __syncwarp();
             }
@@ -441,10 +492,8 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     }
 
     // dK, dV of the warp's band and slice, through the 16x16 float staging
-    half* dK_out = params.dK + b_idx * params.dk_batch_stride + kv_h_idx * params.dk_head_stride
-                             + (kv_start + band * T) * params.dk_seq_stride + part * DP;
-    half* dV_out = params.dV + b_idx * params.dv_batch_stride + kv_h_idx * params.dv_head_stride
-                             + (kv_start + band * T) * params.dv_seq_stride + part * DP;
+    half* dK_out = a.dK + (kv_start + band * T) * a.dk_stride + part * DP;
+    half* dV_out = a.dV + (kv_start + band * T) * a.dv_stride + part * DP;
     const int band_valid = valid_kv - band * T;  // may be <= 0 for the last block
     auto store = [&](Acc& frag, half* out, int stride) {
         wmma::store_matrix_sync(wstage, frag, T, wmma::mem_row_major);
@@ -457,15 +506,18 @@ flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {
     };
     #pragma unroll
     for (int t = 0; t < DPT; t++) {
-        store(dK[t], dK_out + t * T, params.dk_seq_stride);
-        store(dV[t], dV_out + t * T, params.dv_seq_stride);
+        store(dK[t], dK_out + t * T, a.dk_stride);
+        store(dV[t], dV_out + t * T, a.dv_stride);
     }
 }
+};
 
 #else  // __CUDA_ARCH__ < 700
-template <typename Tile>
-__global__ void __launch_bounds__(Tile::kNumWarps * 32)
-flash_attn_bwd_volta_kernel(FlashAttnBwdParams params) {}
+// Stub body for SM < 7.0 device code — never launched there (dispatch in .cpp).
+struct BwdWmma {
+    template <typename Tile>
+    static __device__ __forceinline__ void run(const BwdBlockArgs&) {}
+};
 #endif  // __CUDA_ARCH__
 
 // ---------------------------------------------------------------------------
@@ -476,7 +528,7 @@ void precompute_D(
     const half* dO, const half* O, float* D,
     int B, int H, int N, int d,
     int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride,
+    int l_batch_stride, int l_head_stride, int l_seq_stride,
     cudaStream_t stream
 ) {
     const int total = B * H * N;
@@ -485,7 +537,7 @@ void precompute_D(
     precompute_D_kernel<<<grid_size, block_size, 0, stream>>>(
         dO, O, D, B, H, N, d,
         o_batch_stride, o_head_stride, o_seq_stride,
-        l_batch_stride, l_head_stride
+        l_batch_stride, l_head_stride, l_seq_stride
     );
 }
 
@@ -522,28 +574,37 @@ static void dispatch_bwd_wmma_tile(int head_dim, F&& f) {
     if (!ok) throw_no_tile("WMMA backward", head_dim, limit);
 }
 
-template <typename Tile, typename Kernel>
-static void launch_bwd(Kernel kernel, FlashAttnBwdParams& params, cudaStream_t stream) {
+// Backward of one kernel family (Body) with its tile: batched grid, or varlen
+// grid over total_k_blocks key blocks when params.cu_seqlens_q is set.
+template <typename Tile, typename Body>
+static void launch_bwd(FlashAttnBwdParams& params, int total_k_blocks, cudaStream_t stream) {
     constexpr int smem = Tile::smem_bytes();
-    dim3 grid(cdiv(params.seq_len_k, Tile::Bc), params.batch_size * params.num_heads_k);
-    dim3 block(Tile::kNumWarps * 32);
-    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    kernel<<<grid, block, smem, stream>>>(params);
+    const bool varlen = params.cu_seqlens_q != nullptr;
+    auto kernel = varlen ? bwd_varlen_kernel<Tile, Body> : bwd_batched_kernel<Tile, Body>;
+    const dim3 grid = varlen ? dim3(total_k_blocks, params.num_heads_k)
+                             : dim3(cdiv(params.seq_len_k, Tile::Bc), params.batch_size * params.num_heads_k);
+    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
 }
 
-void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    dispatch_bwd_wmma_tile(params.head_dim, [&](auto tile) {
-        using T = decltype(tile);
-        launch_bwd<T>(flash_attn_bwd_volta_kernel<T>, params, stream);
+// wmma: tensor-core kernel (sm >= 70) or CUDA-core kernel.
+template <typename F>
+static void dispatch_bwd(int head_dim, bool wmma, F&& f) {
+    if (wmma) dispatch_bwd_wmma_tile(head_dim, [&](auto tile) { f(tile, BwdWmma{}); });
+    else      dispatch_bwd_simt_tile(head_dim, [&](auto tile) { f(tile, BwdSimt{}); });
+}
+
+void flash_attn_bwd_launch(FlashAttnBwdParams& params, bool wmma, int total_k_blocks, cudaStream_t stream) {
+    dispatch_bwd(params.head_dim, wmma, [&](auto tile, auto body) {
+        launch_bwd<decltype(tile), decltype(body)>(params, total_k_blocks, stream);
     });
 }
 
-void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream) {
-    dispatch_bwd_simt_tile(params.head_dim, [&](auto tile) {
-        using T = decltype(tile);
-        launch_bwd<T>(flash_attn_bwd_kernel<T>, params, stream);
-    });
+// Keys per block of the backward tile selected for head_dim on this device.
+int flash_attn_bwd_block_cols(int head_dim, bool wmma) {
+    int cols = 0;
+    dispatch_bwd(head_dim, wmma, [&](auto tile, auto) { cols = decltype(tile)::Bc; });
+    return cols;
 }
 
 }  // namespace flash_attn_legacy

@@ -1004,6 +1004,50 @@ class TestForwardContract:
             for g, r in ((q.grad[s:e], rdq), (k.grad[s:e], rdk), (v.grad[s:e], rdv)):
                 torch.testing.assert_close(g, r[0].transpose(0, 1), atol=5e-2, rtol=5e-2)
 
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen_backward_mixed_segments(self, head_dim, causal):
+        """One-launch varlen backward vs per-segment FP32: empty segments, Q and K
+        of different lengths in a segment (bottom-right causal), GQA."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        lens_q = [3, 0, 17, 65, 1, 40, 70]
+        lens_k = [5, 4, 17, 33, 1, 0, 130]  # 130: several key blocks for every tile
+        cu_q = torch.tensor([0] + torch.tensor(lens_q).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0] + torch.tensor(lens_k).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        scale = 1.0 / math.sqrt(head_dim)
+        q = torch.randn(sum(lens_q), 4, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        k = torch.randn(sum(lens_k), 2, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        v = torch.randn(sum(lens_k), 2, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k),
+                                     softmax_scale=scale, causal=causal)
+        go = torch.randn_like(out)
+        out.backward(go)
+        for i in range(len(lens_q)):
+            qs, qe, ks, ke = cu_q[i].item(), cu_q[i + 1].item(), cu_k[i].item(), cu_k[i + 1].item()
+            if qe == qs or ke == ks:  # nothing to attend: zero gradients for the segment
+                assert not q.grad[qs:qe].any() and not k.grad[ks:ke].any() and not v.grad[ks:ke].any()
+                continue
+            qi, ki, vi, gi = (t.detach()[a:b].transpose(0, 1).unsqueeze(0)
+                              for t, (a, b) in ((q, (qs, qe)), (k, (ks, ke)), (v, (ks, ke)), (go, (qs, qe))))
+            rdq, rdk, rdv = ref_backward(qi, ki, vi, gi, scale, causal)
+            for g, r in ((q.grad[qs:qe], rdq), (k.grad[ks:ke], rdk), (v.grad[ks:ke], rdv)):
+                torch.testing.assert_close(g, r[0].transpose(0, 1), atol=5e-2, rtol=5e-2)
+
+    @pytest.mark.parametrize("empty", ["keys", "queries"])
+    def test_varlen_backward_no_keys_or_queries(self, empty):
+        """total_k == 0 (no keys anywhere) or total_q == 0: zero gradients, no launch."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        lens_q, lens_k = ([4, 7], [0, 0]) if empty == "keys" else ([0, 0], [5, 3])
+        cu_q = torch.tensor([0] + torch.tensor(lens_q).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0] + torch.tensor(lens_k).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
+        q = torch.randn(sum(lens_q), 4, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+        k, v = (torch.randn(sum(lens_k), 2, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+                for _ in range(2))
+        out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k), causal=True)
+        out.sum().backward()
+        for t in (q, k, v):
+            assert t.grad.shape == t.shape and not t.grad.any()
+
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
         import flash_attn_legacy_cuda

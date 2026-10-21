@@ -215,14 +215,8 @@ __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_varlen_kernel(FlashAttnVarlenParams p) {
     const int h_idx = blockIdx.y;
     const int block_x = blockIdx.x;
-    // Sequence of this block: binary search in the per-sequence block offsets
-    int lo = 0, hi = p.num_seqs;
-    while (lo < hi) {
-        const int mid = (lo + hi) / 2;
-        if (p.block_offsets[mid + 1] <= block_x) lo = mid + 1;
-        else hi = mid;
-    }
-    const int seq_idx = lo;
+    const int seq_idx = varlen_seq_of_block(p.block_offsets, p.num_seqs, block_x);
+    if (seq_idx >= p.num_seqs) return;
     const int q_start_tok = p.cu_seqlens_q[seq_idx];
     const int k_start_tok = p.cu_seqlens_k[seq_idx];
     const int seq_len_q = p.cu_seqlens_q[seq_idx + 1] - q_start_tok;

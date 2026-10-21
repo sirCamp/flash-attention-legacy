@@ -27,10 +27,10 @@ void precompute_D(
     const half* dO, const half* O, float* D,
     int B, int H, int N, int d,
     int o_batch_stride, int o_head_stride, int o_seq_stride,
-    int l_batch_stride, int l_head_stride,
+    int l_batch_stride, int l_head_stride, int l_seq_stride,
     cudaStream_t stream);
-void flash_attn_bwd_volta_launch(FlashAttnBwdParams& params, cudaStream_t stream);
-void flash_attn_bwd_pascal_launch(FlashAttnBwdParams& params, cudaStream_t stream);
+void flash_attn_bwd_launch(FlashAttnBwdParams& params, bool wmma, int total_k_blocks, cudaStream_t stream);
+int flash_attn_bwd_block_cols(int head_dim, bool wmma);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -100,6 +100,90 @@ static int get_sm_version(int device_id = -1) {
         TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
     }
     return sm;
+}
+
+// Input checks shared by the varlen entry points: Q [total_q, H_q, d],
+// K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
+static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
+                                const torch::Tensor& cu_seqlens_q, const torch::Tensor& cu_seqlens_k) {
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
+    TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(), "Q, K, V must be on the same device");
+    TORCH_CHECK(Q.dtype() == torch::kFloat16 && K.dtype() == torch::kFloat16 &&
+                V.dtype() == torch::kFloat16, "Q, K, V must be float16");
+    TORCH_CHECK(Q.dim() == 3 && K.dim() == 3 && V.dim() == 3, "Q, K, V must be [total, H, d]");
+    const int d = Q.size(2), H_q = Q.size(1), H_kv = K.size(1);
+    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
+                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
+    TORCH_CHECK(K.size(2) == d && V.sizes() == K.sizes(), "K, V shape mismatch");
+    TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
+    TORCH_CHECK(H_q % H_kv == 0, "H_q (", H_q, ") must be divisible by H_kv (", H_kv, ")");
+    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda() &&
+                cu_seqlens_q.device() == Q.device() && cu_seqlens_k.device() == Q.device(),
+                "cu_seqlens_q/k must be on the same CUDA device as Q");
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 && cu_seqlens_k.dtype() == torch::kInt32,
+                "cu_seqlens_q/k must be int32");
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.size(0) >= 2, "cu_seqlens must have at least 2 entries");
+    TORCH_CHECK(cu_seqlens_k.sizes() == cu_seqlens_q.sizes(), "cu_seqlens_k length mismatch");
+}
+
+// Validates the varlen boundaries on one host copy (a wrong cu_seqlens would
+// otherwise read out of bounds or leave rows uncomputed) and returns the host
+// copies {cu_seqlens_q, cu_seqlens_k}. Removing this sync (CUDA graphs,
+// torch.compile) is docs/PLAN.md P6.5.
+static std::pair<torch::Tensor, torch::Tensor> validated_cu_seqlens(
+    const torch::Tensor& cu_seqlens_q, const torch::Tensor& cu_seqlens_k, int total_q, int total_k) {
+    const int num_seqs = cu_seqlens_q.size(0) - 1;
+    auto cu_cpu = torch::cat({cu_seqlens_q, cu_seqlens_k}).to(torch::kCPU);  // one host sync
+    auto cu_q_cpu = cu_cpu.narrow(0, 0, num_seqs + 1);
+    auto cu_k_cpu = cu_cpu.narrow(0, num_seqs + 1, num_seqs + 1);
+    auto cu_q_acc = cu_q_cpu.accessor<int, 1>();
+    auto cu_k_acc = cu_k_cpu.accessor<int, 1>();
+    TORCH_CHECK(cu_q_acc[0] == 0 && cu_k_acc[0] == 0, "cu_seqlens must start at 0");
+    TORCH_CHECK(cu_q_acc[num_seqs] == total_q, "cu_seqlens_q must end at total_q (", total_q,
+                "), got ", cu_q_acc[num_seqs]);
+    TORCH_CHECK(cu_k_acc[num_seqs] == total_k, "cu_seqlens_k must end at total_k (", total_k,
+                "), got ", cu_k_acc[num_seqs]);
+    for (int i = 0; i < num_seqs; i++) {
+        TORCH_CHECK(cu_q_acc[i + 1] >= cu_q_acc[i] && cu_k_acc[i + 1] >= cu_k_acc[i],
+                    "cu_seqlens must be non-decreasing (sequence ", i, ")");
+    }
+    return {cu_q_cpu, cu_k_cpu};
+}
+
+// Blocks of `rows` rows per sequence: cumulative counts [0, cdiv(len_0, rows),
+// ...] on the device (int32, no host loop or host-to-device copy) for the
+// kernels' varlen_seq_of_block, and the total for the grid from the validated
+// host copy of the same cu_seqlens.
+struct VarlenBlocks {
+    torch::Tensor offsets;
+    int total;
+};
+static VarlenBlocks varlen_blocks(const torch::Tensor& cu_seqlens, const torch::Tensor& cu_host, int rows) {
+    const int n = cu_seqlens.size(0) - 1;
+    const torch::Tensor blocks = (cu_seqlens.narrow(0, 1, n) - cu_seqlens.narrow(0, 0, n) + (rows - 1))
+                                     .div(rows, "floor");
+    auto acc = cu_host.accessor<int, 1>();
+    int total = 0;
+    for (int i = 0; i < n; i++) total += cdiv(acc[i + 1] - acc[i], rows);
+    return {torch::cat({torch::zeros({1}, cu_seqlens.options()), blocks.cumsum(0).to(torch::kInt32)}), total};
+}
+
+// Data pointers of the backward (strides differ between batched and varlen and
+// are set by each entry point).
+static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, const torch::Tensor& Q,
+                             const torch::Tensor& K, const torch::Tensor& V, const torch::Tensor& O,
+                             const torch::Tensor& L, const torch::Tensor& D, torch::Tensor& dQ_fp32,
+                             torch::Tensor& dK, torch::Tensor& dV) {
+    b.Q  = reinterpret_cast<const half*>(Q.data_ptr<at::Half>());
+    b.K  = reinterpret_cast<const half*>(K.data_ptr<at::Half>());
+    b.V  = reinterpret_cast<const half*>(V.data_ptr<at::Half>());
+    b.O  = reinterpret_cast<const half*>(O.data_ptr<at::Half>());
+    b.L  = L.data_ptr<float>();
+    b.D  = D.data_ptr<float>();
+    b.dO = reinterpret_cast<const half*>(dO.data_ptr<at::Half>());
+    b.dQ = dQ_fp32.data_ptr<float>();
+    b.dK = reinterpret_cast<half*>(dK.data_ptr<at::Half>());
+    b.dV = reinterpret_cast<half*>(dV.data_ptr<at::Half>());
 }
 
 // ---------------------------------------------------------------------------
@@ -239,21 +323,11 @@ std::vector<torch::Tensor> flash_attn_backward(
         D_tensor.data_ptr<float>(),
         B, H_q, N, d,
         O.stride(0), O.stride(1), O.stride(2),
-        l_batch_stride, l_head_stride,
+        l_batch_stride, l_head_stride, 1,
         stream);
 
     FlashAttnBwdParams bwd = {};
-    bwd.Q  = reinterpret_cast<const half*>(Q.data_ptr<at::Half>());
-    bwd.K  = reinterpret_cast<const half*>(K.data_ptr<at::Half>());
-    bwd.V  = reinterpret_cast<const half*>(V.data_ptr<at::Half>());
-    bwd.O  = reinterpret_cast<const half*>(O.data_ptr<at::Half>());
-    bwd.L  = L.data_ptr<float>();
-    bwd.D  = D_tensor.data_ptr<float>();
-    bwd.dO = reinterpret_cast<const half*>(dO.data_ptr<at::Half>());
-    bwd.dQ = dQ_fp32.data_ptr<float>();
-    bwd.dK = reinterpret_cast<half*>(dK.data_ptr<at::Half>());
-    bwd.dV = reinterpret_cast<half*>(dV.data_ptr<at::Half>());
-
+    set_bwd_pointers(bwd, dO, Q, K, V, O, L, D_tensor, dQ_fp32, dK, dV);
     bwd.batch_size = B; bwd.num_heads = H_q; bwd.num_heads_k = H_kv;
     bwd.seq_len_q = N; bwd.seq_len_k = Nk; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale; bwd.is_causal = is_causal;
@@ -262,7 +336,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     bwd.k_batch_stride = K.stride(0); bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(2);
     bwd.v_batch_stride = V.stride(0); bwd.v_head_stride = V.stride(1); bwd.v_seq_stride = V.stride(2);
     bwd.o_batch_stride = O.stride(0); bwd.o_head_stride = O.stride(1); bwd.o_seq_stride = O.stride(2);
-    bwd.l_batch_stride = l_batch_stride; bwd.l_head_stride = l_head_stride;
+    bwd.l_batch_stride = l_batch_stride; bwd.l_head_stride = l_head_stride; bwd.l_seq_stride = 1;
     bwd.dq_batch_stride = dQ_fp32.stride(0);
     bwd.dq_head_stride  = dQ_fp32.stride(1);
     bwd.dq_seq_stride   = dQ_fp32.stride(2);
@@ -273,12 +347,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     bwd.dv_head_stride  = dV.stride(1);
     bwd.dv_seq_stride   = dV.stride(2);
 
-    int sm = get_sm_version();
-    if (sm >= 70) {
-        flash_attn_bwd_volta_launch(bwd, stream);
-    } else {
-        flash_attn_bwd_pascal_launch(bwd, stream);
-    }
+    flash_attn_bwd_launch(bwd, get_sm_version() >= 70, 0, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
 
     torch::Tensor dQ = dQ_fp32.to(torch::kFloat16);
@@ -297,31 +366,10 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     float softmax_scale, bool is_causal
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
-
-    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be on CUDA");
-    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda() &&
-                cu_seqlens_q.device() == Q.device() && cu_seqlens_k.device() == Q.device(),
-                "cu_seqlens_q/k must be on the same CUDA device as Q");
-    TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(),
-                "Q, K, V must be on the same device");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16 && K.dtype() == torch::kFloat16 &&
-                V.dtype() == torch::kFloat16, "Q, K, V must be float16");
-    TORCH_CHECK(Q.dim() == 3, "Q must be [total_q, H_q, d]");
-    TORCH_CHECK(K.dim() == 3 && V.dim() == 3, "K,V must be 3D");
-    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must be int32");
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must be int32");
-
+    check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
     const int total_q = Q.size(0), H_q = Q.size(1), d = Q.size(2);
     const int total_k = K.size(0), H_kv = K.size(1);
     const int num_seqs = cu_seqlens_q.size(0) - 1;
-
-    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
-                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
-    TORCH_CHECK(K.size(2) == d && V.size(2) == d, "K,V head_dim mismatch");
-    TORCH_CHECK(V.size(1) == H_kv, "V num_heads mismatch");
-    TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
-    TORCH_CHECK(H_q % H_kv == 0, "H_q (", H_q, ") must be divisible by H_kv (", H_kv, ")");
-    TORCH_CHECK(cu_seqlens_k.size(0) == num_seqs + 1, "cu_seqlens_k length mismatch");
 
     auto opts_half = Q.options();
     auto opts_float = Q.options().dtype(torch::kFloat32);
@@ -331,39 +379,15 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Validate the boundaries on one host copy (a wrong cu_seqlens would
-    // otherwise read out of bounds or leave rows uncomputed). Removing this sync
-    // (CUDA graphs, torch.compile) is docs/PLAN.md P6.5.
-    TORCH_CHECK(num_seqs >= 1, "cu_seqlens must have at least 2 entries");
-    auto cu_cpu = torch::cat({cu_seqlens_q, cu_seqlens_k}).to(torch::kCPU);  // one host sync
-    auto cu_q_cpu = cu_cpu.narrow(0, 0, num_seqs + 1);
-    auto cu_k_cpu = cu_cpu.narrow(0, num_seqs + 1, num_seqs + 1);
-    auto cu_q_acc = cu_q_cpu.accessor<int, 1>();
-    auto cu_k_acc = cu_k_cpu.accessor<int, 1>();
-    TORCH_CHECK(cu_q_acc[0] == 0 && cu_k_acc[0] == 0, "cu_seqlens must start at 0");
-    TORCH_CHECK(cu_q_acc[num_seqs] == total_q, "cu_seqlens_q must end at total_q (", total_q,
-                "), got ", cu_q_acc[num_seqs]);
-    TORCH_CHECK(cu_k_acc[num_seqs] == total_k, "cu_seqlens_k must end at total_k (", total_k,
-                "), got ", cu_k_acc[num_seqs]);
-    for (int i = 0; i < num_seqs; i++) {
-        TORCH_CHECK(cu_q_acc[i + 1] >= cu_q_acc[i] && cu_k_acc[i + 1] >= cu_k_acc[i],
-                    "cu_seqlens must be non-decreasing (sequence ", i, ")");
-    }
+    const auto cu_host = validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k);
 
     int sm = get_sm_version();
     // Br of the tile the launcher will select (same dispatch: they cannot disagree)
     const int Br = (sm >= 70) ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
-
-    // Cumulative Q blocks per sequence, computed on the device (no host loop, no
-    // synchronous host-to-device copy); the total for the grid comes from the
-    // host copy already made for the validation.
-    int total_q_blocks = 0;
-    for (int i = 0; i < num_seqs; i++) total_q_blocks += cdiv(cu_q_acc[i + 1] - cu_q_acc[i], Br);
-    if (total_q_blocks == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
-    const torch::Tensor q_blocks = (cu_seqlens_q.narrow(0, 1, num_seqs) - cu_seqlens_q.narrow(0, 0, num_seqs)
-                                    + (Br - 1)).div(Br, "floor");
-    const torch::Tensor block_offsets_t = torch::cat(
-        {torch::zeros({1}, cu_seqlens_q.options()), q_blocks.cumsum(0).to(torch::kInt32)});
+    const VarlenBlocks q_blocks = varlen_blocks(cu_seqlens_q, cu_host.first, Br);
+    if (q_blocks.total == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
+    const int total_q_blocks = q_blocks.total;
+    const torch::Tensor& block_offsets_t = q_blocks.offsets;
 
     FlashAttnVarlenParams p = {};
     p.Q = reinterpret_cast<const half*>(Q.data_ptr<at::Half>());
@@ -400,6 +424,84 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     return {O, L};
 }
 
+// ---------------------------------------------------------------------------
+// Backward — variable-length packed sequences, one launch (GQA aware).
+// Q, O, dO are [total_q, H_q, d], K, V [total_k, H_kv, d], L [total_q, H_q].
+// ---------------------------------------------------------------------------
+std::vector<torch::Tensor> flash_attn_backward_varlen(
+    torch::Tensor dO,
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    torch::Tensor O, torch::Tensor L,
+    torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
+    int max_seqlen_q, int max_seqlen_k,
+    float softmax_scale, bool is_causal
+) {
+    dO = contiguous_aligned(dO);
+    Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
+    O = contiguous_aligned(O);
+    check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
+    TORCH_CHECK(dO.device() == Q.device() && O.device() == Q.device() &&
+                dO.dtype() == torch::kFloat16 && O.dtype() == torch::kFloat16,
+                "dO, O must be CUDA float16 on the same device as Q");
+    TORCH_CHECK(dO.sizes() == Q.sizes() && O.sizes() == Q.sizes(), "dO and O shapes must match Q");
+    const int total_q = Q.size(0), H_q = Q.size(1), d = Q.size(2);
+    const int total_k = K.size(0), H_kv = K.size(1);
+    const int num_seqs = cu_seqlens_q.size(0) - 1;
+    TORCH_CHECK(L.is_cuda() && L.dtype() == torch::kFloat32 && L.device() == Q.device(),
+                "L must be CUDA float32 on the same device as Q");
+    L = L.contiguous();
+    TORCH_CHECK(L.dim() == 2 && L.size(0) == total_q && L.size(1) == H_q, "L must be [total_q, H_q]");
+    const auto cu_host = validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k);
+
+    const at::cuda::CUDAGuard device_guard(Q.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (total_q == 0 || total_k == 0 || H_q == 0) {
+        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V)};
+    }
+
+    const bool wmma = get_sm_version() >= 70;
+    const int Bc = flash_attn_bwd_block_cols(d, wmma);  // same selection as the launch
+    const VarlenBlocks k_blocks = varlen_blocks(cu_seqlens_k, cu_host.second, Bc);
+
+    torch::Tensor dQ_fp32 = torch::zeros({total_q, H_q, d}, Q.options().dtype(torch::kFloat32));
+    // Every key row belongs to one sequence and one key block: written exactly once
+    torch::Tensor dK = torch::empty_like(K);
+    torch::Tensor dV = torch::empty_like(V);
+    torch::Tensor D_tensor = torch::empty({total_q, H_q}, Q.options().dtype(torch::kFloat32));
+    precompute_D(
+        reinterpret_cast<const half*>(dO.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(O.data_ptr<at::Half>()),
+        D_tensor.data_ptr<float>(),
+        1, H_q, total_q, d,
+        0, O.stride(1), O.stride(0),
+        0, 1, H_q,
+        stream);
+
+    FlashAttnBwdParams bwd = {};
+    set_bwd_pointers(bwd, dO, Q, K, V, O, L, D_tensor, dQ_fp32, dK, dV);
+    // seq_len_q / seq_len_k stay 0: the varlen kernel takes each sequence's lengths
+    // from cu_seqlens (max_seqlen_* are accepted for API symmetry, unused).
+    bwd.batch_size = 1; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.head_dim = d;
+    bwd.softmax_scale = softmax_scale; bwd.is_causal = is_causal;
+    // Packed layout: no batch stride, "seq" stride = token stride
+    bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(0);
+    bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(0);
+    bwd.v_head_stride = V.stride(1); bwd.v_seq_stride = V.stride(0);
+    bwd.o_head_stride = dO.stride(1); bwd.o_seq_stride = dO.stride(0);
+    bwd.l_head_stride = 1; bwd.l_seq_stride = H_q;
+    bwd.dq_head_stride = dQ_fp32.stride(1); bwd.dq_seq_stride = dQ_fp32.stride(0);
+    bwd.dk_head_stride = dK.stride(1); bwd.dk_seq_stride = dK.stride(0);
+    bwd.dv_head_stride = dV.stride(1); bwd.dv_seq_stride = dV.stride(0);
+    bwd.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+    bwd.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+    bwd.key_block_offsets = k_blocks.offsets.data_ptr<int>();
+    bwd.num_seqs = num_seqs;
+
+    if (k_blocks.total > 0) flash_attn_bwd_launch(bwd, wmma, k_blocks.total, stream);
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return {dQ_fp32.to(torch::kFloat16), dK, dV};
+}
+
 }  // namespace flash_attn_legacy
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -412,6 +514,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
           "Flash Attention v2 forward — variable-length packed sequences",
           py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
+          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
+          py::arg("softmax_scale"), py::arg("is_causal") = false);
+    m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
+          "Flash Attention v2 backward — variable-length packed sequences, one launch",
+          py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("O"), py::arg("L"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false);

@@ -140,14 +140,22 @@ struct FlashAttnBwdParams {
     int v_batch_stride, v_head_stride, v_seq_stride;
     // Strides for O/dO
     int o_batch_stride, o_head_stride, o_seq_stride;
-    // Strides for L and D
-    int l_batch_stride, l_head_stride;
+    // Strides for L and D (batched [B, H, N]: seq stride 1; varlen [total, H]: num_heads)
+    int l_batch_stride, l_head_stride, l_seq_stride;
     // Strides for dQ (FP32, same layout as Q but float)
     int dq_batch_stride, dq_head_stride, dq_seq_stride;
     // Strides for dK (same layout as K)
     int dk_batch_stride, dk_head_stride, dk_seq_stride;
     // Strides for dV (same layout as V)
     int dv_batch_stride, dv_head_stride, dv_seq_stride;
+
+    // Varlen only (nullptr / 0 for batched): packed [total, H, d] tensors with
+    // batch strides 0; sequence i spans rows [cu_seqlens[i], cu_seqlens[i+1]);
+    // key_block_offsets[i] = key blocks of the sequences before i.
+    const int* __restrict__ cu_seqlens_q;
+    const int* __restrict__ cu_seqlens_k;
+    const int* __restrict__ key_block_offsets;
+    int num_seqs;
 };
 
 // ---------------------------------------------------------------------------
@@ -396,6 +404,19 @@ __device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, 
         *reinterpret_cast<uint4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
                                   + (idx % R::kVecPerRow) * 8) = v;
     }
+}
+
+// Varlen grids: sequence of a flat block index, from the cumulative per-sequence
+// block counts offsets[0..num_seqs] (upper-bound binary search; sequences with no
+// block are skipped). Returns num_seqs for a block past the last sequence.
+__device__ __forceinline__ int varlen_seq_of_block(const int* __restrict__ offsets, int num_seqs, int block) {
+    int lo = 0, hi = num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= block) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
 }
 
 // fp32 destination: the 8 halves are converted once, when stored (the CUDA-core

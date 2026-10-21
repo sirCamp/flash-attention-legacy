@@ -38,7 +38,7 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 |---|---|---|---|---|
 | **Volta** | V100, Titan V | 7.0 | 1st gen | WMMA 16x16x16 |
 | **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | CUDA cores (fp16 storage, fp32 math) |
-| **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | *not yet*: the Volta tiles for d=64/128 need more than the 64 KB of shared memory per block of SM 7.5 (planned) |
+| **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | WMMA 16x16x16 (tiles sized for its 64 KB of shared memory per block) |
 
 Head dimensions: **d = 32, 64, 96, 128, 256**.
 
@@ -420,9 +420,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 3. **Kernel features**: causal (bottom-right aligned) or no mask, packed segments. No sliding window, softcap, sinks or dropout in the kernel yet: those layers run on the fallbacks
 4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
 5. **Non-deterministic dQ**: the backward accumulates dQ with FP32 `atomicAdd`
-6. **Varlen backward** runs one kernel launch per sequence (still faster than the SDPA fallback with a block mask)
-7. **Turing (SM 7.5)** is not supported yet (shared memory limit, see Supported Hardware)
-8. Known integration corner cases:
+6. Known integration corner cases:
    - Pascal + `generate(cache_implementation="static")`: transformers compiles the decoding step with `torch.compile`, and Triton needs SM >= 7.0. Pass `disable_compile=True`
    - decoders with bidirectional attention (`is_causal=False`) and a static cache attend to the empty cache slots, exactly as HF's SDPA does
    - Doge with a static cache indexes the attention mask as 4D and fails with our 2D cache mask
@@ -434,8 +432,10 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] HuggingFace Transformers native integration (`attn_implementation="flash_attn_legacy"`)
 - [x] WMMA tensor cores for both Q@K^T and P@V on Volta
 - [x] WMMA-based backward on Volta
-- [x] Variable-length sequence support (`flash_attn_varlen_func`)
-- [ ] Turing (SM 7.5) optimized path
+- [x] Variable-length sequence support (`flash_attn_varlen_func`), forward and backward in one launch each
+- [x] Turing (SM 7.5)
+- [x] FlashAttention-2 style kernels (warp bands, register accumulators): at or above PyTorch SDPA memory-efficient speed (`docs/bench/`)
+- [ ] Sliding window, softcap and attention sinks in the kernel; head_dim 72/80; decode kernel (see `docs/PLAN.md`)
 
 ## References
 
