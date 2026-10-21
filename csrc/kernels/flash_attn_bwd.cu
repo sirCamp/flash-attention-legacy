@@ -67,6 +67,7 @@ struct BwdBlockArgs {
     index_t q_head_stride, o_head_stride, l_head_stride, dq_head_stride;
     index_t q_stride, o_stride, l_stride, dq_stride, k_stride, v_stride, dk_stride, dv_stride;
     int heads_per_kv, kv_start, seq_len_q, seq_len_k;
+    int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero, never written)
     float softmax_scale;
     bool is_causal;
 };
@@ -96,6 +97,7 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     a.kv_start = kv_start;
     a.seq_len_q = seq_len_q;
     a.seq_len_k = seq_len_k;
+    a.head_dim = p.head_dim;  // kernels narrow it with tile_valid_cols
     a.softmax_scale = p.softmax_scale;
     a.is_causal = p.is_causal;
     return a;
@@ -111,7 +113,9 @@ bwd_batched_kernel(FlashAttnBwdParams p) {
     const int kv_h = bh % p.num_heads_k;
     const int kv_start = (blockIdx.x % key_blocks) * Tile::Bc;
     if (kv_start >= p.seq_len_k) return;
-    Body::template run<Tile>(bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, kv_h, kv_start));
+    BwdBlockArgs a = bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, kv_h, kv_start);
+    a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
+    Body::template run<Tile>(a);
 }
 
 // Grid (key blocks of all sequences, H_kv): the sequence comes from
@@ -125,8 +129,10 @@ bwd_varlen_kernel(FlashAttnBwdParams p) {
     const int seq_len_k = p.cu_seqlens_k[seq + 1] - k_tok0;
     const int kv_start = (blockIdx.x - p.key_block_offsets[seq]) * Tile::Bc;
     if (kv_start >= seq_len_k) return;
-    Body::template run<Tile>(bwd_block_args(p, 0, q_tok0, k_tok0, p.cu_seqlens_q[seq + 1] - q_tok0,
-                                            seq_len_k, blockIdx.y, kv_start));
+    BwdBlockArgs a = bwd_block_args(p, 0, q_tok0, k_tok0, p.cu_seqlens_q[seq + 1] - q_tok0,
+                                    seq_len_k, blockIdx.y, kv_start);
+    a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
+    Body::template run<Tile>(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +187,8 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     float* smem_L  = smem_dS + Br * LDF;
     float* smem_D  = smem_L + Br;
 
-    load_tile_g2s<Bc, D, NT, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv);
-    load_tile_g2s<Bc, D, NT, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv);
+    load_tile_g2s<Bc, D, NT, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
+    load_tile_g2s<Bc, D, NT, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
 
     const int kv_j = tid % Bc, kv_c0 = (tid / Bc) * KV_COLS;
     const int q_i = tid % Br, q_c0 = (tid / Br) * Q_COLS;
@@ -201,9 +207,9 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             // The previous iteration's readers of Q/dO/P/dS passed the barrier
             // at the end of the loop body.
             load_tile_g2s<Br, D, NT, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
-                                          smem_Q, valid_q);
+                                          smem_Q, valid_q, a.head_dim);
             load_tile_g2s<Br, D, NT, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
-                                          smem_dO, valid_q);
+                                          smem_dO, valid_q, a.head_dim);
             if (tid < Br) {
                 const index_t lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
                 smem_L[tid] = (tid < valid_q) ? a.L[lrow] : 0.0f;
@@ -265,7 +271,9 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                 }
                 float* dq_row = a.dQ + qh * a.dq_head_stride + (q_start + q_i) * a.dq_stride + q_c0;
                 #pragma unroll
-                for (int c = 0; c < Q_COLS; c++) atomicAdd(&dq_row[c], acc_dQ[c]);
+                for (int c = 0; c < Q_COLS; c++) {
+                    if (q_c0 + c < a.head_dim) atomicAdd(&dq_row[c], acc_dQ[c]);
+                }
             }
             __syncthreads();  // P/dS/Q/dO are overwritten by the next iteration
         }
@@ -273,12 +281,15 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
 
     // Write dK, dV (row j of this KV block, column slice)
     if (kv_j < valid_kv) {
-        half2* dk2 = reinterpret_cast<half2*>(a.dK + (kv_start + kv_j) * a.dk_stride + kv_c0);
-        half2* dv2 = reinterpret_cast<half2*>(a.dV + (kv_start + kv_j) * a.dv_stride + kv_c0);
         #pragma unroll
         for (int c = 0; c < KV_COLS / 2; c++) {
-            dk2[c] = __floats2half2_rn(acc_dK[2 * c], acc_dK[2 * c + 1]);
-            dv2[c] = __floats2half2_rn(acc_dV[2 * c], acc_dV[2 * c + 1]);
+            const int col = kv_c0 + 2 * c;
+            if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
+                *reinterpret_cast<half2*>(a.dK + (kv_start + kv_j) * a.dk_stride + col) =
+                    __floats2half2_rn(acc_dK[2 * c], acc_dK[2 * c + 1]);
+                *reinterpret_cast<half2*>(a.dV + (kv_start + kv_j) * a.dv_stride + col) =
+                    __floats2half2_rn(acc_dV[2 * c], acc_dV[2 * c + 1]);
+            }
         }
     }
 }
@@ -360,8 +371,8 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
         wmma::fill_fragment(dV[t], 0.0f);
     }
 
-    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv);
-    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv);
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
+    load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
 
     const int num_q_blocks = cdiv(a.seq_len_q, Br);
     const int q_first_blk = bwd_first_q_block(a.is_causal, kv_start, Br, a.seq_len_q, a.seq_len_k);
@@ -373,9 +384,9 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             const int q_start = q_blk * Br;
             const int valid_q = min(Br, a.seq_len_q - q_start);
             load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
-                                                   smem_Q, valid_q);
+                                                   smem_Q, valid_q, a.head_dim);
             load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
-                                                   smem_dO, valid_q);
+                                                   smem_dO, valid_q, a.head_dim);
             for (int i = tid; i < Br; i += NUM_THREADS) {
                 // Rows past the sequence: P = 0 through the mask, D never used
                 const index_t lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
@@ -483,7 +494,9 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                 #pragma unroll
                 for (int e = lane; e < T * T; e += 32) {
                     const int row = qr * T + e / T;
-                    if (row < valid_q) ::atomicAdd(dQ_blk + row * a.dq_stride + dc * T + e % T, wstage[e]);
+                    if (row < valid_q && dc * T + e % T < a.head_dim) {
+                        ::atomicAdd(dQ_blk + row * a.dq_stride + dc * T + e % T, wstage[e]);
+                    }
                 }
                 __syncwarp();
             }
@@ -496,19 +509,21 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     half* dK_out = a.dK + (kv_start + band * T) * a.dk_stride + part * DP;
     half* dV_out = a.dV + (kv_start + band * T) * a.dv_stride + part * DP;
     const int band_valid = valid_kv - band * T;  // may be <= 0 for the last block
-    auto store = [&](Acc& frag, half* out, index_t stride) {
+    auto store = [&](Acc& frag, half* out, index_t stride, int col0) {
         wmma::store_matrix_sync(wstage, frag, T, wmma::mem_row_major);
         __syncwarp();
         #pragma unroll
         for (int e = lane; e < T * T; e += 32) {
-            if (e / T < band_valid) out[(e / T) * stride + e % T] = __float2half(wstage[e]);
+            if (e / T < band_valid && col0 + e % T < a.head_dim) {
+                out[(e / T) * stride + e % T] = __float2half(wstage[e]);
+            }
         }
         __syncwarp();
     };
     #pragma unroll
     for (int t = 0; t < DPT; t++) {
-        store(dK[t], dK_out + t * T, a.dk_stride);
-        store(dV[t], dV_out + t * T, a.dv_stride);
+        store(dK[t], dK_out + t * T, a.dk_stride, part * DP + t * T);
+        store(dV[t], dV_out + t * T, a.dv_stride, part * DP + t * T);
     }
 }
 };
@@ -553,6 +568,8 @@ static void dispatch_bwd_simt_tile(int head_dim, F&& f) {
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<BwdTileSimt<32, 32, 32>>(limit, f); break;
         case 64:  ok = with_first_fitting_tile<BwdTileSimt<32, 32, 64>>(limit, f); break;
+        case 72:
+        case 80:  // zero-padded to the d=96 tile (CUDA-core tiles need d % 32 == 0)
         case 96:  ok = with_first_fitting_tile<BwdTileSimt<32, 16, 96>>(limit, f); break;
         case 128: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 128>>(limit, f); break;
         case 256: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 256>>(limit, f); break;
@@ -568,6 +585,9 @@ static void dispatch_bwd_wmma_tile(int head_dim, F&& f) {
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 32>>(limit, f); break;
         case 64:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 64>>(limit, f); break;
+        case 72:
+        case 80:  ok = with_first_fitting_tile<BwdTileWmma<32, 64, 80>>(limit, f); break;  // 72 zero-padded;
+                  // fwd+bwd N=4096 d=72/80: V100 11.9 ms (SDPA 16.0), T4 26.2 (37.5)
         case 96:  ok = with_first_fitting_tile<BwdTileWmma<32, 64, 96, 2>, BwdTileWmma<32, 32, 96, 2>>(limit, f); break;
         case 128: ok = with_first_fitting_tile<BwdTileWmma<32, 64, 128, 2>, BwdTileWmma<32, 32, 128, 2>>(limit, f); break;
         case 256: ok = with_first_fitting_tile<BwdTileWmma<32, 32, 256, 4>, BwdTileWmma<32, 16, 256, 4>>(limit, f); break;

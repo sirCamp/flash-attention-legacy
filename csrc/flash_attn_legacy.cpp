@@ -102,6 +102,13 @@ static int get_sm_version(int device_id = -1) {
     return sm;
 }
 
+// Head dimensions with a kernel tile (72 and 80 run on the 80 / 96 tiles with
+// zero-padded columns).
+static void check_head_dim(int d) {
+    TORCH_CHECK(d == 32 || d == 64 || d == 72 || d == 80 || d == 96 || d == 128 || d == 256,
+                "head_dim must be 32, 64, 72, 80, 96, 128, or 256, got ", d);
+}
+
 // Input checks shared by the varlen entry points: Q [total_q, H_q, d],
 // K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
 static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
@@ -112,8 +119,7 @@ static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, 
                 V.dtype() == torch::kFloat16, "Q, K, V must be float16");
     TORCH_CHECK(Q.dim() == 3 && K.dim() == 3 && V.dim() == 3, "Q, K, V must be [total, H, d]");
     const int d = Q.size(2), H_q = Q.size(1), H_kv = K.size(1);
-    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
-                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
+    check_head_dim(d);
     TORCH_CHECK(K.size(2) == d && V.sizes() == K.sizes(), "K, V shape mismatch");
     TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "H_q (", H_q, ") must be divisible by H_kv (", H_kv, ")");
@@ -214,8 +220,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     const int H_kv = K.size(1);
     const int Nk = K.size(2);
 
-    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
-                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
+    check_head_dim(d);
     TORCH_CHECK(K.size(0) == B && K.size(3) == d, "K shape mismatch");
     TORCH_CHECK(V.sizes() == K.sizes(), "V shape must match K");
     TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
@@ -292,8 +297,7 @@ std::vector<torch::Tensor> flash_attn_backward(
                 "batch and sequence lengths must fit in int32");
     const int B = Q.size(0), H_q = Q.size(1), N = Q.size(2), d = Q.size(3);
     const int H_kv = K.size(1);
-    TORCH_CHECK(d == 32 || d == 64 || d == 96 || d == 128 || d == 256,
-                "head_dim must be 32, 64, 96, 128, or 256, got ", d);
+    check_head_dim(d);
     TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv for GQA");
     const int Nk = K.size(2);

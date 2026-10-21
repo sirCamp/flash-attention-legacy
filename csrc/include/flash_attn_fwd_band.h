@@ -37,6 +37,7 @@ struct FwdBlockArgs {
     half* __restrict__ O; index_t o_stride;
     float* __restrict__ L; index_t l_stride;
     int q_row_start, valid_q, seq_len_q, seq_len_k;
+    int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero)
     float softmax_scale;
     bool is_causal;
 };
@@ -148,15 +149,15 @@ template <typename Tile, int LD, typename DstT, typename Step>
 __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row0, bool band_active,
                                              DstT* smem_Q, DstT* smem_K, DstT* smem_V, Step&& step) {
     constexpr int Br = Tile::Br, Bc = Tile::Bc, d = Tile::d, NT = Tile::kNumWarps * 32;
-    auto load_q = [&]() { load_tile_g2s<Br, d, NT, LD>(a.Q, a.q_stride, smem_Q, a.valid_q); };
+    auto load_q = [&]() { load_tile_g2s<Br, d, NT, LD>(a.Q, a.q_stride, smem_Q, a.valid_q, a.head_dim); };
     if constexpr (Tile::kPrefetch) {
         TileRegs<Bc, d, NT> next_K, next_V;
         fwd_band_loop<Br, Bc>(a, band_row0, band_active, load_q,
             [&](int kv_blk) {
                 const int kv_start = kv_blk * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                load_tile_g2r(a.K + kv_start * a.k_stride, a.k_stride, next_K, valid_kv);
-                load_tile_g2r(a.V + kv_start * a.v_stride, a.v_stride, next_V, valid_kv);
+                load_tile_g2r(a.K + kv_start * a.k_stride, a.k_stride, next_K, valid_kv, a.head_dim);
+                load_tile_g2r(a.V + kv_start * a.v_stride, a.v_stride, next_V, valid_kv, a.head_dim);
             },
             [&]() {
                 store_tile_r2s<Bc, d, NT, LD>(next_K, smem_K);
@@ -170,8 +171,8 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             [&]() {
                 const int kv_start = pending * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv);
-                load_tile_g2s<Bc, d, NT, LD>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv);
+                load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
+                load_tile_g2s<Bc, d, NT, LD>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
             },
             step);
     }
@@ -208,6 +209,7 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.valid_q = min(Tile::Br, p.seq_len_q - q_row_start);
     a.seq_len_q = p.seq_len_q;
     a.seq_len_k = p.seq_len_k;
+    a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
     a.is_causal = p.is_causal;
     Body::template run<Tile>(a);
@@ -242,6 +244,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.valid_q = min(Tile::Br, seq_len_q - q_row_start);
     a.seq_len_q = seq_len_q;
     a.seq_len_k = p.cu_seqlens_k[seq_idx + 1] - k_start_tok;
+    a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
     a.is_causal = p.is_causal;
     Body::template run<Tile>(a);

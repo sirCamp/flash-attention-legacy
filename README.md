@@ -40,7 +40,7 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 | **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | CUDA cores (fp16 storage, fp32 math) |
 | **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | WMMA 16x16x16 (tiles sized for its 64 KB of shared memory per block) |
 
-Head dimensions: **d = 32, 64, 96, 128, 256**.
+Head dimensions: **d = 32, 64, 72, 80, 96, 128, 256** (72 and 80, as in SigLIP / Qwen2-VL vision towers, run on wider tiles with zero-padded columns).
 
 The kernels compute in **FP16**. BF16 and FP32 inputs are accepted for inference: they are converted to FP16 with a range check (values beyond 65504 raise `FP16RangeError`; through HuggingFace the call falls back to SDPA in the original dtype). Training with BF16/FP32 inputs is not supported by the kernels (FP16 gradients without loss scaling may underflow): use FP16 with a `GradScaler`; through HuggingFace it falls back to SDPA.
 
@@ -415,7 +415,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 
 ## Limitations
 
-1. **Head dimensions**: only d = 32, 64, 96, 128, 256 (other sizes, e.g. 72/80 in SigLIP / Qwen2-VL vision towers, run on the SDPA fallback)
+1. **Head dimensions**: d = 32, 64, 72, 80, 96, 128, 256; other sizes run on the SDPA fallback
 2. **FP16 compute**: BF16/FP32 for inference only (see above); no native BF16
 3. **Kernel features**: causal (bottom-right aligned) or no mask, packed segments. No sliding window, softcap, sinks or dropout in the kernel yet: those layers run on the fallbacks
 4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
@@ -435,7 +435,8 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] Variable-length sequence support (`flash_attn_varlen_func`), forward and backward in one launch each
 - [x] Turing (SM 7.5)
 - [x] FlashAttention-2 style kernels (warp bands, register accumulators): at or above PyTorch SDPA memory-efficient speed (`docs/bench/`)
-- [ ] Sliding window, softcap and attention sinks in the kernel; head_dim 72/80; decode kernel (see `docs/PLAN.md`)
+- [x] head_dim 72 / 80
+- [ ] Sliding window, softcap and attention sinks in the kernel; decode kernel (see `docs/PLAN.md`)
 
 ## References
 

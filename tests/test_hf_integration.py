@@ -55,7 +55,7 @@ _INIT = {"llama": 0.5, "gemma3": 0.05, "gemma2": 0.05, "gpt_oss": 0.5}
 # P0.1 — kernel support is decided per call, never on the model config
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("head_dim", [64, 80])
+@pytest.mark.parametrize("head_dim", [64, 48])
 def test_backend_kept_for_any_head_dim(head_dim):
     """B6: the old config-based check switched whole models to sdpa (and used
     hidden_size / num_heads, wrong for sub-models). The backend must stay ours."""
@@ -63,7 +63,7 @@ def test_backend_kept_for_any_head_dim(head_dim):
     assert model.config._attn_implementation == "flash_attn_legacy"
 
 
-@pytest.mark.parametrize("head_dim,expect_kernel", [(64, True), (128, True), (80, False), (48, False)])
+@pytest.mark.parametrize("head_dim,expect_kernel", [(64, True), (128, True), (80, True), (72, True), (48, False)])
 def test_per_call_decision_and_registry(monkeypatch, head_dim, expect_kernel):
     base = tiny_llama(head_dim=head_dim)
     ids = torch.randint(0, base.config.vocab_size, (1, 200))
@@ -146,7 +146,7 @@ def test_softcap_disabled_values_do_not_raise(value):
 
 
 def test_warn_once_per_reason_and_not_for_expected(caplog):
-    base = tiny_llama(head_dim=80)
+    base = tiny_llama(head_dim=48)
     model = load_impl(base, "flash_attn_legacy")
     ids = torch.randint(0, base.config.vocab_size, (1, 16), device="cuda")
     with caplog.at_level(logging.WARNING, logger=integrations.__name__):
@@ -154,7 +154,7 @@ def test_warn_once_per_reason_and_not_for_expected(caplog):
         model.generate(ids, max_new_tokens=3, min_new_tokens=3, do_sample=False)
     warnings = [r for r in caplog.records
                 if r.name == integrations.__name__ and r.levelno == logging.WARNING]
-    assert len(warnings) == 1 and "head_dim=80" in warnings[0].getMessage()
+    assert len(warnings) == 1 and "head_dim=48" in warnings[0].getMessage()
     # Reasons are checked in order: decode steps count as "decode", prefills as "head_dim".
     n_layers = base.config.num_hidden_layers
     assert fallback_stats() == {"head_dim": 2 * n_layers, "decode": 2 * 2 * n_layers}
@@ -494,7 +494,7 @@ def _per_segment_reference(q, k, v, scaling, causal):
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
-@pytest.mark.parametrize("head_dim,path", [(64, "varlen"), (80, "sdpa")])
+@pytest.mark.parametrize("head_dim,path", [(64, "varlen"), (80, "varlen"), (48, "sdpa")])
 def test_cu_seq_lens_direct(monkeypatch, causal, kv_heads, head_dim, path):
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1], d=head_dim)
@@ -684,7 +684,7 @@ def test_packed_position_ids_training_grads():
 
 
 @pytest.mark.parametrize("kind,head_dim,expect_varlen", [
-    ("qwen2_vl", 64, True), ("qwen2_vl", 80, False), ("qwen2_5_vl", 64, True)])
+    ("qwen2_vl", 64, True), ("qwen2_vl", 80, True), ("qwen2_vl", 48, False), ("qwen2_5_vl", 64, True)])
 def test_vision_tower_multiple_images(monkeypatch, kind, head_dim, expect_varlen):
     """VLM vision encoders: patches of several images attend within their image
     (and window, Qwen2.5-VL) via cu_seq_lens."""

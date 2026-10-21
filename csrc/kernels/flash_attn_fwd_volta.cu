@@ -188,7 +188,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         #pragma unroll
         for (int c = lane; c < PASS_CHUNKS; c += 32) {
             const int row = c / (GROUP * 2), col = (c % (GROUP * 2)) * 8;
-            if (row < band_valid) {
+            if (row < band_valid && t0 * T + col < a.head_dim) {
                 const float4 lo = *reinterpret_cast<const float4*>(stage + row * LDS + col);
                 const float4 hi = *reinterpret_cast<const float4*>(stage + row * LDS + col + 4);
                 const half2 o[4] = {__floats2half2_rn(lo.x, lo.y), __floats2half2_rn(lo.z, lo.w),
@@ -229,6 +229,8 @@ static void dispatch_volta_fwd_tile(int head_dim, F&& f) {
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<TileVolta_d32>(limit, f); break;
         case 64:  ok = with_first_fitting_tile<TileVolta_d64>(limit, f); break;
+        case 72:
+        case 80:  ok = with_first_fitting_tile<TileVolta_d80>(limit, f); break;  // 72 zero-padded
         case 96:  ok = with_first_fitting_tile<TileVolta_d96>(limit, f); break;
         case 128: ok = with_first_fitting_tile<TileVolta_d128, TileVolta_d128_64k>(limit, f); break;
         case 256: ok = with_first_fitting_tile<TileVolta_d256, TileVolta_d256_64k>(limit, f); break;

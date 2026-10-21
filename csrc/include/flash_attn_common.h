@@ -44,7 +44,7 @@ struct FlashAttnParams {
     int num_heads_k;     // H_kv — key/value heads (== num_heads for MHA, 1 for MQA)
     int seq_len_q;       // N_q
     int seq_len_k;       // N_kv (may differ from N_q; causal is bottom-right aligned)
-    int head_dim;        // 32, 64, 96, 128, or 256
+    int head_dim;        // 32, 64, 72, 80, 96, 128, or 256
 
     // Strides (in elements) for Q
     index_t q_batch_stride;
@@ -96,7 +96,7 @@ struct FlashAttnVarlenParams {
     int num_seqs;
     int num_heads;       // H_q
     int num_heads_k;     // H_kv
-    int head_dim;        // 32, 64, 96, 128, or 256
+    int head_dim;        // 32, 64, 72, 80, 96, 128, or 256
 
     // Strides (in elements) — layout is [total, H, d]
     index_t q_token_stride;  // H_q * d
@@ -231,6 +231,8 @@ struct FwdTileSimt {
 // (V100) vs 35.9; on T4 d=256 stays at 4 warps (55 ms; 8 warps do not fit).
 using TileVolta_d32  = FwdTileWmma<128, 32, 32>;    // 36 KB
 using TileVolta_d64  = FwdTileWmma<128, 32, 64>;    // 48 KB
+using TileVolta_d80  = FwdTileWmma<128, 16, 80>;    // 40 KB, also d=72 (zero-padded columns):
+                                                    // N=4096 V100 3.1 ms (SDPA 3.4), T4 5.9 (8.2)
 using TileVolta_d96  = FwdTileWmma<128, 16, 96>;    // 45 KB
 using TileVolta_d128 = FwdTileWmma<128, 32, 128>;   // 72 KB (V100)
 using TileVolta_d128_64k = FwdTileWmma<128, 16, 128>;  // 55 KB
@@ -375,7 +377,8 @@ __host__ __device__ __forceinline__ int cdiv(int a, int b) {
 // that a kernel can issue the global loads of the next tile early (into
 // registers) and store them to shared memory later: load_tile_g2r reads a
 // [ROWS, COLS] half tile (row stride src_row_stride) into TileRegs, rows >=
-// num_valid_rows as zeros; store_tile_r2s writes it with row stride DST_STRIDE
+// num_valid_rows and columns >= num_valid_cols (a multiple of 8: head_dim 72 /
+// 80 on a tile of 80 / 96 columns) as zeros; store_tile_r2s writes it with row stride DST_STRIDE
 // (>= COLS, padded against bank conflicts), as half or converted to fp32.
 // load_tile_g2s does both directly.
 // Rows must start 16-byte aligned (COLS, strides multiples of 8 halves;
@@ -396,12 +399,13 @@ struct TileRegs {
 // Vector idx of a tile copy: row idx / kVecPerRow, 8 halves at column 8 * (idx % kVecPerRow).
 template <typename R>
 __device__ __forceinline__ uint4 tile_vec_load(const half* __restrict__ src, int src_row_stride,
-                                               int idx, int num_valid_rows) {
+                                               int idx, int num_valid_rows, int num_valid_cols) {
     const int row = idx / R::kVecPerRow;
-    if ((R::kVecs % R::kThreads != 0 && idx >= R::kVecs) || row >= num_valid_rows) {
+    const int col = (idx % R::kVecPerRow) * 8;
+    if ((R::kVecs % R::kThreads != 0 && idx >= R::kVecs) || row >= num_valid_rows || col >= num_valid_cols) {
         return make_uint4(0u, 0u, 0u, 0u);
     }
-    return *reinterpret_cast<const uint4*>(src + row * src_row_stride + (idx % R::kVecPerRow) * 8);
+    return *reinterpret_cast<const uint4*>(src + row * src_row_stride + col);
 }
 
 template <typename R, int DST_STRIDE>
@@ -411,6 +415,14 @@ __device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, 
         *reinterpret_cast<uint4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
                                   + (idx % R::kVecPerRow) * 8) = v;
     }
+}
+
+// Columns of a tile of d columns that hold data for this head_dim: tiles of 80
+// and 96 columns also run head_dim 72 / 80 with zero-padded columns, every
+// other tile has head_dim == d (a compile-time constant: no runtime checks).
+template <int d>
+__host__ __device__ __forceinline__ int tile_valid_cols(int head_dim) {
+    return (d == 80 || d == 96) ? head_dim : d;
 }
 
 // Varlen grids: sequence of a flat block index, from the cumulative per-sequence
@@ -445,12 +457,13 @@ __device__ __forceinline__ void tile_vec_store(float* __restrict__ dst, int idx,
 template <int ROWS, int COLS, int NUM_THREADS>
 __device__ __forceinline__ void load_tile_g2r(
     const half* __restrict__ src, int src_row_stride,
-    TileRegs<ROWS, COLS, NUM_THREADS>& regs, int num_valid_rows
+    TileRegs<ROWS, COLS, NUM_THREADS>& regs, int num_valid_rows, int num_valid_cols = COLS
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
-        regs.v[i] = tile_vec_load<R>(src, src_row_stride, threadIdx.x + i * NUM_THREADS, num_valid_rows);
+        regs.v[i] = tile_vec_load<R>(src, src_row_stride, threadIdx.x + i * NUM_THREADS, num_valid_rows,
+                                     num_valid_cols);
     }
 }
 
@@ -469,13 +482,14 @@ __device__ __forceinline__ void store_tile_r2s(
 template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
 __device__ __forceinline__ void load_tile_g2s(
     const half* __restrict__ src, int src_row_stride,
-    DstT* __restrict__ dst, int num_valid_rows
+    DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
         const int idx = threadIdx.x + i * NUM_THREADS;
-        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load<R>(src, src_row_stride, idx, num_valid_rows));
+        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load<R>(src, src_row_stride, idx, num_valid_rows,
+                                                                 num_valid_cols));
     }
 }
 

@@ -8,7 +8,7 @@ Architectures:
     - Pascal: Tesla P100, GTX 1080/Ti (SM 6.0, 6.1)
     - Volta:  Tesla V100, Titan V      (SM 7.0)
 
-Head dimensions: 32, 64, 96, 128, 256
+Head dimensions: 32, 64, 72, 80, 96, 128, 256
 
 Quick start:
     >>> import torch

@@ -142,12 +142,14 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         if (cg == 0) a.L[row * a.l_stride] = lse[i];
         #pragma unroll
         for (int t = 0; t < TD; t++) {
-            const half2 lo = __floats2half2_rn(O[i][t].x * inv[i], O[i][t].y * inv[i]);
-            const half2 hi = __floats2half2_rn(O[i][t].z * inv[i], O[i][t].w * inv[i]);
-            uint2 packed;
-            memcpy(&packed.x, &lo, 4);
-            memcpy(&packed.y, &hi, 4);
-            *reinterpret_cast<uint2*>(a.O + row * a.o_stride + 4 * cg + 32 * t) = packed;
+            if (4 * cg + 32 * t < a.head_dim) {  // not a zero-padded column (d=72/80)
+                const half2 lo = __floats2half2_rn(O[i][t].x * inv[i], O[i][t].y * inv[i]);
+                const half2 hi = __floats2half2_rn(O[i][t].z * inv[i], O[i][t].w * inv[i]);
+                uint2 packed;
+                memcpy(&packed.x, &lo, 4);
+                memcpy(&packed.y, &hi, 4);
+                *reinterpret_cast<uint2*>(a.O + row * a.o_stride + 4 * cg + 32 * t) = packed;
+            }
         }
     }
 }
@@ -164,7 +166,10 @@ static void dispatch_pascal_fwd_tile(int head_dim, F&& f) {
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<TilePascal_d32>(limit, f); break;
         case 64:  ok = with_first_fitting_tile<TilePascal_d64>(limit, f); break;
+        case 72:
+        case 80:
         case 96:  ok = with_first_fitting_tile<TilePascal_d96>(limit, f); break;
+        // 72/80 zero-padded (CUDA-core tiles need d % 32 == 0): fwd N=4096 P100 22.7 ms (SDPA 23.2-24.1)
         case 128: ok = with_first_fitting_tile<TilePascal_d128>(limit, f); break;
         case 256: ok = with_first_fitting_tile<TilePascal_d256>(limit, f); break;
         default:  throw std::runtime_error("Unsupported head_dim for the CUDA-core forward");

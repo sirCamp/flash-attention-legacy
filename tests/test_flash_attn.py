@@ -68,7 +68,7 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(params=[32, 64, 96, 128, 256], ids=["d32", "d64", "d96", "d128", "d256"])
+@pytest.fixture(params=[32, 64, 72, 80, 96, 128, 256], ids=["d32", "d64", "d72", "d80", "d96", "d128", "d256"])
 def head_dim(request):
     return request.param
 
@@ -313,7 +313,7 @@ class TestVarlen:
             outputs.append(oi.squeeze(0).permute(1, 0, 2))
         return torch.cat(outputs, dim=0)
 
-    @pytest.mark.parametrize("d", [32, 64, 96, 128, 256])
+    @pytest.mark.parametrize("d", [32, 64, 72, 80, 96, 128, 256])
     @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
     def test_varlen_correctness(self, d, causal):
         """Varlen matches per-sequence reference attention."""
@@ -338,7 +338,7 @@ class TestVarlen:
         assert out.shape == (total, H, d)
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=5e-3)
 
-    @pytest.mark.parametrize("d", [32, 64, 96, 128, 256])
+    @pytest.mark.parametrize("d", [32, 64, 72, 80, 96, 128, 256])
     def test_varlen_gqa(self, d):
         """Varlen with GQA (different Q and KV head counts)."""
         from flash_attn_legacy import flash_attn_varlen_func
@@ -458,6 +458,8 @@ class TestModules:
     @pytest.mark.parametrize("embed_dim,num_heads,head_dim", [
         (384, 12, 32),   # MiniLM-style
         (768, 8, 96),    # Phi-3-mini-style
+        (1152, 16, 72),  # SigLIP-so400m-style (zero-padded tiles)
+        (1280, 16, 80),  # Qwen2-VL vision-style
         (512, 2, 256),   # GPT-J-style
     ])
     def test_module_new_head_dims(self, embed_dim, num_heads, head_dim):

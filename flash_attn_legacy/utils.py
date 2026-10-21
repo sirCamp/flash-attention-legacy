@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 # Single source of truth for the head dimensions the CUDA kernels are compiled for
 # (keep in sync with the dispatch switches in csrc/).
-SUPPORTED_HEAD_DIMS = (32, 64, 96, 128, 256)
+SUPPORTED_HEAD_DIMS = (32, 64, 72, 80, 96, 128, 256)
 
 
 def check_head_dim(d: int) -> None:
