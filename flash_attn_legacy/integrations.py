@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 class FallbackReason(NamedTuple):
     message: str
-    action: str = "sdpa"     # "sdpa": run SDPA instead; "raise": NotImplementedError
+    # "sdpa": torch SDPA; "eager": _eager_attention (applies softcap / sinks /
+    # position_bias, which SDPA would ignore); "raise": NotImplementedError
+    action: str = "sdpa"
     expected: bool = False   # expected by design: counted but not logged
     hint: str = ""           # what to use instead (for action="raise")
 
@@ -52,12 +54,10 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
         "packed/segmented attention via cu_seq_lens_q/k (e.g. VLM vision encoders)", "raise",
         hint="attn_implementation='sdpa' handles it (for a VLM it can be set for the vision "
              "sub-model only)"),
-    "softcap": FallbackReason("attention logit softcapping (e.g. Gemma 2)", "raise",
-                              hint="use attn_implementation='eager'"),
-    "s_aux": FallbackReason("attention sinks s_aux (e.g. gpt-oss)", "raise",
-                            hint="use attn_implementation='eager'"),
-    "position_bias": FallbackReason("additive position_bias", "raise",
-                                    hint="use attn_implementation='eager'"),
+    # -- SDPA would ignore them: eager fallback (temporary, docs/PLAN.md §3b) --
+    "softcap": FallbackReason("attention logit softcapping (e.g. Gemma 2)", "eager"),
+    "s_aux": FallbackReason("attention sinks s_aux (e.g. gpt-oss)", "eager"),
+    "position_bias": FallbackReason("additive position_bias", "eager"),
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
     "decode": FallbackReason("q_len == 1 (decode)", expected=True),
     "attention_mask": FallbackReason(
@@ -81,9 +81,9 @@ _fallback_counts: Counter = Counter()
 _warned_reasons: set = set()
 
 
-def _record_fallback(reason: str, detail: str = "") -> None:
+def _record_fallback(reason: str, detail: str = "") -> str:
     """Count a fallback; warn once per reason (unless expected); raise if the
-    reason has no correct fallback."""
+    reason has no correct fallback. Returns the action ("sdpa" or "eager")."""
     if reason not in FALLBACK_REASONS:
         raise KeyError(f"unknown fallback reason {reason!r}")
     info = FALLBACK_REASONS[reason]
@@ -94,7 +94,9 @@ def _record_fallback(reason: str, detail: str = "") -> None:
             f"fallback would silently ignore it: {info.hint}.")
     if not info.expected and reason not in _warned_reasons:
         _warned_reasons.add(reason)
-        logger.warning("flash_attn_legacy: falling back to SDPA: %s%s", info.message, detail)
+        logger.warning("flash_attn_legacy: falling back to %s attention: %s%s",
+                       info.action, info.message, detail)
+    return info.action
 
 
 def fallback_stats() -> Dict[str, int]:
@@ -139,6 +141,93 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
     return None, ""
 
 
+def _causal_mask(q_len: int, kv_len: int, device) -> torch.Tensor:
+    """Bottom-right aligned causal mask (True = keep): query i sees keys
+    j <= i + (kv_len - q_len), the convention of the kernel."""
+    return torch.ones(q_len, kv_len, dtype=torch.bool, device=device).tril(diagonal=kv_len - q_len)
+
+
+# Upper bound for the fp32 logits of one query block in _eager_attention (the
+# block holds ~3 live copies of it: logits, probabilities, a masked temporary).
+_EAGER_BLOCK_BYTES = 256 * 1024 * 1024
+
+
+def _eager_attention(query, key, value, mask, scaling, dropout_p, softcap=None,
+                     sinks=None, position_bias=None):
+    """Reference attention for features SDPA cannot express, in fp32, one block
+    of query rows at a time (block size from _EAGER_BLOCK_BYTES).
+
+    Semantics follow transformers' eager implementations: logits = q k^T * scale;
+    softcap * tanh(logits / softcap) (Gemma 2); + position_bias (additive, must
+    NOT include the mask; 2D-4D, broadcastable to [B, H, q, kv]); the mask (2D-4D,
+    bool: True = keep, or additive float); softmax with an extra per-head sink logit that takes
+    probability mass but contributes no value (gpt-oss); dropout.
+
+    q: [B, H, q, d]; k, v: [B, H_kv, kv, d] (GQA not expanded: query heads are
+    grouped per KV head, so K/V are never copied H/H_kv times). Returns
+    [B, H, q, d_v] in the query dtype. Inference-oriented: under autograd every
+    block's intermediates are kept. Temporary: replaced by the kernel
+    (docs/PLAN.md §3b)."""
+    B, H, q_len, d = query.shape
+    H_kv, kv_len = key.shape[1], key.shape[2]
+    rep = H // H_kv
+    lowest = torch.finfo(torch.float32).min  # like HF eager: no -inf, so no NaN rows
+
+    def grouped(t):
+        """[*, H or 1, rows, kv] -> [*, H_kv or 1, rep or 1, rows, kv] (query-head groups)."""
+        if t.shape[1] == 1:
+            return t.unsqueeze(2)
+        return t.reshape(t.shape[0], H_kv, rep, *t.shape[2:])
+
+    def rows(t, r0, r1):  # slice the query dimension when it is not broadcast
+        return t if t.shape[-2] == 1 else t[..., r0:r1, :]
+
+    def as_4d(t, name):
+        if t.dim() not in (2, 3, 4):
+            raise ValueError(f"flash_attn_legacy: {name} must be 2D, 3D or 4D, got {tuple(t.shape)}")
+        while t.dim() < 4:
+            t = t.unsqueeze(0)
+        return grouped(t[..., :kv_len].expand(-1, -1, q_len, -1))
+
+    if mask is not None:
+        mask = as_4d(mask, "attention mask")
+    if position_bias is not None:
+        position_bias = as_4d(position_bias, "position_bias")
+    if sinks is not None:
+        sinks = sinks.float().reshape(1, H_kv, rep, 1, 1)
+
+    # The `rep` query heads of a KV head are folded into the row dimension so that
+    # both matmuls have identical batch dims ([B, H_kv]): a broadcast matmul would
+    # materialise K and V `rep` times per block.
+    k32, v32 = key.float(), value.float()      # [B, H_kv, kv, d]
+    q = query.reshape(B, H_kv, rep, q_len, d)
+    d_v = value.shape[-1]
+    out = torch.empty(B, H_kv, rep, q_len, d_v, dtype=query.dtype, device=query.device)
+    block = max(1, _EAGER_BLOCK_BYTES // (3 * 4 * B * H * max(kv_len, 1)))
+    for r0 in range(0, q_len, block):
+        r1 = min(r0 + block, q_len)
+        n = r1 - r0
+        qb = q[:, :, :, r0:r1].float().reshape(B, H_kv, rep * n, d)
+        logits = (qb @ k32.transpose(-2, -1)).view(B, H_kv, rep, n, kv_len) * scaling
+        if softcap:
+            logits = softcap * torch.tanh(logits / softcap)
+        if position_bias is not None:
+            logits = logits + rows(position_bias, r0, r1).float()
+        if mask is not None:
+            m = rows(mask, r0, r1)
+            logits = logits.masked_fill(~m, lowest) if m.dtype == torch.bool else logits + m.float()
+        logits = logits.clamp_min(lowest)  # -inf (or overflow) from additive inputs -> finite
+        if sinks is not None:
+            logits = torch.cat([logits, sinks.expand(B, -1, -1, r1 - r0, 1)], dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        if sinks is not None:
+            probs = probs[..., :-1]  # the sink absorbs probability, contributes no value
+        probs = torch.nn.functional.dropout(probs, p=dropout_p)
+        o = probs.reshape(B, H_kv, rep * n, kv_len) @ v32
+        out[:, :, :, r0:r1] = o.view(B, H_kv, rep, n, d_v).to(query.dtype)
+    return out.reshape(B, H, q_len, d_v)
+
+
 def flash_attn_legacy_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -155,7 +244,8 @@ def flash_attn_legacy_forward(
     Runs the flash_attn_legacy kernel when _kernel_fallback_reason allows it
     (no mask, 1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
     Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
-    and the call either runs on PyTorch SDPA or raises NotImplementedError.
+    and the call runs on PyTorch SDPA, on _eager_attention (features SDPA would
+    ignore: softcap, sinks, position_bias) or raises NotImplementedError.
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
@@ -216,37 +306,39 @@ def flash_attn_legacy_forward(
         if query.dtype != torch.float16:
             attn_output = attn_output.to(query.dtype)
     else:
-        _record_fallback(reason, detail)  # raises for reasons without a correct fallback
-        # GQA via repeat_interleave, not enable_gqa: on sm_6x/7x there is no flash
-        # SDPA backend and enable_gqa would push mem-efficient SDPA to the O(N^2)
-        # math backend.
-        H_kv = key.shape[1]
-        if H_kv != H_q:
-            rep = H_q // H_kv
-            key = key.repeat_interleave(rep, dim=1)
-            value = value.repeat_interleave(rep, dim=1)
+        action = _record_fallback(reason, detail)  # raises if no correct fallback exists
 
-        mask, sdpa_causal = attention_mask, False
+        # One mask for both fallbacks: boolean (True = keep) or additive float,
+        # with bottom-right causality; `causal_only` = plain causal, q_len == kv_len.
+        mask, causal_only = attention_mask, False
         if mask is not None:
             mask = mask[..., :kv_len]
             if padding_2d and is_causal and q_len > 1:
-                mask = mask & torch.ones(q_len, kv_len, dtype=torch.bool,
-                                         device=query.device).tril(diagonal=kv_len - q_len)
+                mask = mask & _causal_mask(q_len, kv_len, query.device)
         elif is_causal and q_len == kv_len:
-            sdpa_causal = True  # no N x N mask materialised
+            causal_only = True  # no N x N mask materialised for SDPA
         elif is_causal and q_len > 1:
-            # Bottom-right aligned causal mask: query i sees keys <= i + (kv_len - q_len)
-            mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(
-                diagonal=kv_len - q_len
-            )
+            mask = _causal_mask(q_len, kv_len, query.device)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=mask,
-            dropout_p=dropout if module.training else 0.0,
-            is_causal=sdpa_causal,
-            scale=scaling,
-        )
+        dropout_p = dropout if module.training else 0.0
+        if action == "eager":
+            if causal_only:
+                mask = _causal_mask(q_len, kv_len, query.device)
+            attn_output = _eager_attention(
+                query, key, value, mask, scaling, dropout_p,
+                softcap=kwargs.get("softcap"), sinks=kwargs.get("s_aux"),
+                position_bias=kwargs.get("position_bias"))
+        else:
+            # GQA via repeat_interleave, not enable_gqa: on sm_6x/7x there is no
+            # flash SDPA backend and enable_gqa would push mem-efficient SDPA to
+            # the O(N^2) math backend.
+            if key.shape[1] != H_q:
+                rep = H_q // key.shape[1]
+                key = key.repeat_interleave(rep, dim=1)
+                value = value.repeat_interleave(rep, dim=1)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=mask, dropout_p=dropout_p,
+                is_causal=causal_only, scale=scaling)
 
     # Transpose from [B, H, N, d] to [B, N, H, d] — matches SDPA output format
     attn_output = attn_output.transpose(1, 2).contiguous()

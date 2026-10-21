@@ -85,6 +85,10 @@ def tiny_llama(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, vocab=512, seed
     return LlamaForCausalLM(cfg).eval()
 
 
+def _alternating(n_layers):
+    return ["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(n_layers)]
+
+
 def tiny_gemma3(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_window=8, vocab=512,
                 seed=0, **extra):
     """Random-weight Gemma 3 text model alternating sliding / full attention layers."""
@@ -96,13 +100,52 @@ def tiny_gemma3(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_window
         num_key_value_heads=n_kv_heads, head_dim=head_dim, query_pre_attn_scalar=head_dim,
         intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
         vocab_size=vocab, max_position_embeddings=4096, sliding_window=sliding_window,
-        layer_types=["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(n_layers)],
+        layer_types=_alternating(n_layers),
         **extra,
     )
     return Gemma3ForCausalLM(cfg).eval()
 
 
-TINY_MODELS = {"llama": tiny_llama, "gemma3": tiny_gemma3}
+def tiny_gemma2(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_window=8, vocab=512,
+                seed=0, **extra):
+    """Random-weight Gemma 2: attention logit softcapping + sliding window layers.
+    Softcap 1.0 (real models: 50) so that it actually changes these small logits."""
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    torch.manual_seed(seed)
+    cfg = Gemma2Config(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads, head_dim=head_dim, query_pre_attn_scalar=head_dim,
+        intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
+        vocab_size=vocab, max_position_embeddings=4096, sliding_window=sliding_window,
+        layer_types=_alternating(n_layers), **{"attn_logit_softcapping": 1.0, **extra},
+    )
+    return Gemma2ForCausalLM(cfg).eval()
+
+
+def tiny_gpt_oss(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_window=8, vocab=512,
+                 seed=0, **extra):
+    """Random-weight gpt-oss: attention sinks (s_aux), sliding window layers, small MoE."""
+    from transformers import GptOssConfig, GptOssForCausalLM
+
+    torch.manual_seed(seed)
+    cfg = GptOssConfig(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads, head_dim=head_dim,
+        intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
+        num_local_experts=2, num_experts_per_tok=1, vocab_size=vocab,
+        max_position_embeddings=4096, sliding_window=sliding_window,
+        layer_types=_alternating(n_layers), **extra,
+    )
+    model = GptOssForCausalLM(cfg).eval()
+    with torch.no_grad():  # sinks are zero-initialised: make them matter
+        for layer in model.model.layers:
+            layer.self_attn.sinks.normal_(0.0, 2.0)
+    return model
+
+
+TINY_MODELS = {"llama": tiny_llama, "gemma3": tiny_gemma3, "gemma2": tiny_gemma2,
+               "gpt_oss": tiny_gpt_oss}
 
 
 def load_impl(model, impl, dtype=torch.float16):

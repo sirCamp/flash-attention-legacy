@@ -20,7 +20,7 @@ transformers = pytest.importorskip("transformers")
 
 from flash_attn_legacy import fallback_stats, integrations, reset_fallback_stats  # noqa: E402
 from .hf_helpers import (  # noqa: E402
-    TINY_MODELS, KernelCounter, assert_close_to_gold, load_impl, logits, tiny_llama,
+    TINY_MODELS, KernelCounter, assert_close_to_gold, compare, load_impl, logits, tiny_llama,
 )
 
 
@@ -42,6 +42,12 @@ class _Attn(nn.Module):
     def __init__(self, is_causal):
         super().__init__()
         self.is_causal = is_causal
+
+
+# initializer_range per tiny model for end-to-end tests: logits peaked enough to
+# avoid FP16 near-ties and to make softcap/sinks matter, without saturating them
+# (Gemma scales embeddings by sqrt(hidden), hence the smaller range).
+_INIT = {"llama": 0.5, "gemma3": 0.05, "gemma2": 0.05, "gpt_oss": 0.5}
 
 
 # ---------------------------------------------------------------------------
@@ -118,17 +124,12 @@ def test_v_head_dim_reason():
     torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
-@pytest.mark.parametrize("kwarg,value,reason", [
-    ("cu_seq_lens_q", torch.tensor([0, 8, 16], dtype=torch.int32), "cu_seq_lens"),
-    ("cu_seq_lens_k", torch.tensor([0, 8, 16], dtype=torch.int32), "cu_seq_lens"),
-    ("softcap", 50.0, "softcap"),
-    ("s_aux", torch.zeros(4), "s_aux"),
-    ("position_bias", torch.zeros(1, 4, 16, 16), "position_bias"),
-])
+@pytest.mark.parametrize("kwarg", ["cu_seq_lens_q", "cu_seq_lens_k"])
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
-def test_unsupported_kwargs_raise(kwarg, value, reason, q_len):
-    """No correct path exists yet (SDPA would silently ignore them): must raise,
-    on the kernel path and on the fallback path alike."""
+def test_unsupported_kwargs_raise(kwarg, q_len):
+    """cu_seq_lens: no correct path exists yet (SDPA would silently ignore it):
+    must raise, on the kernel path and on the fallback path alike."""
+    value, reason = torch.tensor([0, 8, 16], dtype=torch.int32), "cu_seq_lens"
     q, k, v = _qkv(q_len=q_len)
     with pytest.raises(NotImplementedError):
         integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None,
@@ -218,7 +219,9 @@ def _beam_rows_error(x, y):
     return 1.0 - best.values.min().item()
 
 
-@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+
+
+@pytest.mark.parametrize("arch", list(_INIT))
 @pytest.mark.parametrize("cache_implementation", ["static", "offloaded_static", "dynamic"])
 @pytest.mark.parametrize("mode", ["greedy", "beam", "assisted"])
 def test_generate_matches_gold(arch, cache_implementation, mode):
@@ -226,8 +229,7 @@ def test_generate_matches_gold(arch, cache_implementation, mode):
     every step's logits (all beams) and the final sequences."""
     if mode == "assisted" and cache_implementation != "dynamic":
         pytest.skip("assisted decoding needs a dynamic cache")
-    # Peaked but not saturated logits (Gemma scales embeddings by sqrt(hidden)).
-    base = TINY_MODELS[arch](initializer_range={"llama": 0.5, "gemma3": 0.05}[arch])
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, 24), device="cuda")
     # disable_compile: HF auto-compiles static-cache generation and Triton does not
     # support sm < 7.0; torch.compile is covered separately (docs/PLAN.md, P6.5).
@@ -240,7 +242,7 @@ def test_generate_matches_gold(arch, cache_implementation, mode):
     def gen(impl, dtype=torch.float16):
         extra = {}
         if mode == "assisted":
-            extra["assistant_model"] = load_impl(base, "sdpa", dtype)
+            extra["assistant_model"] = load_impl(base, "eager", dtype)  # any arch supports eager
             extra["cache_implementation"] = None  # assisted decoding manages its own cache
         return load_impl(base, impl, dtype).generate(ids, **{**kw, **extra})
 
@@ -335,3 +337,122 @@ def test_tagged_mask_longer_than_keys_raises():
     m = _build(q_length=4, q_offset=6)  # tags 10 valid keys, only 8 passed
     with pytest.raises(RuntimeError):
         integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
+
+
+# ---------------------------------------------------------------------------
+# P0.3 — softcap / sinks / position_bias: eager fallback that applies them
+# (temporary until the kernel supports them, docs/PLAN.md §3b)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("arch,reason", [("gemma2", "softcap"), ("gpt_oss", "s_aux")])
+@pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
+def test_eager_feature_models_vs_gold(monkeypatch, arch, reason, n_tokens):
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
+    gold = logits(load_impl(base, "eager", torch.float32), ids)
+    # Guard: the feature must matter on this model, or the test proves nothing.
+    without = {"gemma2": dict(attn_logit_softcapping=None), "gpt_oss": {}}[arch]
+    plain = TINY_MODELS[arch](initializer_range=_INIT[arch], **without)
+    if arch == "gpt_oss":
+        with torch.no_grad():
+            for layer in plain.model.layers:
+                layer.self_attn.sinks.fill_(-1e4)  # sinks with no mass
+    _, cos_plain, _ = compare(logits(load_impl(plain, "eager", torch.float32), ids), gold)
+    assert 1.0 - cos_plain > 1e-3, f"{reason} does not change the gold logits"
+    noise = logits(load_impl(base, "eager"), ids)
+    counter = KernelCounter(monkeypatch)
+    out = logits(load_impl(base, "flash_attn_legacy"), ids)
+    assert counter.calls == [] and fallback_stats() == {reason: base.config.num_hidden_layers}
+    assert_close_to_gold(out, gold, noise, f"{arch} N={n_tokens}")
+
+
+def _reference(q, k, v, scaling, mask=None, softcap=None, sinks=None, bias=None):
+    rep = q.shape[1] // k.shape[1]
+    k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+    s = (q.float() @ k.float().transpose(-2, -1)) * scaling
+    if softcap:
+        s = softcap * torch.tanh(s / softcap)
+    if bias is not None:
+        s = s + bias
+    if mask is not None:
+        s = s.masked_fill(~mask, float("-inf")) if mask.dtype == torch.bool else s + mask
+    if sinks is not None:
+        s = torch.cat([s, sinks.reshape(1, -1, 1, 1).expand(*s.shape[:-1], 1)], dim=-1)
+    p = torch.softmax(s, dim=-1)
+    if sinks is not None:
+        p = p[..., :-1]
+    return p @ v.float()
+
+
+@pytest.mark.parametrize("q_len,kv_len", [(16, 16), (5, 40), (1, 40), (700, 700)])
+@pytest.mark.parametrize("kv_heads", [4, 2], ids=["mha", "gqa"])
+def test_eager_attention_unit(monkeypatch, q_len, kv_len, kv_heads):
+    """_eager_attention (grouped GQA, query blocks) vs a direct fp32 formula with
+    every feature on. Softcap 2.0 and scale 0.5 saturate the logits, so an ignored
+    or misplaced softcap is far above the tolerance (checked below)."""
+    monkeypatch.setattr(integrations, "_EAGER_BLOCK_BYTES", 4 * 1024 * 1024)  # several blocks
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=q_len, kv_len=kv_len)
+    k, v = k[:, :kv_heads].contiguous(), v[:, :kv_heads].contiguous()
+    sinks = torch.randn(4, device="cuda")
+    bias = torch.randn(1, 4, q_len, kv_len, device="cuda")
+    causal = integrations._causal_mask(q_len, kv_len, "cuda")
+    additive = torch.where(causal, 0.0, float("-inf")).float()  # -inf must not give NaN
+    for mask in (causal, additive[None, None]):
+        out = integrations._eager_attention(q, k, v, mask, 0.5, 0.0, softcap=2.0,
+                                            sinks=sinks, position_bias=bias)
+        ref = _reference(q, k, v, 0.5, mask.bool() if mask.dim() == 2 else mask,
+                         softcap=2.0, sinks=sinks, bias=bias)
+        no_cap = _reference(q, k, v, 0.5, causal, sinks=sinks, bias=bias)
+        assert (ref - no_cap).abs().max() > 0.05  # softcap matters here
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=2e-3)
+
+
+def test_eager_attention_gqa_per_head_mask_and_3d_bias():
+    """Per-head (head dim H) mask under GQA and a 3D bias go through grouped()."""
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=12, kv_len=20)
+    k, v = k[:, :2].contiguous(), v[:, :2].contiguous()
+    mask = torch.rand(1, 4, 12, 20, device="cuda") > 0.3
+    mask[..., 0] = True  # every row keeps at least one key
+    bias = torch.randn(4, 12, 20, device="cuda")
+    out = integrations._eager_attention(q, k, v, mask, 0.5, 0.0, position_bias=bias)
+    ref = _reference(q, k, v, 0.5, mask, bias=bias[None])
+    torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=2e-3)
+    with pytest.raises(ValueError):
+        integrations._eager_attention(q, k, v, mask[0, 0, 0], 0.5, 0.0)  # 1D mask
+
+
+def test_eager_attention_gqa_does_not_copy_kv_per_query_head():
+    """Folding query heads into rows: peak memory stays far below rep copies of K/V."""
+    B, H, H_kv, kv_len, d = 1, 16, 2, 8192, 64
+    q = torch.randn(B, H, 1, d, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H_kv, kv_len, d, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+    kv_fp32_bytes = 2 * k.numel() * 4  # K and V once in fp32
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    integrations._eager_attention(q, k, v, None, 0.125, 0.0)
+    peak = torch.cuda.max_memory_allocated() - base
+    rep = H // H_kv
+    assert peak < kv_fp32_bytes * rep / 2, f"peak {peak} B suggests K/V copied per query head"
+
+
+@pytest.mark.parametrize("kwarg,reason", [("softcap", "softcap"), ("s_aux", "s_aux"),
+                                          ("position_bias", "position_bias")])
+@pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
+def test_eager_kwargs_routed_and_applied(kwarg, reason, q_len):
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len=q_len, kv_len=16)
+    value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda"),
+             "position_bias": torch.randn(1, 4, q_len, 16, device="cuda")}[kwarg]
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, None,
+                                                    scaling=0.5, **{kwarg: value})
+    ref = _reference(q, k, v, 0.5, integrations._causal_mask(q_len, 16, "cuda"),
+                     softcap=value if kwarg == "softcap" else None,
+                     sinks=value if kwarg == "s_aux" else None,
+                     bias=value if kwarg == "position_bias" else None)
+    assert fallback_stats() == {reason: 1}
+    torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)

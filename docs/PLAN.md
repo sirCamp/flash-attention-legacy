@@ -153,6 +153,21 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 
 ---
 
+## 3b. Debito temporaneo (da rimuovere)
+
+Soluzioni provvisorie introdotte durante P0, ciascuna con la voce che la sostituisce. Una voce si chiude solo quando il codice provvisorio è **rimosso**, non solo affiancato.
+
+| Provvisorio | Introdotto in | Sostituito da | Si chiude quando |
+|---|---|---|---|
+| Fallback eager (FP32, a blocchi di query, senza tensor core, orientato all'inferenza) per `softcap` | P0.3 | P4.2 softcap nel kernel, più P4.1 window (gli strati sliding di Gemma 2 oggi vanno anch'essi su eager) | Gemma 2 sul kernel in tutti gli strati; il motivo `softcap` sparisce dal registro |
+| Fallback eager per i sink `s_aux` | P0.3 | P4.3 sink nel kernel, più P4.1 window (gpt-oss alterna strati sliding) | gpt-oss sul kernel in tutti gli strati; il motivo `s_aux` sparisce dal registro |
+| Fallback eager per `position_bias` (nessun modello HF 5.x lo passa oggi: copertura difensiva) | P0.3 | da decidere: kernel con bias additivo, oppure errore esplicito | Il motivo `position_bias` sparisce dal registro |
+| `_eager_attention` stessa | P0.3 | — | Si rimuove solo quando nessun motivo del registro ha più l'azione `eager` |
+| `cu_seq_lens` solleva `NotImplementedError` | P0.1 | P0.4 (varlen o fallback a segmenti), poi P3.2/P3.3 nativo | Nessun motivo con azione `raise` per `cu_seq_lens` |
+| Padding (maschera 2D con zeri o maschera 4D) → fallback SDPA | prima di P0 | P3.1 padding nativo | Batch con padding sul kernel in tutti gli strati |
+| Sliding window → fallback SDPA | prima di P0 | P4.1 window nel kernel | Gemma 3, Mistral v0.1 e Phi-3 senza motivo `attention_mask` dovuto alla window |
+| Guardia sulla T4 (tile che non entrano → fallback) | P0.6 | P2.2/P2.3 tile a runtime | Nessun fallback per shared memory su T4 |
+
 ## 4. Strategia di test
 
 - **Kernel** (`tests/test_flash_attn.py`): riferimento FP32 e tolleranze attuali; parametrizzati su `FORCE_ARCH` nel build di test.
