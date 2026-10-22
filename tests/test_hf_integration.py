@@ -92,7 +92,7 @@ def test_decode_reason():
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
-@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral", "gpt_oss"])
 def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
     """P3.1: a padded batch is unpadded onto the varlen kernel in every layer;
     logits of the real tokens within the noise of FP32 eager."""
@@ -119,7 +119,7 @@ def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
 
 
 @pytest.mark.parametrize("cache_implementation", ["dynamic", "static"])
-@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral", "gpt_oss"])
 def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation):
     """Batched generation with left padding: the prefill runs unpadded on the
     kernel; every step's logits of every row within the noise of FP32 eager."""
@@ -732,15 +732,15 @@ def test_tagged_mask_longer_than_keys_raises():
 
 
 # ---------------------------------------------------------------------------
-# P0.3 / P4.2 — softcap on the kernel; sinks / position_bias: eager fallback
-# that applies them (temporary until the kernel supports them, docs/PLAN.md §3b)
+# P0.3 / P4.2 / P4.3 — softcap and sinks on the kernel; position_bias: eager
+# fallback that applies it (temporary until the kernel supports it, docs/PLAN.md §3b)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("arch", ["gemma2", "gpt_oss"])
 @pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
 def test_feature_models_vs_gold(monkeypatch, arch, n_tokens):
-    """Gemma 2 (softcap, P4.2): every layer on the kernel, sliding layers with
-    their window. gpt-oss (sinks): eager fallback. Both within the FP16 noise."""
+    """Gemma 2 (softcap, P4.2) and gpt-oss (sinks, P4.3): every layer on the
+    kernel, sliding layers with their window, within the FP16 noise."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
     gold = logits(load_impl(base, "eager", torch.float32), ids)
@@ -756,15 +756,35 @@ def test_feature_models_vs_gold(monkeypatch, arch, n_tokens):
     noise = logits(load_impl(base, "eager"), ids)
     counter = KernelCounter(monkeypatch)
     out = logits(load_impl(base, "flash_attn_legacy"), ids)
-    n_layers = base.config.num_hidden_layers
-    if arch == "gemma2":
-        W = base.config.sliding_window
-        assert len(counter.calls) == n_layers and fallback_stats() == {}
-        assert [w for w in counter.windows if w != (-1, -1)] == \
-            [(W - 1, W - 1)] * layer_types(base.config).count("sliding_attention")
-    else:
-        assert counter.calls == [] and fallback_stats() == {"s_aux": n_layers}
+    W = base.config.sliding_window
+    assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
+    assert [w for w in counter.windows if w != (-1, -1)] == \
+        [(W - 1, W - 1)] * layer_types(base.config).count("sliding_attention")
     assert_close_to_gold(out, gold, noise, f"{arch} N={n_tokens}")
+
+
+def test_gpt_oss_training_sink_gradients(monkeypatch):
+    """gpt-oss fine-tuning under fp16 autocast on the kernel: loss and gradients,
+    the sinks' own included, vs FP32 eager; noise floor: fp16-autocast eager."""
+    base = TINY_MODELS["gpt_oss"](initializer_range=_INIT["gpt_oss"])
+    ids = torch.randint(0, base.config.vocab_size, (2, 40), device="cuda")
+
+    def grads(impl, autocast):
+        model = load_impl(base, impl, torch.float32).train()
+        with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+            model(input_ids=ids, labels=ids).loss.backward()
+        sinks = torch.cat([layer.self_attn.sinks.grad for layer in model.model.layers])
+        return sinks, torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+
+    gold_s, gold_g = grads("eager", autocast=False)
+    noise_s, noise_g = grads("eager", autocast=True)
+    counter = KernelCounter(monkeypatch)
+    sinks, g = grads("flash_attn_legacy", autocast=True)
+    assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
+    assert gold_s.abs().min() > 0  # every sink is trained
+    for got, gold, noise in ((sinks, gold_s, noise_s), (g, gold_g, noise_g)):
+        err = lambda x: 1 - torch.nn.functional.cosine_similarity(x, gold, dim=0).item()  # noqa: E731
+        assert err(got) <= max(3 * err(noise), 1e-5), (err(got), err(noise))
 
 
 def _reference(q, k, v, scaling, mask=None, softcap=None, sinks=None, bias=None):
@@ -841,12 +861,12 @@ def test_eager_attention_gqa_does_not_copy_kv_per_query_head():
     assert peak < kv_fp32_bytes * rep / 2, f"peak {peak} B suggests K/V copied per query head"
 
 
-@pytest.mark.parametrize("kwarg,reason", [("softcap", None), ("s_aux", "s_aux"),
+@pytest.mark.parametrize("kwarg,reason", [("softcap", None), ("s_aux", None),
                                           ("position_bias", "position_bias")])
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
 def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
-    """softcap: kernel on prefill, eager (not SDPA, which would ignore it) on
-    decode; sinks / position_bias: eager. Softcap 2.0 with scale 0.5 saturates."""
+    """softcap / sinks: kernel on prefill, eager (not SDPA, which would ignore
+    them) on decode; position_bias: eager. Softcap 2.0 with scale 0.5 saturates."""
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=q_len, kv_len=16)
     value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda"),
@@ -857,7 +877,7 @@ def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
                      softcap=value if kwarg == "softcap" else None,
                      sinks=value if kwarg == "s_aux" else None,
                      bias=value if kwarg == "position_bias" else None)
-    if reason is None:  # softcap: the kernel on prefill, decode falls back
+    if reason is None:  # softcap / sinks: the kernel on prefill, decode falls back
         reason = "decode" if q_len == 1 else None
     assert fallback_stats() == ({reason: 1} if reason else {})
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
@@ -899,18 +919,22 @@ def test_cu_seq_lens_direct(monkeypatch, causal, kv_heads, head_dim, path):
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
 
 
-def test_cu_seq_lens_with_softcap_on_varlen_kernel(monkeypatch):
+@pytest.mark.parametrize("kwarg", ["softcap", "s_aux"])
+def test_cu_seq_lens_with_features_on_varlen_kernel(monkeypatch, kwarg):
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1])
     cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda")}[kwarg]
     counter = KernelCounter(monkeypatch)
     out, _ = integrations.flash_attn_legacy_forward(
-        _Attn(is_causal=True), q, k, v, None, scaling=0.5, softcap=2.0,
-        cu_seq_lens_q=cu, cu_seq_lens_k=cu)
+        _Attn(is_causal=True), q, k, v, None, scaling=0.5,
+        cu_seq_lens_q=cu, cu_seq_lens_k=cu, **{kwarg: value})
     outs = []
     for a, b in zip(_CU[:-1], _CU[1:]):
         outs.append(_reference(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], 0.5,
-                               integrations._causal_mask(b - a, b - a, "cuda"), softcap=2.0))
+                               integrations._causal_mask(b - a, b - a, "cuda"),
+                               softcap=value if kwarg == "softcap" else None,
+                               sinks=value if kwarg == "s_aux" else None))
     assert counter.varlen_calls == [(_CU[-1], len(_CU) - 1)] and fallback_stats() == {}
     torch.testing.assert_close(out.transpose(1, 2).float(), torch.cat(outs, dim=2), atol=2e-3, rtol=2e-3)
 
