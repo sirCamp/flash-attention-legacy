@@ -33,21 +33,29 @@ def ref_hidden(Nq, Nk, is_causal, window, device):
     return hidden
 
 
-def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1)):
+def ref_logits(q, k, scale, is_causal, window, softcap):
+    """FP32 logits (K already expanded to the Q heads): scaled scores, softcapped
+    as c * tanh(x / c) when softcap > 0 (Gemma 2), -inf where hidden."""
+    s = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if softcap > 0:
+        s = softcap * torch.tanh(s / softcap)
+    return s.masked_fill(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
+
+
+def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1), softcap=0.0):
     """Standard attention in FP32. Handles GQA by repeating K/V heads."""
     H_q, H_kv = q.shape[1], k.shape[1]
     if H_kv < H_q:
         reps = H_q // H_kv
         k = k.repeat_interleave(reps, dim=1)
         v = v.repeat_interleave(reps, dim=1)
-    s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-    s.masked_fill_(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
+    s = ref_logits(q.float(), k.float(), scale, is_causal, window, softcap)
     p = torch.softmax(s, dim=-1)
     p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     return torch.matmul(p, v.float()).half()
 
 
-def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1)):
+def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1), softcap=0.0):
     """Reference backward in FP32. Returns dQ [H_q], dK [H_kv], dV [H_kv]."""
     H_q, H_kv = q.shape[1], k.shape[1]
     reps = H_q // H_kv
@@ -57,8 +65,7 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1)):
     k_f = k.float().detach().repeat_interleave(reps, dim=1).requires_grad_(True)
     v_f = v.float().detach().repeat_interleave(reps, dim=1).requires_grad_(True)
 
-    s = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
-    s = s.masked_fill(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
+    s = ref_logits(q_f, k_f, scale, is_causal, window, softcap)
     p = torch.softmax(s, dim=-1)
     p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     o = torch.matmul(p, v_f)
@@ -848,6 +855,114 @@ class TestWindow:
         q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
         with pytest.raises(ValueError, match="window_size"):
             flash_attention(q, q, q, window_size=window)
+
+
+class TestSoftcap:
+    """Logit softcapping c * tanh(x / c) (docs/PLAN.md P4.2): forward + backward
+    vs the FP32 reference, batched and varlen. Inputs scaled so that many logits
+    sit where tanh saturates (a wrong (1 - t^2) factor shows in the gradients)."""
+
+    @staticmethod
+    def _inputs(shape_q, shape_kv, amp=3.0, requires_grad=True):
+        mk = lambda shape: (torch.randn(*shape, device="cuda") * amp).half().requires_grad_(requires_grad)
+        return mk(shape_q), mk(shape_kv), mk(shape_kv)
+
+    @pytest.mark.parametrize("n_q,n_k", [(256, 256), (100, 300), (300, 100)])  # 300/100: rows see no key
+    @pytest.mark.parametrize("softcap", [5.0, 50.0])
+    @pytest.mark.parametrize("causal,window", [(False, (-1, -1)), (True, (-1, -1)), (True, (16, 0))],
+                             ids=["full", "causal", "causal_window16"])
+    def test_forward_backward(self, head_dim, n_q, n_k, softcap, causal, window):
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        scale = 1.0 / math.sqrt(head_dim)
+        q, k, v = self._inputs((2, 4, n_q, head_dim), (2, 2, n_k, head_dim))
+        go = torch.randn(2, 4, n_q, head_dim, device="cuda", dtype=torch.float16)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=causal, window_size=window, softcap=softcap)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        kw = dict(is_causal=causal, window=window, softcap=softcap)
+        rdq, rdk, rdv = ref_backward(*args, go, scale, **kw)
+        torch.testing.assert_close(out, ref_attention(*args, scale, **kw), atol=2e-2, rtol=2e-2)
+        # |dQ|, |dK| grow with the input scale: tolerance relative to the largest entry
+        for got, ref in ((q.grad, rdq), (k.grad, rdk), (v.grad, rdv)):
+            tol = 2e-2 * ref.float().abs().max().item()
+            torch.testing.assert_close(got.float(), ref.float(), atol=tol, rtol=2e-2)
+
+    def test_softcap_is_applied_with_its_value(self):
+        """Mutation check: forward matches its own cap, not no cap or another cap;
+        gradients match the softcapped reference, not the uncapped chain rule."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(1)
+        q, k, v = self._inputs((1, 2, 192, 64), (1, 2, 192, 64))
+        go = torch.randn(1, 2, 192, 64, device="cuda", dtype=torch.float16)
+        scale, cap = 1.0 / 8, 4.0
+        out = flash_attention(q, k, v, softcap=cap)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        torch.testing.assert_close(out, ref_attention(*args, scale, softcap=cap), atol=2e-2, rtol=2e-2)
+        for other in (0.0, 2 * cap):
+            assert (out - ref_attention(*args, scale, softcap=other)).abs().max() > 0.1
+        rdq = ref_backward(*args, go, scale, softcap=cap)[0]
+        # dS * (1 - t^2) left out: the same P and dP, the uncapped factor `scale`
+        assert (q.grad.float() - rdq.float()).abs().max() < 0.05 * rdq.float().abs().max()
+        with torch.no_grad():
+            s = (args[0].float() @ args[1].float().transpose(-1, -2)) * scale
+            p = torch.softmax(cap * torch.tanh(s / cap), -1)
+            dp = go.float() @ args[2].float().transpose(-1, -2)
+            ds = p * (dp - (dp * p).sum(-1, keepdim=True)) * scale  # no (1 - t^2)
+            wrong_dq = ds @ args[1].float()
+        assert (q.grad.float() - wrong_dq).abs().max() > 0.2 * rdq.float().abs().max()
+
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen(self, causal):
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        H_q, H_kv, d, cap = 4, 2, 64, 10.0
+        lens = [1, 70, 200, 33]
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
+        q, k, v = self._inputs((sum(lens), H_q, d), (sum(lens), H_kv, d))
+        go = torch.randn_like(q)
+        scale = 1.0 / math.sqrt(d)
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max(lens), max(lens), softmax_scale=scale,
+                                     causal=causal, softcap=cap)
+        out.backward(go)
+        s0 = 0
+        for n in lens:
+            def seq(t):
+                return t[s0:s0 + n].detach().permute(1, 0, 2).unsqueeze(0)
+
+            def tok(t):
+                return t.squeeze(0).permute(1, 0, 2)
+            args = (seq(q), seq(k), seq(v))
+            ref = ref_attention(*args, scale, is_causal=causal, softcap=cap)
+            refs = ref_backward(*args, seq(go), scale, is_causal=causal, softcap=cap)
+            torch.testing.assert_close(out[s0:s0 + n], tok(ref), atol=2e-2, rtol=2e-2)
+            for got, r in zip((q.grad, k.grad, v.grad), refs):
+                r = tok(r).float()
+                torch.testing.assert_close(got[s0:s0 + n].float(), r, atol=2e-2 * r.abs().max().item() + 1e-3,
+                                           rtol=2e-2)
+            s0 += n
+
+    def test_huge_softcap_is_no_softcap(self):
+        """c far above every |x|: c * tanh(x / c) ~ x, so the softcapped kernel
+        must match the uncapped reference (forward and backward)."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        q, k, v = self._inputs((2, 4, 130, 64), (2, 4, 130, 64), amp=1.0)
+        go = torch.randn_like(q)
+        out = flash_attention(q, k, v, causal=True, softcap=1e4)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        torch.testing.assert_close(out, ref_attention(*args, 1 / 8, is_causal=True), atol=2e-2, rtol=2e-2)
+        for got, ref in zip((q.grad, k.grad, v.grad), ref_backward(*args, go, 1 / 8, is_causal=True)):
+            torch.testing.assert_close(got, ref, atol=5e-2, rtol=5e-2)
+
+    @pytest.mark.parametrize("softcap", [-1.0, float("nan"), float("inf"), True, "30", None, 1e-50, 1e39, 1e-40])
+    def test_invalid_softcap_raises(self, softcap):
+        from flash_attn_legacy import flash_attention
+        q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+        with pytest.raises(ValueError, match="softcap"):
+            flash_attention(q, q, q, softcap=softcap)
 
 
 class TestValidation:

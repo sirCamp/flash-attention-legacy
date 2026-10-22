@@ -91,6 +91,18 @@ def _check_window(window_size):
     return left, right
 
 
+def _check_softcap(softcap):
+    """Logit softcap as a float >= 0 (0 = none), within the float32 range the
+    kernels compute it in (a normal float with a finite 1 / c)."""
+    if not isinstance(softcap, numbers.Real) or isinstance(softcap, bool) \
+            or not math.isfinite(softcap) or softcap < 0:
+        raise ValueError(f"softcap must be a finite number >= 0 (0 = no softcapping), got {softcap!r}")
+    f32 = torch.finfo(torch.float32)
+    if softcap != 0 and not (f32.tiny <= softcap <= f32.max and 1.0 / softcap <= f32.max):
+        raise ValueError(f"softcap out of the float32 range, got {softcap!r}")
+    return float(softcap)
+
+
 class FlashAttentionFunc(Function):
     """
     Autograd function for Flash Attention v2.
@@ -98,7 +110,7 @@ class FlashAttentionFunc(Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal, window_size):
+    def forward(ctx, q, k, v, softmax_scale, causal, window_size, softcap):
         _check_inputs(q, k, v, ndim=4)
         d = q.shape[-1]
         check_head_dim(d)
@@ -107,12 +119,12 @@ class FlashAttentionFunc(Function):
         if H_q % H_kv != 0:
             raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size)
+        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap)
 
         ctx.save_for_backward(q, k, v, o, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        ctx.window_size = window_size
+        ctx.window_size, ctx.softcap = window_size, softcap
         return o
 
     @staticmethod
@@ -122,9 +134,9 @@ class FlashAttentionFunc(Function):
 
         dq, dk, dv = flash_attn_legacy_cuda.backward(
             grad_output, q, k, v, o, lse,
-            ctx.softmax_scale, ctx.causal, *ctx.window_size,
+            ctx.softmax_scale, ctx.causal, *ctx.window_size, ctx.softcap,
         )
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 def _resolve_causal(causal: bool, is_causal: Optional[bool]) -> bool:
@@ -148,6 +160,7 @@ def flash_attention(
     causal: bool = False,
     *,
     window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
     is_causal: Optional[bool] = None,
 ) -> torch.Tensor:
     """
@@ -172,6 +185,8 @@ def flash_attention(
             unbounded. With causal, right is 0. A sliding window of W keys back
             (HF sliding_window = W) is (W - 1, 0). Blocks outside the window are
             skipped, forward and backward.
+        softcap: logit softcapping c > 0, as upstream flash-attn and Gemma 2: the
+            scaled scores x become c * tanh(x / c) before the softmax; 0 = none
         is_causal: deprecated alias of `causal`
 
     Returns:
@@ -181,8 +196,8 @@ def flash_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     _check_inputs(q, k, v, ndim=4)
-    window_size = _check_window(window_size)
-    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size)
+    window_size, softcap = _check_window(window_size), _check_softcap(softcap)
+    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size, softcap)
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 
 
@@ -194,7 +209,7 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, validate):
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, validate):
         _check_inputs(q, k, v, ndim=3)
         check_head_dim(q.shape[-1])
 
@@ -204,13 +219,13 @@ class FlashAttnVarlenFunc(Function):
 
         o, lse = flash_attn_legacy_cuda.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, validate,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, validate,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        ctx.window_size = window_size
+        ctx.window_size, ctx.softcap = window_size, softcap
         ctx.max_seqlen_q, ctx.max_seqlen_k = max_seqlen_q, max_seqlen_k
         ctx.validate = validate
         return o
@@ -223,9 +238,9 @@ class FlashAttnVarlenFunc(Function):
         dq, dk, dv = flash_attn_legacy_cuda.backward_varlen(
             grad_output, q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal, *ctx.window_size,
-            ctx.validate,
+            ctx.softcap, ctx.validate,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -240,6 +255,7 @@ def flash_attn_varlen_func(
     causal: bool = False,
     validate: bool = True,
     window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     """
     Variable-length Flash Attention for packed sequences.
@@ -263,6 +279,7 @@ def flash_attn_varlen_func(
         causal: apply causal mask
         window_size: (left, right) local attention within each sequence, as in
             flash_attention
+        softcap: logit softcapping, as in flash_attention
         validate: check cu_seqlens (start at 0, non-decreasing, end at the totals)
             on a host copy, one CPU-GPU sync per call. Pass False only for
             cu_seqlens known to be valid (no sync; e.g. the HuggingFace
@@ -287,10 +304,10 @@ def flash_attn_varlen_func(
         softmax_scale = 1.0 / math.sqrt(d)
 
     _check_inputs(q, k, v, ndim=3)
-    window_size = _check_window(window_size)
+    window_size, softcap = _check_window(window_size), _check_softcap(softcap)
     out = FlashAttnVarlenFunc.apply(
         *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, validate,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, validate,
     )
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 

@@ -71,7 +71,6 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     const int band_row0 = warp_id * T;  // first row of the band within the Q block
     const bool band_active = band_row0 < a.valid_q;
     const int q_row = a.q_row_start + band_row0 + r;  // sequence row of this lane's softmax row
-    const float scale_log2 = a.softmax_scale * kLog2e;
 
     // Row of each accumulator element of this lane (identical for every fragment).
     int row_of[NE], col_unused[NE];
@@ -121,15 +120,12 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         float s[1][CHUNKS * 4];
         #pragma unroll
         for (int c = 0; c < CHUNKS; c++) {
-            const int col0 = 4 * (2 * c + h);
-            const float4 v = *reinterpret_cast<const float4*>(stage + r * LDS + col0);
-            const float e[4] = {v.x, v.y, v.z, v.w};
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                s[0][4 * c + i] = (kMask && fwd_key_masked(a, q_row, kv_start + col0 + i))
-                                  ? -INFINITY : e[i] * scale_log2;
-            }
+            const float4 v = *reinterpret_cast<const float4*>(stage + r * LDS + 4 * (2 * c + h));
+            s[0][4 * c] = v.x; s[0][4 * c + 1] = v.y; s[0][4 * c + 2] = v.z; s[0][4 * c + 3] = v.w;
         }
+        // element 4c + i of the row: key 4 (2c + h) + i of the block
+        fwd_logits<kMask>(a, s, [&](int) { return q_row; },
+                          [&](int e) { return kv_start + 4 * (2 * (e / 4) + h) + e % 4; });
         float alpha[1];
         softmax.update(s, alpha);
         if (h == 0) row_scale[r] = alpha[0];

@@ -70,8 +70,9 @@ struct FlashAttnParams {
     index_t l_batch_stride;
     index_t l_head_stride;
 
-    // Softmax scale  (typically 1/sqrt(d))
+    // Softmax scale  (typically 1/sqrt(d)); logit softcap (ScoreMap, 0 = none)
     float softmax_scale;
+    float softcap;
 
     // Visible keys of each query row: KeyWindow (-1 = unbounded; causal is right = 0)
     int window_left, window_right;
@@ -109,6 +110,7 @@ struct FlashAttnVarlenParams {
     index_t o_head_stride;
 
     float softmax_scale;
+    float softcap;                  // ScoreMap (0 = none)
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 };
 
@@ -135,6 +137,7 @@ struct FlashAttnBwdParams {
     // Dimensions
     int batch_size, num_heads, num_heads_k, seq_len_q, seq_len_k, head_dim;
     float softmax_scale;
+    float softcap;                  // ScoreMap (0 = none)
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 
     // Strides for Q/dQ
@@ -557,6 +560,61 @@ struct KeyWindow {
     }
     __host__ __device__ __forceinline__ int last_row(int key) const {
         return (left < 0 || key - offset + left > seq_len_q - 1) ? seq_len_q - 1 : key - offset + left;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ScoreMap: score s = q . k -> logit x of the softmax, for every forward and
+// backward kernel (P4.2):
+//   x = s * scale, or with logit softcapping c > 0 (Gemma 2): x = c * tanh(s * scale / c)
+// in the log2 domain of the kernels (x * log2(e)), with dx/ds for the backward:
+// scale, or scale * (1 - t^2) with t = tanh(s * scale / c).
+// ---------------------------------------------------------------------------
+struct ScoreMap {
+    float mul;       // scale * log2(e), or scale / c with softcapping
+    float cap_log2;  // c * log2(e); 0: no softcapping
+    float scale;
+
+    __host__ __device__ __forceinline__ ScoreMap(float scale_, float softcap)
+        : mul(softcap > 0.0f ? scale_ / softcap : scale_ * kLog2e),
+          cap_log2(softcap > 0.0f ? softcap * kLog2e : 0.0f), scale(scale_) {}
+
+    __device__ __forceinline__ bool softcapped() const { return cap_log2 > 0.0f; }
+
+    // f(std::true_type) with softcapping, else f(std::false_type): element
+    // loops compiled once per case, the (uniform) branch outside them
+    template <typename F>
+    __device__ __forceinline__ void dispatch(F&& f) const {
+        if (softcapped()) f(std::true_type{});
+        else              f(std::false_type{});
+    }
+
+    // x * log2(e) and dx/ds of one score (kSoftcap == softcapped(), see dispatch)
+    template <bool kSoftcap>
+    __device__ __forceinline__ float log2_logit(float s, float& dx_ds) const {
+        if constexpr (kSoftcap) {
+            const float t = tanhf(s * mul);
+            dx_ds = scale * (1.0f - t * t);
+            return cap_log2 * t;
+        } else {
+            dx_ds = scale;
+            return s * mul;
+        }
+    }
+
+    // x * log2(e) of a thread's scores in place (forward: dx/ds unused)
+    template <int R, int C>
+    __device__ __forceinline__ void log2_logits(float (&s)[R][C]) const {
+        dispatch([&](auto softcap) {
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                #pragma unroll
+                for (int c = 0; c < C; c++) {
+                    float unused;
+                    s[r][c] = log2_logit<decltype(softcap)::value>(s[r][c], unused);
+                }
+            }
+        });
     }
 };
 

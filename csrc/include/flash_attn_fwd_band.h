@@ -8,7 +8,7 @@
 //   - FwdBlockArgs: pointers and lengths of one Q block, from the batched or
 //     the varlen grid (fwd_batched_kernel / fwd_varlen_kernel)
 //   - fwd_key_masked: the KeyWindow of the sequence (causal, sliding window,
-//     tail of the keys)
+//     tail of the keys); score_map(): scale and softcap (ScoreMap)
 //   - BandSoftmax: online softmax in the log2 domain for the rows a thread holds,
 //     reduced over the lanes that share a row
 //   - fwd_band_loop: the K/V loop (the blocks the Q block can see, blocks
@@ -40,18 +40,36 @@ struct FwdBlockArgs {
     float* __restrict__ L; index_t l_stride;
     int q_row_start, valid_q, seq_len_q, seq_len_k;
     int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero)
-    float softmax_scale;
+    float softmax_scale, softcap;
     int window_left, window_right;  // KeyWindow of the sequence
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
     }
+    __device__ __forceinline__ ScoreMap score_map() const { return ScoreMap(softmax_scale, softcap); }
 };
 
 // Key `key` is not visible to sequence row `q_row` (KeyWindow; includes keys
 // past the end).
 __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row, int key) {
     return a.window().masked(q_row, key);
+}
+
+// Raw scores s[r][c] of a block -> log2-domain logits (ScoreMap), -inf for keys
+// outside the KeyWindow when kMask (masked after the map: c * tanh(-inf) would be
+// finite). row(r) / key(c): sequence row / key of s[r][c].
+template <bool kMask, int R, int C, typename RowOf, typename KeyOf>
+__device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][C], RowOf&& row, KeyOf&& key) {
+    a.score_map().log2_logits(s);
+    if constexpr (kMask) {
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            #pragma unroll
+            for (int c = 0; c < C; c++) {
+                if (fwd_key_masked(a, row(r), key(c))) s[r][c] = -INFINITY;
+            }
+        }
+    }
 }
 
 // Online softmax state of the ROWS rows a thread holds; each row is spread over
@@ -224,6 +242,7 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.seq_len_k = p.seq_len_k;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
+    a.softcap = p.softcap;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
     Body::template run<Tile>(a);
@@ -260,6 +279,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.seq_len_k = p.cu_seqlens_k[seq_idx + 1] - k_start_tok;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
+    a.softcap = p.softcap;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
     Body::template run<Tile>(a);

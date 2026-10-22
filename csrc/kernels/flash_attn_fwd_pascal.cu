@@ -44,7 +44,6 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     const int band_row0 = warp_id * kBandRows;
     const bool band_active = band_row0 < a.valid_q;
     const int row0 = band_row0 + 4 * rg;      // first of this lane's rows, within the block
-    const float scale_log2 = a.softmax_scale * kLog2e;
 
     float4 O[4][TD];
     #pragma unroll
@@ -88,14 +87,8 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
                 for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].w, kk.w, s[i][j]);
             }
         }
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            #pragma unroll
-            for (int j = 0; j < TN; j++) {
-                s[i][j] = (kMask && fwd_key_masked(a, a.q_row_start + row0 + i, kv_start + cg + 8 * j))
-                          ? -INFINITY : s[i][j] * scale_log2;
-            }
-        }
+        fwd_logits<kMask>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
+                          [&](int j) { return kv_start + cg + 8 * j; });
         float alpha[4];
         softmax.update(s, alpha);
 

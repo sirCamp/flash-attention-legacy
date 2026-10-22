@@ -124,6 +124,17 @@ static std::pair<int, int> key_window(bool is_causal, int64_t left, int64_t righ
     return {int(left), int(right)};
 }
 
+// Logit softcap of the kernels' ScoreMap: c * tanh(x / c), 0 = none (Gemma 2).
+// It must stay a normal float with a finite 1 / c (ScoreMap divides by it).
+static float logit_softcap(double softcap) {
+    TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0,
+                "softcap must be finite and >= 0 (0 = no softcapping), got ", softcap);
+    const float c = static_cast<float>(softcap);
+    TORCH_CHECK(softcap == 0.0 || (std::isnormal(c) && std::isfinite(1.0f / c)),
+                "softcap out of the float range, got ", softcap);
+    return c;
+}
+
 // Input checks shared by the varlen entry points: Q [total_q, H_q, d],
 // K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
 static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
@@ -224,7 +235,7 @@ static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, con
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
@@ -273,6 +284,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     p.seq_len_q = N; p.seq_len_k = Nk; p.head_dim = d;
     p.softmax_scale = softmax_scale;
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
+    p.softcap = logit_softcap(softcap);
 
     p.q_batch_stride = Q.stride(0); p.q_head_stride = Q.stride(1); p.q_seq_stride = Q.stride(2);
     p.k_batch_stride = K.stride(0); p.k_head_stride = K.stride(1); p.k_seq_stride = K.stride(2);
@@ -302,7 +314,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     torch::Tensor dO,
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor O, torch::Tensor L,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -366,6 +378,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     bwd.seq_len_q = N; bwd.seq_len_k = Nk; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale;
     std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
+    bwd.softcap = logit_softcap(softcap);
 
     bwd.q_batch_stride = Q.stride(0); bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(2);
     bwd.k_batch_stride = K.stride(0); bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(2);
@@ -398,7 +411,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
     check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
@@ -444,6 +457,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     p.head_dim = d;
     p.softmax_scale = softmax_scale;
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
+    p.softcap = logit_softcap(softcap);
 
     p.q_token_stride = Q.stride(0); p.q_head_stride = Q.stride(1);
     p.k_token_stride = K.stride(0); p.k_head_stride = K.stride(1);
@@ -472,7 +486,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor O, torch::Tensor L,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap, bool validate
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -523,6 +537,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     bwd.batch_size = 1; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale;
     std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
+    bwd.softcap = logit_softcap(softcap);
     // Packed layout: no batch stride, "seq" stride = token stride
     bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(0);
     bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(0);
@@ -551,14 +566,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0);
     m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
           "Flash Attention v2 forward — variable-length packed sequences",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("validate") = true);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("validate") = true);
     m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
           "Flash Attention v2 backward — variable-length packed sequences, one launch",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
@@ -566,11 +581,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("validate") = true);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("validate") = true);
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("L"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0);
 }

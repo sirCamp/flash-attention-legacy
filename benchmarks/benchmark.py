@@ -17,15 +17,20 @@ Usage:
     python benchmarks/benchmark.py --save                 # also write docs/bench/<gpu>.json
     python benchmarks/benchmark.py --seq-lens 1024 4096 --head-dim 64 --no-causal
     python benchmarks/benchmark.py --window 1024           # causal sliding window (P4.1)
+    python benchmarks/benchmark.py --softcap 50            # logit softcapping (P4.2)
 
 With --window W every query sees its last W keys (HF sliding_window = W): the
 kernel gets window_size=(W - 1, -1) (right side 0 when causal), SDPA and eager
 a boolean mask built once per shape, during the warmup (it stays cached, so it
 is neither timed nor counted in the peak memory).
+With --softcap C the logits x become C * tanh(x / C) (Gemma 2). SDPA cannot
+do that (reported as unsupported): the reference is eager, which is what the
+HF integration falls back to for softcapping layers.
 """
 
 import argparse
 import contextlib
+import dataclasses
 import functools
 import json
 import math
@@ -55,24 +60,41 @@ def keep_mask(n, causal, window, device):
     return keep
 
 
+@dataclasses.dataclass(frozen=True)
+class Variant:
+    """The attention computed: causal, sliding window W (None: none), softcap C (0: none)."""
+    causal: bool
+    window: int = None
+    softcap: float = 0.0
+
+
+class Unsupported(Exception):
+    """The implementation cannot compute this Variant."""
+
+
 # Shapes here always have n_q == n_k, where top-left (SDPA) and bottom-right
 # (flash_attn_legacy) causal alignment coincide.
-def eager_attention(q, k, v, causal, window=None):
+def eager_attention(q, k, v, var):
     assert q.shape[-2] == k.shape[-2]
     s = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(q.shape[-1]))
-    if causal or window is not None:
-        s = s.masked_fill(~keep_mask(q.shape[-2], causal, window, q.device), float("-inf"))
+    if var.softcap:
+        s = var.softcap * torch.tanh(s / var.softcap)
+    if var.causal or var.window is not None:
+        s = s.masked_fill(~keep_mask(q.shape[-2], var.causal, var.window, q.device), float("-inf"))
     return torch.softmax(s.float(), dim=-1).to(q.dtype) @ v
 
 
-def sdpa_attention(q, k, v, causal, window=None):
-    if window is None:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=keep_mask(q.shape[-2], causal, window, q.device))
+def sdpa_attention(q, k, v, var):
+    if var.softcap:
+        raise Unsupported("SDPA has no logit softcapping")
+    if var.window is None:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=var.causal)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=keep_mask(q.shape[-2], var.causal, var.window, q.device))
 
 
-def legacy_attention(q, k, v, causal, window=None):
-    return flash_attention(q, k, v, causal=causal, window_size=(-1, -1) if window is None else (window - 1, -1))
+def legacy_attention(q, k, v, var):
+    window = (-1, -1) if var.window is None else (var.window - 1, -1)
+    return flash_attention(q, k, v, causal=var.causal, window_size=window, softcap=var.softcap)
 
 
 # name -> (function, SDPA backend to select around it or None)
@@ -119,7 +141,7 @@ def peak_mb(fn, tensors):
     return (torch.cuda.max_memory_allocated() - base) / 2**20
 
 
-def bench_config(impl, B, H, N, d, causal, window, mode, warmup, reps):
+def bench_config(impl, B, H, N, d, var, mode, warmup, reps):
     """One (impl, shape, mode) measurement; mode is 'fwd' or 'fwd_bwd'."""
     attn, backend = IMPLS[impl]
     grad = mode == "fwd_bwd"
@@ -128,9 +150,9 @@ def bench_config(impl, B, H, N, d, causal, window, mode, warmup, reps):
     def step():
         if grad:
             q.grad = k.grad = v.grad = None
-            attn(q, k, v, causal, window).backward(dout)
+            attn(q, k, v, var).backward(dout)
         else:
-            attn(q, k, v, causal, window)
+            attn(q, k, v, var)
 
     try:
         q, k, v = (torch.randn(B, H, N, d, device="cuda", dtype=torch.float16, requires_grad=grad)
@@ -141,6 +163,8 @@ def bench_config(impl, B, H, N, d, causal, window, mode, warmup, reps):
             mem = peak_mb(step, (q, k, v))
     except torch.cuda.OutOfMemoryError:
         return {"status": "oom"}
+    except Unsupported as e:
+        return {"status": "unsupported", "error": str(e)}
     except RuntimeError as e:
         # Only "this SDPA backend cannot run this input" is a legitimate gap; any
         # error of our kernel must fail loudly, not be reported as unsupported.
@@ -153,18 +177,20 @@ def bench_config(impl, B, H, N, d, causal, window, mode, warmup, reps):
     return {"status": "ok", "mean_ms": mean, "std_ms": std, "peak_mb": mem}
 
 
-def max_errors(B, H, N, d, causal, window, impls):
-    """Max abs error of each forward vs SDPA math in FP32 (None if it did not fit)."""
+def max_errors(B, H, N, d, var, impls):
+    """Max abs error of each forward vs eager in FP32 (None if it did not fit or
+    the implementation cannot compute the variant)."""
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, N, d, device="cuda", dtype=torch.float16) for _ in range(3))
     errors = {}
     try:
-        with torch.no_grad(), sdpa_kernel(SDPBackend.MATH):
-            ref = sdpa_attention(q.float(), k.float(), v.float(), causal, window)
+        with torch.no_grad():
+            ref = eager_attention(q.float(), k.float(), v.float(), var)
         for impl in impls:
             attn, backend = IMPLS[impl]
             with torch.no_grad(), sdpa_kernel(backend) if backend is not None else contextlib.nullcontext():
-                errors[impl] = (attn(q, k, v, causal, window).float() - ref).abs().max().item()
+                with contextlib.suppress(Unsupported):
+                    errors[impl] = (attn(q, k, v, var).float() - ref).abs().max().item()
     except torch.cuda.OutOfMemoryError:
         pass
     del q, k, v
@@ -193,6 +219,8 @@ def main():
     p.add_argument("--no-causal", action="store_true", help="non-causal only (default: causal only)")
     p.add_argument("--window", type=int, default=None,
                    help="sliding window: each query sees its last W keys (default: none)")
+    p.add_argument("--softcap", type=float, default=0.0,
+                   help="logit softcapping C * tanh(x / C) (default: 0, none)")
     p.add_argument("--modes", nargs="+", default=["fwd", "fwd_bwd"], choices=["fwd", "fwd_bwd"])
     p.add_argument("--impls", nargs="+", default=list(IMPLS), choices=list(IMPLS))
     p.add_argument("--warmup", type=int, default=5)
@@ -203,14 +231,21 @@ def main():
         p.error("--reps must be at least 10 (mean and std are reported)")
     if args.window is not None and args.window < 1:
         p.error("--window must be at least 1")
+    if not (math.isfinite(args.softcap) and args.softcap >= 0):
+        p.error("--softcap must be a finite number >= 0")
     if args.warmup < 1:
         p.error("--warmup must be at least 1 (the first call pays one-time setup)")
 
     env = environment()
     causal = not args.no_causal
+    var = Variant(causal, args.window, args.softcap)
+    # what the kernel replaces: SDPA mem-efficient, or eager for softcapping (HF fallback)
+    ref_impl = "eager" if args.softcap else "sdpa_mem_efficient"
     print(f"{env['gpu']} (sm_{env['sm'].replace('.', '')}), torch {env['torch']}, "
-          f"B={args.batch} H={args.heads} causal={causal} window={args.window}, {args.reps} reps")
-    hdr = f"{'mode':>7} {'d':>4} {'N':>6} | " + " | ".join(f"{i:>22}" for i in args.impls) + " | legacy/mem_eff"
+          f"B={args.batch} H={args.heads} causal={causal} window={args.window} softcap={args.softcap}, "
+          f"{args.reps} reps")
+    hdr = (f"{'mode':>7} {'d':>4} {'N':>6} | " + " | ".join(f"{i:>22}" for i in args.impls)
+           + f" | legacy/{ref_impl}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -218,18 +253,17 @@ def main():
     for mode in args.modes:
         for d in args.head_dim:
             for N in args.seq_lens:
-                errors = (max_errors(args.batch, args.heads, N, d, causal, args.window, args.impls)
-                          if mode == "fwd" else {})
+                errors = max_errors(args.batch, args.heads, N, d, var, args.impls) if mode == "fwd" else {}
                 row = {}
                 order = args.impls[rotation:] + args.impls[:rotation]
                 rotation = (rotation + 1) % len(args.impls)
                 for impl in order:
-                    row[impl] = bench_config(impl, args.batch, args.heads, N, d, causal, args.window,
-                                             mode, args.warmup, args.reps)
+                    row[impl] = bench_config(impl, args.batch, args.heads, N, d, var, mode,
+                                             args.warmup, args.reps)
                 for impl in args.impls:
                     results.append({"impl": impl, "mode": mode, "batch": args.batch, "heads": args.heads,
                                     "seq_len": N, "head_dim": d, "causal": causal, "window": args.window,
-                                    "max_abs_error": errors.get(impl), **row[impl]})
+                                    "softcap": args.softcap, "max_abs_error": errors.get(impl), **row[impl]})
                 bad = [i for i, e in errors.items() if e > 1e-2]
                 if bad:
                     print(f"WARNING d={d} N={N}: max abs error > 1e-2 vs FP32 math for {bad}: "
@@ -239,15 +273,16 @@ def main():
                     r = row[impl]
                     cells.append(f"{r['mean_ms']:8.2f}±{r['std_ms']:5.2f} {r['peak_mb']:5.0f}MB"
                                  if r["status"] == "ok" else f"{r['status']:>22}")
-                ref, ours = row.get("sdpa_mem_efficient"), row.get("flash_attn_legacy")
+                ref, ours = row.get(ref_impl), row.get("flash_attn_legacy")
                 ratio = (f"{ours['mean_ms'] / ref['mean_ms']:6.2f}x"
                          if ref and ours and ref["status"] == ours["status"] == "ok" else "")
                 print(f"{mode:>7} {d:>4} {N:>6} | " + " | ".join(cells) + f" | {ratio}")
 
-    print("cells: mean±std ms, peak memory above inputs and gradients; legacy/mem_eff < 1 means faster than SDPA")
+    print(f"cells: mean±std ms, peak memory above inputs and gradients; legacy/{ref_impl} < 1 means faster")
     print("note: the flash_attn_legacy forward always writes the logsumexp (B*H*N floats), SDPA skips it without grad")
     if args.save:
-        suffix = "" if args.window is None else f"_window{args.window}"
+        suffix = ("" if args.window is None else f"_window{args.window}") + \
+                 (f"_softcap{args.softcap:g}" if args.softcap else "")
         out = ROOT / "docs" / "bench" / (env["gpu"].replace(" ", "_") + suffix + ".json")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"environment": env, "args": vars(args), "results": results}, indent=1) + "\n")

@@ -68,12 +68,13 @@ struct BwdBlockArgs {
     index_t q_stride, o_stride, l_stride, dq_stride, k_stride, v_stride, dk_stride, dv_stride;
     int heads_per_kv, kv_start, seq_len_q, seq_len_k;
     int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero, never written)
-    float softmax_scale;
+    float softmax_scale, softcap;
     int window_left, window_right;  // KeyWindow of the sequence
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
     }
+    __device__ __forceinline__ ScoreMap score_map() const { return ScoreMap(softmax_scale, softcap); }
     // Query blocks of Br rows [x, y) with some row that sees a key of the key
     // block [kv_start, kv_start + Bc) (first / last row grow with the key)
     template <int Br, int Bc>
@@ -113,6 +114,7 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     a.seq_len_k = seq_len_k;
     a.head_dim = p.head_dim;  // kernels narrow it with tile_valid_cols
     a.softmax_scale = p.softmax_scale;
+    a.softcap = p.softcap;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
     return a;
@@ -155,7 +157,7 @@ bwd_varlen_kernel(FlashAttnBwdParams p) {
 //
 // One block per (KV block of Bc rows, batch x KV head). For every Q head of
 // the group (GQA) and every Q block of Br rows:
-//   1. S, P = exp(S*scale - L), dP = dO @ V^T, dS = P * (dP - D) * scale for
+//   1. S, P = exp(x(S) - L), dP = dO @ V^T, dS = P * (dP - D) * dx/dS for
 //      the [Br, Bc] tile: each thread computes some entries (128-bit dot
 //      products on padded rows: bank-conflict free) and stores P, dS in shared
 //      memory (row stride Bc + 1: conflict free by rows and by columns).
@@ -191,6 +193,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     const int kv_start = a.kv_start;
     const int valid_kv = min(Bc, a.seq_len_k - kv_start);
     const KeyWindow w = a.window();
+    const ScoreMap score_map = a.score_map();
 
     extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
     half*  smem_K  = reinterpret_cast<half*>(smem_raw);
@@ -199,7 +202,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     half*  smem_dO = smem_Q + Br * LDH;
     float* smem_P  = reinterpret_cast<float*>(smem_dO + Br * LDH);
     float* smem_dS = smem_P + Br * LDF;
-    float* smem_L  = smem_dS + Br * LDF;
+    float* smem_L  = smem_dS + Br * LDF;  // L * log2(e)
     float* smem_D  = smem_L + Br;
 
     load_tile_g2s<Bc, D, NT, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
@@ -226,26 +229,30 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                                           smem_dO, valid_q, a.head_dim);
             if (tid < Br) {
                 const index_t lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
-                smem_L[tid] = (tid < valid_q) ? a.L[lrow] : 0.0f;
+                smem_L[tid] = (tid < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
                 smem_D[tid] = (tid < valid_q) ? a.D[lrow] : 0.0f;
             }
             __syncthreads();
 
             // 1. P and dS for the [Br, Bc] tile (j fastest across threads)
-            #pragma unroll
-            for (int e = tid; e < Br * Bc; e += NT) {
-                const int i = e / Bc, j = e % Bc;
-                float p = 0.0f, ds = 0.0f;
-                const bool valid = i < valid_q && !w.masked(q_start + i, kv_start + j);
-                if (valid) {
-                    const float s = half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH) * a.softmax_scale;
-                    p = expf(s - smem_L[i]);
-                    const float dp = half_dot<D>(smem_dO + i * LDH, smem_V + j * LDH);
-                    ds = p * (dp - smem_D[i]) * a.softmax_scale;
+            score_map.dispatch([&](auto softcap) {
+                #pragma unroll
+                for (int e = tid; e < Br * Bc; e += NT) {
+                    const int i = e / Bc, j = e % Bc;
+                    float p = 0.0f, ds = 0.0f;
+                    const bool valid = i < valid_q && !w.masked(q_start + i, kv_start + j);
+                    if (valid) {
+                        float dx_ds;
+                        const float x = score_map.template log2_logit<decltype(softcap)::value>(
+                            half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH), dx_ds);
+                        p = exp2f(x - smem_L[i]);
+                        const float dp = half_dot<D>(smem_dO + i * LDH, smem_V + j * LDH);
+                        ds = p * (dp - smem_D[i]) * dx_ds;
+                    }
+                    smem_P[i * LDF + j] = p;
+                    smem_dS[i * LDF + j] = ds;
                 }
-                smem_P[i * LDF + j] = p;
-                smem_dS[i * LDF + j] = ds;
-            }
+            });
             __syncthreads();
 
             // 2. dV[j] += P^T dO, dK[j] += dS^T Q (registers; row j, column slice)
@@ -321,8 +328,8 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
 // columns of slice w % kSplitD of dK / dV, accumulated in WMMA fragments. Per
 // query block, each warp on its own computes, as transposed [16 keys, Br]
 // fragments,
-//   S^T = K_band Q^T,  P^T = exp(S^T * scale - L)  (masked to 0)
-//   dV += P^T dO,  dP^T = V_band dO^T,  dS^T = P^T (dP^T - D) * scale,  dK += dS^T Q
+//   S^T = K_band Q^T,  P^T = exp(x(S^T) - L)  (ScoreMap; masked to 0)
+//   dV += P^T dO,  dP^T = V_band dO^T,  dS^T = P^T (dP^T - D) * dx/dS,  dK += dS^T Q
 // with the element-wise steps done on the fragments themselves (the row and
 // column of each element come from wmma_acc_layout). P^T / dS^T reach the
 // next WMMA as half through the warp's buffer, and dS^T also goes to a shared
@@ -361,7 +368,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     const int kv_start = a.kv_start;
     const int valid_kv = min(Bc, a.seq_len_k - kv_start);
     const KeyWindow w = a.window();
-    const float scale_log2 = a.softmax_scale * kLog2e;
+    const ScoreMap score_map = a.score_map();
 
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
     half*  smem_K  = reinterpret_cast<half*>(smem_raw);
@@ -431,19 +438,25 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
 
             // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as
             // half into the warp buffer for dV += P^T dO
-            #pragma unroll
-            for (int qt = 0; qt < QT; qt++) {
+            score_map.dispatch([&](auto softcap) {
                 #pragma unroll
-                for (int i = 0; i < NE; i++) {
-                    const int key = kv_start + band * T + e_row[i];
-                    const int q = qt * T + e_col[i];  // row within the query block
-                    const bool masked = q >= valid_q || w.masked(q_start + q, key);
-                    const float p = masked ? 0.0f : exp2f(S[qt].x[i] * scale_log2 - smem_L[q]);
-                    S[qt].x[i] = p;
-                    dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * a.softmax_scale;
-                    wbuf[e_row[i] * LDB + q] = __float2half(p);
+                for (int qt = 0; qt < QT; qt++) {
+                    #pragma unroll
+                    for (int i = 0; i < NE; i++) {
+                        const int key = kv_start + band * T + e_row[i];
+                        const int q = qt * T + e_col[i];  // row within the query block
+                        // selects, not a branch: the map of masked elements is
+                        // cheaper than diverging (V100 fwd+bwd -3%)
+                        const bool masked = q >= valid_q || w.masked(q_start + q, key);
+                        float dx_ds;
+                        const float x = score_map.template log2_logit<decltype(softcap)::value>(S[qt].x[i], dx_ds);
+                        const float p = masked ? 0.0f : exp2f(x - smem_L[q]);
+                        S[qt].x[i] = p;
+                        dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * dx_ds;
+                        wbuf[e_row[i] * LDB + q] = __float2half(p);
+                    }
                 }
-            }
+            });
             __syncwarp();
             #pragma unroll
             for (int k = 0; k < Br; k += T) {
