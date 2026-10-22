@@ -75,13 +75,17 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             #pragma unroll
             for (int j = 0; j < TN; j++) {
                 const float4 kk = *reinterpret_cast<const float4*>(smem_K + (cg + 8 * j) * LDF + k);
+                // One K component over the 4 rows at a time: it stays in the operand
+                // reuse cache, so sm_6x register bank conflicts no longer depend on
+                // the register allocation (it swung d=96 / d=128 by +-30%, P4.1)
                 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    s[i][j] = fmaf(q[i].x, kk.x, s[i][j]);
-                    s[i][j] = fmaf(q[i].y, kk.y, s[i][j]);
-                    s[i][j] = fmaf(q[i].z, kk.z, s[i][j]);
-                    s[i][j] = fmaf(q[i].w, kk.w, s[i][j]);
-                }
+                for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].x, kk.x, s[i][j]);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].y, kk.y, s[i][j]);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].z, kk.z, s[i][j]);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].w, kk.w, s[i][j]);
             }
         }
         #pragma unroll
