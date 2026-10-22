@@ -201,10 +201,11 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 
 #else  // __CUDA_ARCH__ < 700
 
-// Stub body for SM < 7.0 device code — never launched there (dispatch in .cpp).
+// Stub body for SM < 7.0 device code — never launched there: the host selects the
+// family from the arch of the code that runs (compiled_arch_for).
 struct VoltaFwd {
     template <typename Tile>
-    static __device__ __forceinline__ void run(const FwdBlockArgs&) {}
+    static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 
 #endif  // __CUDA_ARCH__

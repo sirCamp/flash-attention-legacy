@@ -31,8 +31,8 @@ void precompute_D(
     index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
     cudaStream_t stream);
-void flash_attn_bwd_launch(FlashAttnBwdParams& params, bool wmma, int total_k_blocks, cudaStream_t stream);
-int flash_attn_bwd_block_cols(int head_dim, bool wmma);
+void flash_attn_bwd_launch(FlashAttnBwdParams& params, int sm, int total_k_blocks, cudaStream_t stream);
+int flash_attn_bwd_block_cols(int head_dim, int sm);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -64,14 +64,17 @@ static std::string compiled_archs_str() {
     return s;
 }
 
-// A GPU can run SASS of the same major and lower-or-equal minor, or PTX of a
-// lower-or-equal arch (JIT). Fail with a clear message instead of CUDA's
-// "no kernel image is available for execution on the device".
-static void check_compiled_for(int sm) {
+// A GPU runs the SASS of its major with the highest minor not above its own,
+// else the PTX of a lower-or-equal arch (JIT). Returns the arch of the code that
+// runs (e.g. 70 on a T4 built for 7.0 only: no sm_75 instructions), or fails
+// with a clear message instead of CUDA's "no kernel image is available".
+static int compiled_arch_for(int sm) {
+    int best = 0;
     for (int a : kCompiledSass) {
-        if (a / 10 == sm / 10 && a <= sm) return;
+        if (a / 10 == sm / 10 && a <= sm && a > best) best = a;
     }
-    if (kCompiledPtx && kCompiledPtx <= sm) return;
+    if (best) return best;
+    if (kCompiledPtx && kCompiledPtx <= sm) return kCompiledPtx;
     TORCH_CHECK(false, "flash_attn_legacy was built for SM ", compiled_archs_str(),
                 ", this GPU is SM ", sm / 10, ".", sm % 10, ". Rebuild with "
                 "FLASH_ATTN_LEGACY_ARCHS=\"", sm / 10, ".", sm % 10, "\" pip install -e . --no-build-isolation");
@@ -90,18 +93,19 @@ static int get_sm_version(int device_id = -1) {
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id));
     const int sm = major * 10 + minor;
-    check_compiled_for(sm);
+    const int code_sm = compiled_arch_for(sm);  // selects the kernel family below
     if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
         const std::string f(force);
         if (f == "pascal") return 60;  // CUDA-core kernels run on any SM >= 6.0
         if (f == "volta") {
-            TORCH_CHECK(sm >= 70, "FLASH_ATTN_LEGACY_FORCE_ARCH=volta needs tensor cores "
-                        "(SM >= 7.0), this GPU is SM ", sm);
+            TORCH_CHECK(code_sm >= 70, "FLASH_ATTN_LEGACY_FORCE_ARCH=volta needs tensor cores "
+                        "(SM >= 7.0) and a build for them; this GPU is SM ", sm, ", built for ",
+                        compiled_archs_str());
             return 70;
         }
         TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
     }
-    return sm;
+    return code_sm;
 }
 
 // Head dimensions with a kernel tile (72 and 80 run on the 80 / 96 tiles with
@@ -421,7 +425,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     bwd.dv_head_stride  = dV.stride(1);
     bwd.dv_seq_stride   = dV.stride(2);
 
-    flash_attn_bwd_launch(bwd, get_sm_version() >= 70, 0, stream);
+    flash_attn_bwd_launch(bwd, get_sm_version(), 0, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
 
     torch::Tensor dQ = dQ_fp32.to(torch::kFloat16);
@@ -544,8 +548,8 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
         return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V), dsink};
     }
 
-    const bool wmma = get_sm_version() >= 70;
-    const int Bc = flash_attn_bwd_block_cols(d, wmma);  // same selection as the launch
+    const int sm = get_sm_version();
+    const int Bc = flash_attn_bwd_block_cols(d, sm);  // same selection as the launch
     const VarlenBlocks k_blocks = varlen_blocks(cu_seqlens_k, cu_host.second, Bc, total_k);
 
     torch::Tensor dQ_fp32 = torch::zeros({total_q, H_q, d}, Q.options().dtype(torch::kFloat32));
@@ -585,7 +589,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     bwd.key_block_offsets = k_blocks.offsets.data_ptr<int>();
     bwd.num_seqs = num_seqs;
 
-    if (k_blocks.total > 0) flash_attn_bwd_launch(bwd, wmma, k_blocks.total, stream);
+    if (k_blocks.total > 0) flash_attn_bwd_launch(bwd, sm, k_blocks.total, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
     return {dQ_fp32.to(torch::kFloat16), dK, dV, dsink};
 }

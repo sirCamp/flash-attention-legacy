@@ -1,8 +1,8 @@
 #pragma once
 
 // WMMA helpers shared by the tensor-core forward and backward kernels
-// (sm_70 / sm_75). Device code only exists for __CUDA_ARCH__ >= 700; the
-// including .cu files provide stubs for older architectures.
+// (sm_70 / sm_75). Device code only exists for __CUDA_ARCH__ >= 700; the kernel
+// bodies using it have trapping stubs for older architectures.
 
 #include <mma.h>  // file scope: inside a namespace it breaks cuda_bf16.h
 

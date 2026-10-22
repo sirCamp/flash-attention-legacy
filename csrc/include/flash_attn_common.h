@@ -315,6 +315,27 @@ struct BwdTileWmma {
     static_assert(kWarpBufBytes >= 256 * 4 + 256, "warp buffer too small for the layout probe (Br >= 32)");
 };
 
+// mma.sync backward (Turing, docs/analysis/kernels/bwd_design.md): K, V [Bc,kLdH],
+// Q, dO [Br,kLdH] (half, rows padded by 8: conflict-free ldmatrix), L, D [Br]
+// (float), dS^T [Bc,kLdS] (half, key-major, for dQ = dS K). P^T and dS^T of a
+// warp's band stay in registers; no per-warp buffers. kNumWarps = (Bc / 16) *
+// kSplitD: warp w owns the 16 keys of band w / kSplitD and d / kSplitD columns
+// of dK / dV.
+template <int Br_, int Bc_, int d_, int kSplitD_ = 1>
+struct BwdTileMma {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kSplitD = kSplitD_;
+    static constexpr int kNumWarps = (Bc_ / 16) * kSplitD_;
+    static constexpr int kLdH = d_ + 8;
+    static constexpr int kLdS = Br_ + 8;
+    static constexpr int smem_bytes() {
+        return (2 * Bc + 2 * Br) * kLdH * 2 + 2 * Br * 4 + Bc * kLdS * 2;
+    }
+    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % (16 * kSplitD_) == 0, "invalid mma backward tile");
+};
+
 // CUDA-core backward (Pascal): K, V [Bc,kLdH], Q, dO [Br,kLdH] (half, rows padded
 // for conflict-free 128-bit reads); P, dS [Br,kLdF] (float, odd stride: column
 // reads in the dK/dV and dQ steps are conflict free); L, D [Br] (float). dK/dV

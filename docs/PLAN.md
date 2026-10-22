@@ -173,6 +173,15 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P5.3 | **Fatto (branch p2-turing)**: forward WMMA con righe di S/P padded (+4 float / +8 half) e accessi a 128 bit per riga, softmax che scrive P direttamente in half; forward CUDA-core con Q padded (+8 half), prodotto scalare a 128 bit e P nei registri (niente buffer P). Corpo del blocco condiviso tra kernel batched e varlen (`volta_fwd_block`, `pascal_fwd_block`, anticipo di P2.1). Br=64 provato: differenze del ±10% di segno opposto tra GPU, tenuto Br=128. | S | Fatto: conflitti in lettura a 0 (Nsight, T4); tempi in §1b. |
 | P5.4 | **Fatto (branch p2-turing)**: Pascal d=256 (Gemma 2/3): la shared memory fp32 lasciava un solo blocco di 16 righe, cioè **un warp per SM** sulla P100 (metà delle unità FMA ferme, latenze scoperte). Ora i warp di una banda si dividono le colonne (`kSplit` nel tile): S parziale per fetta di colonne, somma in shared memory con una barriera nominata per banda, stesso softmax, O per fetta (16 registri invece di 128). S parziale in shared memory per lane (senza conflitti di banco). Causale B=2 H=16 N=4096: P100 288 → 99 ms (kSplit 2/4/8 = 153/130/120 prima della correzione dei conflitti), 1080 Ti 196 → 121; SDPA mem-efficient 58 / 1049, eager 110 / 141. Il forward da solo resta sopra SDPA (P100 99 contro 58 ms) per il limite di Bc=8 (poco lavoro per blocco K/V): prossimi passi possibili, più invasivi, K e V non residenti insieme (Bc=16) oppure Q e K a fette di colonne come i kernel cutlass. Backward d=256: stesso limite (36 KB, un blocco per SM sulla P100), tile da 8 warp invece di 4: fwd+bwd P100 706 → 398 ms (SDPA mem-efficient 443, math 271), 1080 Ti 664 → 566 (math 353). | M | P100 d=256 almeno pari a SDPA mem-efficient |
 
+### P7 — Backward sui tensor core e Turing `mma.sync` (ordine scelto il 2026-10-22: questo, poi P6.1, P6.2, P6.5)
+
+| ID | Intervento | Dim | Criterio di accettazione |
+|---|---|---|---|
+| P7.1 | **Fatto**: `precompute_D` coalescente (8 lane per riga): V100 0.76 → 0.09 ms, T4 2.62 → 0.28 | S | — |
+| P7.2 | **In corso**: backward Turing con `mma.sync` m16n8k8 e `ldmatrix` (`BwdMma`, progetto e misure in `docs/analysis/kernels/bwd_design.md`): P^T e dS^T restano nei registri come operandi A, niente buffer per warp, d=128 a 8 warp sulla T4. Backward T4 d=128 53.7 → 32.3 ms, d=64 18.2 → 16.6, d=256 invariato (S^T ricalcolato da ogni warp della banda: prossimo passo). Famiglia scelta dall'arch del codice che gira (`compiled_arch_for`); sm_8x usa `BwdMma` tramite il PTX 7.5 (non testato). | L | fwd+bwd T4 entro ~1× SDPA mem-efficient |
+| P7.3 | Forward Turing sugli stessi primitivi (P2.8 passo 3) | M | — |
+| P7.4 | V100: `mma.m8n8k4` oppure WMMA migliorato, da decidere dopo la T4 | M | fwd+bwd V100 entro ~1× SDPA |
+
 ### P6 — Estensioni (da prioritizzare)
 
 | ID | Intervento | Dim |
