@@ -61,7 +61,8 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
     "decode": FallbackReason("q_len == 1 (decode)", expected=True),
     "attention_mask": FallbackReason(
-        "explicit attention mask (sliding window, padding inside a sequence, custom masks, ...)",
+        "explicit attention mask (padding inside a sequence, bidirectional sliding window, "
+        "custom masks, ...)",
         expected=True),
     "q_longer_than_kv": FallbackReason("q_len > kv_len"),
     "head_dim": FallbackReason(f"head_dim not in {SUPPORTED_HEAD_DIMS}"),
@@ -82,6 +83,14 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
 # forward can skip a device sync; the attribute is only a fast path (it is lost
 # if transformers copies the mask), never needed for correctness.
 _N_VALID_ATTR = "_flash_attn_legacy_n_valid"
+# The 2D masks _flash_attn_legacy_mask builds for causal sliding-window layers
+# carry the window W (HF sliding_window: query i sees keys j with i - j < W) in
+# their values: int32, W + 1 on kept slots and 0 on padding (W + 1 > 1, so never
+# read from a plain 0/1 mask). Some models pass no `sliding_window` kwarg, so the
+# window must survive copies of the mask (e.g. accelerate's .to(device) between
+# GPUs); _WINDOW_ATTR is only the sync-free fast path, as _N_VALID_ATTR.
+_WINDOW_ATTR = "_flash_attn_legacy_window"
+_WINDOW_DTYPE = torch.int32
 
 _fallback_counts: Counter = Counter()
 _warned_reasons: set = set()
@@ -153,10 +162,14 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
     return None, ""
 
 
-def _causal_mask(q_len: int, kv_len: int, device) -> torch.Tensor:
+def _causal_mask(q_len: int, kv_len: int, device, window: Optional[int] = None) -> torch.Tensor:
     """Bottom-right aligned causal mask (True = keep): query i sees keys
-    j <= i + (kv_len - q_len), the convention of the kernel."""
-    return torch.ones(q_len, kv_len, dtype=torch.bool, device=device).tril(diagonal=kv_len - q_len)
+    j <= i + (kv_len - q_len), the convention of the kernel; with a sliding
+    `window` only the last `window` of them (HF sliding_window)."""
+    keep = torch.ones(q_len, kv_len, dtype=torch.bool, device=device).tril(diagonal=kv_len - q_len)
+    if window is not None:
+        keep = keep.triu(diagonal=kv_len - q_len - window + 1)
+    return keep
 
 
 # Upper bound for the fp32 logits of one query block in _eager_attention (the
@@ -372,6 +385,35 @@ def _unpad_plan(key_mask, q_len, causal, device):
     return q_idx, k_idx, cu_q, cu_k, max_q, max_k
 
 
+def _is_sliding_causal(mask_function, window: int) -> bool:
+    """`mask_function` behaves as transformers' sliding_window_causal_mask_function
+    (window) on probe points around the window edges of two consecutive rows with
+    more than `window` keys before them (rules out chunked attention, chunk size
+    2 included, and other overlays)."""
+    t = torch.tensor
+    for q in (2 * window + 3, 2 * window + 4):
+        expected = {0: False, q - window: False, q - window + 1: True, q: True, q + 1: False}
+        try:
+            if not all(bool(mask_function(t(0), t(0), t(q), t(kv))) == keep for kv, keep in expected.items()):
+                return False
+        except (TypeError, IndexError, RuntimeError):  # not index-based: not ours to interpret
+            return False
+    return True
+
+
+def _mask_window(attention_mask) -> Optional[int]:
+    """The sliding window W a 2D mask of _flash_attn_legacy_mask carries
+    (see _WINDOW_ATTR), or None. Reads the values (a device sync) only when the
+    tag was lost in a copy."""
+    if attention_mask is None or attention_mask.dim() != 2:
+        return None
+    window = getattr(attention_mask, _WINDOW_ATTR, None)
+    if window is None and attention_mask.dtype == _WINDOW_DTYPE and attention_mask.numel() > 0:
+        top = int(attention_mask.max())
+        window = top - 1 if top > 1 else None
+    return window
+
+
 def _segment_mask(cu_seqlens, n, causal, device) -> torch.Tensor:
     """[1, 1, n, n] boolean mask (True = keep) of a packing: tokens attend within
     their own segment only (and causally within it when `causal`)."""
@@ -412,6 +454,14 @@ def flash_attn_legacy_forward(
     elif not key.dtype == value.dtype == query.dtype:
         # e.g. an fp32 static cache: compute in the query dtype
         key, value = key.to(query.dtype), value.to(query.dtype)
+
+    # Causal sliding window (HF sliding_window = W: query i sees keys i - j < W):
+    # from our mask builder (_WINDOW_ATTR), else from the layer's kwarg as in HF's
+    # flash_attention_2. The kernel gets window_size=(W - 1, W - 1), right side 0
+    # when causal.
+    window = _mask_window(attention_mask)
+    if window is None:
+        window = kwargs.get("sliding_window")
 
     padding_2d = False
     key_mask_2d = None  # [B, kv] padding mask (True = keep) when padding_2d
@@ -460,6 +510,10 @@ def flash_attn_legacy_forward(
     # reason recorded in the fallback registry.
     reason, detail = _kernel_fallback_reason(module, query, key, value,
                                              None if padding_2d else attention_mask, dropout, kwargs)
+    if reason is None and window is not None and padding_2d and not is_causal:
+        # unpadding shifts bidirectional rows against their keys
+        reason, detail = "attention_mask", " (padding with a non-causal sliding window)"
+    window_size = (-1, -1) if window is None else (window - 1, window - 1)
     unpad = None
     if reason is None and padding_2d:  # the plan's host sync only when the kernel can run
         unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
@@ -482,18 +536,19 @@ def flash_attn_legacy_forward(
                     return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
                 out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
                                              cu_q, cu_k, max_q, max_k, softmax_scale=scaling,
-                                             causal=is_causal, validate=False)  # built by _unpad_plan
+                                             causal=is_causal, window_size=window_size,
+                                             validate=False)  # built by _unpad_plan
                 attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
                                .view(B, q_len, H_q, -1).transpose(1, 2))
             elif segments is None:
-                attn_output = flash_attention(query, key, value,
-                                              softmax_scale=scaling, causal=is_causal)
+                attn_output = flash_attention(query, key, value, softmax_scale=scaling,
+                                              causal=is_causal, window_size=window_size)
             else:
                 cu_seqlens, max_len = segments
                 packed = [t[0].transpose(0, 1) for t in (query, key, value)]  # [N, H, d]
                 attn_output = flash_attn_varlen_func(
                     *packed, cu_seqlens, cu_seqlens, max_len, max_len,
-                    softmax_scale=scaling, causal=is_causal,
+                    softmax_scale=scaling, causal=is_causal, window_size=window_size,
                     validate=False,  # validated / built by _packed_segments
                 ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
         except FP16RangeError:
@@ -512,19 +567,28 @@ def flash_attn_legacy_forward(
         # One mask for both fallbacks: boolean (True = keep) or additive float,
         # with bottom-right causality; `causal_only` = plain causal, q_len == kv_len.
         mask, causal_only = attention_mask, False
+        # The window of a 2D-mask / kwarg layer (4D masks already carry theirs)
+        band = window if (attention_mask is None or padding_2d) else None
+        if band is not None and not is_causal:
+            band_mask = (_causal_mask(q_len, kv_len, query.device, band)
+                         | _causal_mask(kv_len, q_len, query.device, band).T)  # |i - j| < W
+        elif band is not None or (is_causal and q_len > 1):
+            band_mask = _causal_mask(q_len, kv_len, query.device, band)
+        else:
+            band_mask = None
         if mask is not None:
             mask = mask[..., :kv_len]
-            if padding_2d and is_causal and q_len > 1:
-                mask = mask & _causal_mask(q_len, kv_len, query.device)
+            if padding_2d and band_mask is not None:
+                mask = mask & band_mask
             if padding_2d:
                 # Query rows that see no key (left padding) attend everything instead,
                 # as HF's SDPA mask does: fully masked rows give NaN on torch < 2.5,
                 # and NaN in padded rows can reach valid ones in the next layer.
                 mask = mask | ~mask.any(-1, keepdim=True)
-        elif is_causal and q_len == kv_len:
+        elif is_causal and q_len == kv_len and band is None:
             causal_only = True  # no N x N mask materialised for SDPA
-        elif is_causal and q_len > 1:
-            mask = _causal_mask(q_len, kv_len, query.device)
+        elif band_mask is not None:
+            mask = band_mask
         if segments is not None:
             # Intersect, never replace: the existing mask may carry a sliding window.
             seg = _segment_mask(segments[0], q_len, is_causal, query.device)
@@ -567,14 +631,16 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
                             **kwargs):
     """Mask builder for transformers' ALL_MASK_ATTENTION_FUNCTIONS.
 
-    For plain causal / bidirectional attention with no sliding window (and when
+    For plain causal / bidirectional attention and causal sliding windows (when
     transformers allows skipping the mask) it returns:
       - None when every key slot is attended (-> kernel), or
       - causal only: a [batch, n_valid] mask tagged with _N_VALID_ATTR when only
         the first n_valid key slots hold tokens (pre-allocated static caches) ->
         flash_attn_legacy_forward slices K/V to n_valid and runs the kernel;
       - with padding: the [batch, n_valid] padding mask (untagged) -> unpadded
-        onto the varlen kernel when the padding is contiguous per row.
+        onto the varlen kernel when the padding is contiguous per row;
+      - causal sliding window (P4.1): always a [batch, n_valid] mask, as above,
+        holding the window in its values (_WINDOW_ATTR) -> the kernel's window_size.
     Anything else gets the SDPA builder's boolean 4D mask (-> SDPA fallback).
     The SDPA builder is always called with both skips disabled: an SDPA `None`
     means "slice K/V to q_len" (causal, top-left) or "no mask at all", which is
@@ -592,13 +658,17 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
             attention_mask=attention_mask, local_size=local_size,
             allow_is_causal_skip=False, allow_is_bidirectional_skip=False, **kwargs)
 
-    causal = mask_function is mu.causal_mask_function
+    window = None
+    if (allow_is_causal_skip and local_size is not None and mask_function is not mu.causal_mask_function
+            and _is_sliding_causal(mask_function, local_size)):
+        window = int(local_size)
+    causal = mask_function is mu.causal_mask_function or window is not None
     bidirectional = mask_function is mu.bidirectional_mask_function
     skip_allowed = (causal and allow_is_causal_skip) or (bidirectional and allow_is_bidirectional_skip)
     if not skip_allowed:
-        return sdpa_mask()  # sliding window, packing, overlays, custom mask functions
-    if local_size is not None and kv_length >= local_size:
-        return sdpa_mask()  # sliding window
+        return sdpa_mask()  # packing, overlays, custom mask functions, bidirectional windows
+    if window is None and local_size is not None and kv_length >= local_size:
+        return sdpa_mask()  # a window we did not recognise
     # Static caches may pass offsets as 0-d tensors; reading them syncs (see P6.5).
     q_off, kv_off = int(q_offset), int(kv_offset)
     if causal:
@@ -619,13 +689,21 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
             # marked as padded -> unpadded onto the varlen kernel (_unpad_plan), or
             # the fallback. Models that index the mask as 4D (e.g. Doge) do not
             # follow this convention: see README "Known integration corner cases".
-            pad = pad.to(torch.bool, copy=True)
+            if window is None:
+                pad = pad.to(torch.bool, copy=True)
+            else:
+                pad = pad.to(torch.bool).to(_WINDOW_DTYPE) * (window + 1)
+                setattr(pad, _WINDOW_ATTR, window)
             setattr(pad, _PADDING_ATTR, True)
             return pad
-    if n_valid == kv_length:
+    if n_valid == kv_length and window is None:
         return None
     device = kwargs.get("device", "cpu")
-    valid = torch.ones(1, 1, dtype=torch.bool, device=device).expand(batch_size, n_valid)
+    if window is None:
+        valid = torch.ones(1, 1, dtype=torch.bool, device=device).expand(batch_size, n_valid)
+    else:
+        valid = torch.full((1, 1), window + 1, dtype=_WINDOW_DTYPE, device=device).expand(batch_size, n_valid)
+        setattr(valid, _WINDOW_ATTR, window)
     setattr(valid, _N_VALID_ATTR, n_valid)
     return valid
 

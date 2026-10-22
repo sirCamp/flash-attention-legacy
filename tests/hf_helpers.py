@@ -10,19 +10,22 @@ import torch
 class KernelCounter:
     """Counts calls to our kernels made through the HF integration:
     `calls` gets (q_len, kv_len) per batched call, `varlen_calls` gets
-    (total_tokens, n_segments) per varlen call."""
+    (total_tokens, n_segments) per varlen call, `windows` the window_size of
+    every call (both kinds, in call order)."""
 
     def __init__(self, monkeypatch):
         import flash_attn_legacy.flash_attn as fa
-        self.calls, self.varlen_calls = [], []
+        self.calls, self.varlen_calls, self.windows = [], [], []
         batched, varlen = fa.flash_attention, fa.flash_attn_varlen_func
 
         def wrapped(q, k, v, *args, **kwargs):
             self.calls.append((q.shape[2], k.shape[2]))
+            self.windows.append(kwargs.get("window_size", (-1, -1)))
             return batched(q, k, v, *args, **kwargs)
 
         def wrapped_varlen(q, k, v, cu_q, *args, **kwargs):
             self.varlen_calls.append((q.shape[0], cu_q.numel() - 1))
+            self.windows.append(kwargs.get("window_size", (-1, -1)))
             return varlen(q, k, v, cu_q, *args, **kwargs)
 
         monkeypatch.setattr(fa, "flash_attention", wrapped)
@@ -31,6 +34,7 @@ class KernelCounter:
     def reset(self):
         self.calls.clear()
         self.varlen_calls.clear()
+        self.windows.clear()
 
 
 def set_impl(model, impl):
@@ -103,6 +107,36 @@ def tiny_llama(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, vocab=512, seed
     return LlamaForCausalLM(cfg).eval()
 
 
+def tiny_mistral(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, sliding_window=8, vocab=512,
+                 seed=0, **extra):
+    """Random-weight Mistral (v0.1 style): every layer has the sliding window."""
+    from transformers import MistralConfig, MistralForCausalLM
+
+    torch.manual_seed(seed)
+    cfg = MistralConfig(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads, head_dim=head_dim,
+        intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
+        vocab_size=vocab, max_position_embeddings=4096, sliding_window=sliding_window, **extra,
+    )
+    return MistralForCausalLM(cfg).eval()
+
+
+def tiny_phi3(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, sliding_window=8, vocab=512,
+              seed=0, **extra):
+    """Random-weight Phi-3 with a sliding window on every layer."""
+    from transformers import Phi3Config, Phi3ForCausalLM
+
+    torch.manual_seed(seed)
+    cfg = Phi3Config(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads, intermediate_size=2 * head_dim * n_heads,
+        num_hidden_layers=n_layers, vocab_size=vocab, max_position_embeddings=4096,
+        sliding_window=sliding_window, pad_token_id=0, **extra,
+    )
+    return Phi3ForCausalLM(cfg).eval()
+
+
 def _alternating(n_layers):
     return ["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(n_layers)]
 
@@ -163,7 +197,15 @@ def tiny_gpt_oss(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, sliding_windo
 
 
 TINY_MODELS = {"llama": tiny_llama, "gemma3": tiny_gemma3, "gemma2": tiny_gemma2,
-               "gpt_oss": tiny_gpt_oss}
+               "gpt_oss": tiny_gpt_oss, "mistral": tiny_mistral, "phi3": tiny_phi3}
+
+
+def layer_types(config):
+    """Attention type of every layer: config.layer_types, else all sliding when
+    the config has a sliding_window (Mistral, Phi-3), else all full."""
+    return list(getattr(config, "layer_types", None) or (
+        ["sliding_attention" if getattr(config, "sliding_window", None) else "full_attention"]
+        * config.num_hidden_layers))
 
 
 def load_impl(model, impl, dtype=torch.float16):

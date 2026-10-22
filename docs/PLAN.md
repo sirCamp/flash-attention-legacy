@@ -159,7 +159,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
-| P4.1 | Sliding window `window_size=(left, right)` nel forward e nel backward, saltando i blocchi | S–M | Gemma 3, Mistral v0.1 e Phi-3 sul kernel oltre la finestra, entro il rumore; tempi contro SDPA mem-efficient (a 8k SDPA può andare in OOM: confronto a 4k più memoria a 8k) [R12] |
+| P4.1 | **Fatto (branch p2-turing)**: `window_size=(left, right)` con la semantica di upstream (righe allineate in basso a destra, −1 illimitato) nel forward e nel backward, batched e varlen; i blocchi fuori finestra sono saltati, quelli interni senza maschera. Integrazione HF: la finestra arriva dal builder della maschera (`local_size` verificato sulla `mask_function`) o dal kwarg `sliding_window`; anche i fallback la applicano. P100, finestra 1024, causale: a 8k forward 11.6 ms contro 121.8 di SDPA mem-efficient, fwd+bwd 71 contro 844, meno memoria. Riordino delle FMA QK su Pascal (conflitti di banco): d=128 forward causale da 51.8 a 34 ms. Piano originale: Sliding window `window_size=(left, right)` nel forward e nel backward, saltando i blocchi | S–M | Gemma 3, Mistral v0.1 e Phi-3 sul kernel oltre la finestra, entro il rumore; tempi contro SDPA mem-efficient (a 8k SDPA può andare in OOM: confronto a 4k più memoria a 8k) [R12] |
 | P4.2 | Softcap: `cap·tanh(s/cap)`, con il backward che moltiplica per `(1−t²)` | S–M | Gemma 2 sul kernel, entro il rumore |
 | P4.3 | Sink (`row_max=sink`, `row_sum=1`) e riduzione per `d_sink` | S–M | gpt-oss ridotto: top1 come eager FP16 |
 | P4.4 | Integrazione: il fallback di P0.3 resta solo per i casi non supportati | S | Matrice dei modelli senza fallback per window, softcap e sink |
@@ -201,7 +201,7 @@ Soluzioni provvisorie introdotte durante P0, ciascuna con la voce che la sostitu
 | ~~Backward varlen come loop Python per segmento~~ **risolto da P2.4** (un lancio) | prima di P0, usato da P0.4 | P2.4 varlen backward nativo | Un solo lancio del kernel, nessuna sincronizzazione host per segmento. Già oggi più veloce del fallback SDPA a blocchi: V100 7.6–15.9 ms contro 24, 1080 Ti 36–267 ms contro 5260, a 8192 token |
 | Encoder di visione con head_dim 72/80 (Qwen2-VL, SigLIP) → fallback a segmenti | P0.4 | P2.7 nuovi head_dim | Encoder di visione di Qwen2-VL e SigLIP sul kernel varlen |
 | Padding (maschera 2D con zeri o maschera 4D) → fallback SDPA | prima di P0 | P3.1 padding nativo | Batch con padding sul kernel in tutti gli strati |
-| Sliding window → fallback SDPA | prima di P0 | P4.1 window nel kernel | Gemma 3, Mistral v0.1 e Phi-3 senza motivo `attention_mask` dovuto alla window |
+| ~~Sliding window → fallback SDPA~~ **risolto da P4.1** | prima di P0 | P4.1 window nel kernel | Gemma 3, Mistral v0.1 e Phi-3 senza motivo `attention_mask` dovuto alla window |
 | Guardia sulla T4 (tile che non entrano → fallback) | P0.6 | P2.2/P2.3 tile a runtime | Nessun fallback per shared memory su T4 |
 
 ## 4. Strategia di test

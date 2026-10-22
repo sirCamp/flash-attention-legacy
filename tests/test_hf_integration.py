@@ -9,6 +9,7 @@ Run:  pytest tests/test_hf_integration.py -v
 """
 
 import logging
+from collections import Counter
 
 import pytest
 import torch
@@ -20,8 +21,8 @@ transformers = pytest.importorskip("transformers")
 
 from flash_attn_legacy import fallback_stats, integrations, reset_fallback_stats  # noqa: E402
 from .hf_helpers import (  # noqa: E402
-    TINY_MODELS, KernelCounter, assert_close_to_gold, compare, load_impl, logits, tiny_llama,
-    tiny_vision_tower,
+    TINY_MODELS, KernelCounter, assert_close_to_gold, compare, layer_types, load_impl, logits,
+    tiny_llama, tiny_vision_tower,
 )
 
 
@@ -48,7 +49,7 @@ class _Attn(nn.Module):
 # initializer_range per tiny model for end-to-end tests: logits peaked enough to
 # avoid FP16 near-ties and to make softcap/sinks matter, without saturating them
 # (Gemma scales embeddings by sqrt(hidden), hence the smaller range).
-_INIT = {"llama": 0.5, "gemma3": 0.05, "gemma2": 0.05, "gpt_oss": 0.5}
+_INIT = {"llama": 0.5, "gemma3": 0.05, "gemma2": 0.05, "gpt_oss": 0.5, "mistral": 0.5, "phi3": 0.5}
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ def test_decode_reason():
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
-@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])
 def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
     """P3.1: a padded batch is unpadded onto the varlen kernel in every layer;
     logits of the real tokens within the noise of FP32 eager."""
@@ -112,15 +113,13 @@ def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
     gold, noise = run("eager", torch.float32), run("eager")
     counter = KernelCounter(monkeypatch)
     out = run("flash_attn_legacy")
-    full_layers = sum(t == "full_attention" for t in getattr(
-        base.config, "layer_types", None) or ["full_attention"] * base.config.num_hidden_layers)
-    assert len(counter.varlen_calls) == full_layers
+    assert len(counter.varlen_calls) == base.config.num_hidden_layers  # sliding layers too (P4.1)
     keep = mask.bool()
     assert_close_to_gold(out[keep], gold[keep], noise[keep], f"{arch} {side} padding")
 
 
 @pytest.mark.parametrize("cache_implementation", ["dynamic", "static"])
-@pytest.mark.parametrize("arch", ["llama", "gemma3"])
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])
 def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation):
     """Batched generation with left padding: the prefill runs unpadded on the
     kernel; every step's logits of every row within the noise of FP32 eager."""
@@ -399,6 +398,15 @@ def test_warn_once_per_reason_and_not_for_expected(caplog):
 # P0.2 — caches whose kv_len is not "all tokens so far" (B1: StaticCache)
 # ---------------------------------------------------------------------------
 
+# transformers 5.20: an offloaded static cache offloads only full-attention
+# layers and its prefetch raises (ValueError) when there is none, with any backend.
+_ALL_SLIDING_OFFLOAD = "transformers: offloaded static cache needs a full-attention layer"
+
+
+def _all_sliding(arch):
+    return "full_attention" not in layer_types(TINY_MODELS[arch]().config)
+
+
 # prefill, a multi-token chunk with an offset (as in assisted decoding),
 # two decode steps, a longer chunk
 _STEPS = [20, 5, 1, 1, 13]
@@ -416,9 +424,12 @@ def _stepwise_logits(model, ids, cache):
 
 
 @pytest.mark.parametrize("offloading", [False, True], ids=["static", "offloaded_static"])
-@pytest.mark.parametrize("arch", ["llama", "gemma3"])  # gemma3: sliding + full layers (hybrid)
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])  # gemma3: sliding + full (hybrid)
 def test_static_cache_stepwise(monkeypatch, arch, offloading):
     from transformers import StaticCache
+
+    if offloading and _all_sliding(arch):
+        pytest.skip(_ALL_SLIDING_OFFLOAD)
 
     base = TINY_MODELS[arch]()
     ids = torch.randint(0, base.config.vocab_size, (1, sum(_STEPS)), device="cuda")
@@ -434,13 +445,21 @@ def test_static_cache_stepwise(monkeypatch, arch, offloading):
     out = run("flash_attn_legacy")
     assert_close_to_gold(out, gold, noise, f"{arch} static")
 
-    # The kernel must run on the multi-token steps of every full-attention layer,
-    # on K/V sliced to the filled part of the cache (kv == tokens so far).
-    full_layers = sum(t == "full_attention" for t in getattr(
-        base.config, "layer_types", None) or ["full_attention"] * base.config.num_hidden_layers)
-    ends = [sum(_STEPS[:i + 1]) for i in range(len(_STEPS))]
-    expected = [(n, end) for n, end in zip(_STEPS, ends) if n > 1 for _ in range(full_layers)]
-    assert sorted(counter.calls) == sorted(expected)
+    # The kernel must run on the multi-token steps of every layer: full-attention
+    # layers on K/V sliced to the filled part of the cache (kv == tokens so far),
+    # sliding layers (P4.1) on the filled slots of their sliding cache (the last
+    # W - 1 tokens plus the new ones), with the window.
+    types = layer_types(base.config)
+    W = getattr(base.config, "sliding_window", None) or 0  # 0: no sliding layers (llama)
+    expected = Counter()
+    for i, n in enumerate(_STEPS):
+        if n > 1:
+            total = sum(_STEPS[:i + 1])
+            expected[(n, total)] += types.count("full_attention")
+            expected[(n, min(total, W - 1 + n))] += types.count("sliding_attention")
+    assert Counter(counter.calls) == +expected
+    sliding_calls = sum(n > 1 for n in _STEPS) * types.count("sliding_attention")
+    assert [w for w in counter.windows if w != (-1, -1)] == [(W - 1, W - 1)] * sliding_calls
 
 
 def _beam_rows_error(x, y, ignore_worst=0):
@@ -472,8 +491,12 @@ _GENERATE_CASES = [(c, m) for c in ("static", "offloaded_static", "dynamic")
 @pytest.mark.parametrize("arch", list(_INIT))
 @pytest.mark.parametrize("cache_implementation,mode", _GENERATE_CASES)
 def test_generate_matches_gold(arch, cache_implementation, mode):
-    """End-to-end generate vs FP32 eager (gold), FP16 eager as noise floor:
-    every step's logits (all beams) and the final sequences."""
+    """End-to-end generate vs FP32 eager (gold), with the noise floor of FP16
+    eager and FP16 SDPA (the worse of the two: FP16 near-ties fork beams on one
+    backend and not on another; decode steps run on SDPA by design): every step's
+    logits (all beams) and the final sequences."""
+    if cache_implementation == "offloaded_static" and _all_sliding(arch):
+        pytest.skip(_ALL_SLIDING_OFFLOAD)
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, 24), device="cuda")
     # disable_compile: HF auto-compiles static-cache generation and Triton does not
@@ -491,7 +514,8 @@ def test_generate_matches_gold(arch, cache_implementation, mode):
             extra["cache_implementation"] = None  # assisted decoding manages its own cache
         return load_impl(base, impl, dtype).generate(ids, **{**kw, **extra})
 
-    gold, noise, out = gen("eager", torch.float32), gen("eager"), gen("flash_attn_legacy")
+    gold, out = gen("eager", torch.float32), gen("flash_attn_legacy")
+    noises = [gen("eager")] + ([gen("sdpa")] if getattr(base, "_supports_sdpa", False) else [])  # gpt-oss: no SDPA
     label = f"{arch}/{cache_implementation}/{mode}"
     # Beam search: an FP16 near-tie in the beam scores can keep a different
     # hypothesis in one beam for one step (a fork), with every other beam
@@ -499,16 +523,107 @@ def test_generate_matches_gold(arch, cache_implementation, mode):
     # single beam may differ at a single step of the whole generation; the final
     # sequences are still checked below.
     forked_steps = []
-    for step, (o, n, g) in enumerate(zip(out.logits, noise.logits, gold.logits)):
+    for step, (o, g, *ns) in enumerate(zip(out.logits, gold.logits, *(n.logits for n in noises))):
         assert torch.isfinite(g).all(), f"{label}: non-finite reference logits"
-        err, err_noise = _beam_rows_error(o, g), _beam_rows_error(n, g)
+        err, err_noise = _beam_rows_error(o, g), max(_beam_rows_error(n, g) for n in ns)
         bound = max(3.0 * err_noise, 1e-3)  # same rule as hf_helpers.assert_within_noise
         if err > bound and mode == "beam" and not forked_steps:
             err = _beam_rows_error(o, g, ignore_worst=1)
             forked_steps.append(step)
         assert err <= bound, f"{label}: step {step} 1-cos={err:.2e} (noise {err_noise:.2e})"
-    if torch.equal(noise.sequences, gold.sequences):
+    if all(torch.equal(n.sequences, gold.sequences) for n in noises):
         assert torch.equal(out.sequences, gold.sequences), label
+
+
+# ---------------------------------------------------------------------------
+# P4.1 — sliding window on the kernel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
+@pytest.mark.parametrize("arch", ["mistral", "gemma3", "phi3"])
+def test_sliding_window_models_on_kernel(monkeypatch, arch, n_tokens):
+    """Every layer (sliding ones included) on the kernel, no fallback, logits
+    within the noise of FP32 eager; sliding layers get window_size=(W-1, W-1)."""
+    base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
+    gold = logits(load_impl(base, "eager", torch.float32), ids)
+    noise = logits(load_impl(base, "eager"), ids)
+    counter = KernelCounter(monkeypatch)
+    out = logits(load_impl(base, "flash_attn_legacy"), ids)
+    W = base.config.sliding_window
+    n_sliding = layer_types(base.config).count("sliding_attention")
+    assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
+    assert counter.windows.count((W - 1, W - 1)) == n_sliding > 0
+    assert_close_to_gold(out, gold, noise, f"{arch} sliding window, {n_tokens} tokens")
+
+
+def test_sliding_window_mutation():
+    """The window must be W keys (HF: i - j < W), not W +- 1: the kernel output
+    of a sliding layer matches SDPA with the HF mask and differs from W +- 1."""
+    torch.manual_seed(0)
+    q, k, v = _qkv(40, 40)
+    W = 8
+    hf = integrations._causal_mask(40, 40, "cuda", W)
+    assert hf.sum(-1).max() == W and bool(hf[10, 3]) and not bool(hf[10, 2])
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(True), q, k, v, None, sliding_window=W)
+    out = out.transpose(1, 2)
+    for w, same in ((W, True), (W - 1, False), (W + 1, False)):
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=integrations._causal_mask(40, 40, "cuda", w))
+        assert torch.allclose(out, ref, atol=2e-3, rtol=2e-3) == same, w
+
+
+@pytest.mark.parametrize("q_len,kv_len,causal,padded", [
+    (1, 40, True, False), (1, 40, True, True), (5, 40, True, True),
+    (40, 40, False, False), (40, 40, False, True)])
+def test_sliding_window_fallbacks_apply_window(q_len, kv_len, causal, padded):
+    """Decode and padding with a non-causal window (fallbacks), causal padding
+    (unpadded onto the varlen kernel): all apply the window, vs SDPA with the
+    explicit band mask."""
+    torch.manual_seed(0)
+    q, k, v = _qkv(q_len, kv_len)
+    W = 8
+    pad = torch.ones(1, kv_len, dtype=torch.bool, device="cuda")
+    if padded:
+        pad[0, :3] = False
+    off = kv_len - q_len
+    rel = torch.arange(kv_len, device="cuda")[None] - torch.arange(q_len, device="cuda")[:, None] - off
+    band = (rel <= 0) & (rel > -W) if causal else rel.abs() < W
+    keep = band & pad[0]
+    keep = keep | ~keep.any(-1, keepdim=True)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(causal), q, k, v, pad if padded else None,
+                                                    sliding_window=W)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+    torch.testing.assert_close(out.transpose(1, 2), ref, atol=2e-3, rtol=2e-3)
+
+
+def test_builder_sliding_window_tags_window():
+    from transformers import masking_utils as mu
+
+    sliding = mu.sliding_window_causal_mask_function(8)
+    m = _build(kv_length=25, mask_function=sliding, local_size=8)
+    assert m.shape == (2, 25) and getattr(m, integrations._WINDOW_ATTR) == 8
+    pad = torch.ones(2, 25, dtype=torch.bool, device="cuda")
+    pad[1, :3] = False
+    m = _build(kv_length=25, mask_function=sliding, local_size=8, attention_mask=pad)
+    assert getattr(m, integrations._WINDOW_ATTR) == 8 and getattr(m, integrations._PADDING_ATTR)
+    assert torch.equal(m.bool(), pad)
+    # skipping not allowed (packing, overlays): SDPA's 4D mask, window included
+    assert _build(kv_length=25, mask_function=sliding, local_size=8, allow_is_causal_skip=False).dim() == 4
+
+
+def test_builder_chunked_attention_is_not_a_window():
+    """local_size also comes with chunked attention (Llama 4): never read as a window."""
+    from transformers import masking_utils as mu
+
+    chunked = mu.chunked_causal_mask_function(8, torch.zeros(2, dtype=torch.long, device="cuda"))
+    assert not integrations._is_sliding_causal(chunked, 8)
+    # chunk 2 matches a window of 2 on any single row: two rows are probed
+    assert not integrations._is_sliding_causal(mu.chunked_causal_mask_function(2, torch.zeros(2, dtype=torch.long)), 2)
+    assert integrations._is_sliding_causal(mu.sliding_window_causal_mask_function(8), 8)
+    assert not integrations._is_sliding_causal(mu.sliding_window_causal_mask_function(9), 8)
+    m = _build(kv_length=25, mask_function=chunked, local_size=8)
+    assert m.dim() == 4
 
 
 # -- mask builder unit tests --------------------------------------------------
@@ -582,6 +697,30 @@ def test_untagged_copy_of_builder_mask_still_runs_kernel(monkeypatch):
     out_tagged, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
     out_copy, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m.clone())
     assert counter.calls == [(5, 25), (5, 25)] and fallback_stats() == {}
+    torch.testing.assert_close(out_tagged, out_copy, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_window_survives_mask_copies(monkeypatch, padded):
+    """Layers without a sliding_window kwarg (e.g. Qwen2-MoE) get the window only
+    from the builder's mask: a copy that drops the tag (accelerate's .to(device)
+    across GPUs) must keep it, read from the values; a plain 0/1 mask has none."""
+    from transformers import masking_utils as mu
+
+    q, k, v = _qkv(q_len=40, kv_len=40)
+    pad = torch.ones(1, 40, dtype=torch.bool, device="cuda")
+    if padded:
+        pad[0, :3] = False
+    m = _build(batch_size=1, q_length=40, kv_length=40, q_offset=0,
+               mask_function=mu.sliding_window_causal_mask_function(8), local_size=8,
+               attention_mask=pad if padded else None)
+    copy = m.clone()
+    assert getattr(copy, integrations._WINDOW_ATTR, None) is None
+    assert integrations._mask_window(copy) == 8 and integrations._mask_window(pad.int()) is None
+    counter = KernelCounter(monkeypatch)
+    out_tagged, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
+    out_copy, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, copy)
+    assert counter.windows == [(7, 7), (7, 7)] and fallback_stats() == {}
     torch.testing.assert_close(out_tagged, out_copy, atol=0, rtol=0)
 
 
@@ -779,12 +918,12 @@ def _packed_batch(base, lengths, seed=0):
 
 
 @pytest.mark.parametrize("use_cache", [True, False])
-@pytest.mark.parametrize("arch", ["llama", "gemma3"])  # gemma3: sliding-window layers
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral"])  # sliding layers: gemma3, mistral
 def test_packed_position_ids_forward(monkeypatch, arch, use_cache):
     """B4: with a cache transformers builds no packing mask (and only the window
     on sliding layers); our forward must still keep the segments apart (varlen
-    kernel, or the segment mask intersected with the window). Without a cache it
-    builds a block mask (-> SDPA fallback). All must equal each sequence alone."""
+    kernel, with the window on sliding layers). Without a cache it builds a block
+    mask (-> SDPA fallback). All must equal each sequence alone."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     lengths = [30, 17, 45]
     seqs, ids, position_ids = _packed_batch(base, lengths)
@@ -794,11 +933,11 @@ def test_packed_position_ids_forward(monkeypatch, arch, use_cache):
     out = logits(load_impl(base, "flash_attn_legacy"), ids,
                  position_ids=position_ids.cuda(), use_cache=use_cache)
     n_layers = base.config.num_hidden_layers
-    full = sum(t == "full_attention" for t in getattr(base.config, "layer_types", None)
-               or ["full_attention"] * n_layers)
-    if use_cache:
-        assert counter.varlen_calls == [(sum(lengths), 3)] * full
-        assert fallback_stats() == ({"attention_mask": n_layers - full} if full < n_layers else {})
+    if use_cache:  # segments longer than the window (8): a missing window_size shows
+        W = getattr(base.config, "sliding_window", None) or 0  # 0: no sliding layers (llama)
+        assert counter.varlen_calls == [(sum(lengths), 3)] * n_layers and fallback_stats() == {}
+        n_sliding = layer_types(base.config).count("sliding_attention")
+        assert [w for w in counter.windows if w != (-1, -1)] == [(W - 1, W - 1)] * n_sliding
     else:
         assert counter.varlen_calls == [] and fallback_stats() == {"attention_mask": n_layers}
     assert counter.calls == []
@@ -1000,9 +1139,8 @@ def test_non_fp16_models_run_kernel(monkeypatch, arch, dtype):
                              else torch.float16), ids)
     counter = KernelCounter(monkeypatch)
     out = logits(load_impl(base, "flash_attn_legacy", dtype), ids)
-    full = sum(t == "full_attention" for t in getattr(base.config, "layer_types", None)
-               or ["full_attention"] * base.config.num_hidden_layers)
-    assert len(counter.calls) == full and "fp16_overflow" not in fallback_stats()
+    # every layer, sliding ones included (P4.1)
+    assert len(counter.calls) == base.config.num_hidden_layers and "fp16_overflow" not in fallback_stats()
     assert_close_to_gold(out, gold, noise, f"{arch} {dtype}")
 
 
