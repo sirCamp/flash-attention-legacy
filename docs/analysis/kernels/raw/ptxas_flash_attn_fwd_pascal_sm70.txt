@@ -1,41 +1,41 @@
 ptxas info    : 0 bytes gmem
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_15TilePascal_d256EEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_15TilePascal_d256EEEvNS_21FlashAttnVarlenParamsE
-    352 bytes stack frame, 2604 bytes spill stores, 1924 bytes spill loads
-ptxas info    : Used 255 registers, used 1 barriers, 352 bytes cumulative stack size, 472 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_15TilePascal_d128EEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_15TilePascal_d128EEEvNS_21FlashAttnVarlenParamsE
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi16ELi8ELi256ELi8EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi16ELi8ELi256ELi8EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 239 registers, used 1 barriers, 472 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d96EEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d96EEEvNS_21FlashAttnVarlenParamsE
+ptxas info    : Used 105 registers, used 16 barriers, 520 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi32ELi8ELi128ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi32ELi8ELi128ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 168 registers, used 1 barriers, 472 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d64EEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d64EEEvNS_21FlashAttnVarlenParamsE
+ptxas info    : Used 172 registers, used 1 barriers, 520 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi16ELi96ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi16ELi96ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 168 registers, used 1 barriers, 472 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d32EEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy35flash_attn_fwd_pascal_varlen_kernelINS_14TilePascal_d32EEEvNS_21FlashAttnVarlenParamsE
+ptxas info    : Used 168 registers, used 1 barriers, 520 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi16ELi64ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi16ELi64ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 127 registers, used 1 barriers, 472 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_15TilePascal_d256EEEvNS_15FlashAttnParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_15TilePascal_d256EEEvNS_15FlashAttnParamsE
-    360 bytes stack frame, 2612 bytes spill stores, 1860 bytes spill loads
-ptxas info    : Used 255 registers, used 1 barriers, 360 bytes cumulative stack size, 480 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_15TilePascal_d128EEEvNS_15FlashAttnParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_15TilePascal_d128EEEvNS_15FlashAttnParamsE
+ptxas info    : Used 134 registers, used 1 barriers, 520 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi32ELi32ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy17fwd_varlen_kernelINS_11FwdTileSimtILi64ELi32ELi32ELi1EEENS_9PascalFwdEEEvNS_21FlashAttnVarlenParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 238 registers, used 1 barriers, 480 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d96EEEvNS_15FlashAttnParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d96EEEvNS_15FlashAttnParamsE
+ptxas info    : Used 142 registers, used 1 barriers, 520 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi16ELi8ELi256ELi8EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi16ELi8ELi256ELi8EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 168 registers, used 1 barriers, 480 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d64EEEvNS_15FlashAttnParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d64EEEvNS_15FlashAttnParamsE
+ptxas info    : Used 101 registers, used 16 barriers, 552 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi32ELi8ELi128ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi32ELi8ELi128ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 168 registers, used 1 barriers, 480 bytes cmem[0]
-ptxas info    : Compiling entry function '_ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d32EEEvNS_15FlashAttnParamsE' for 'sm_70'
-ptxas info    : Function properties for _ZN17flash_attn_legacy28flash_attn_fwd_pascal_kernelINS_14TilePascal_d32EEEvNS_15FlashAttnParamsE
+ptxas info    : Used 176 registers, used 1 barriers, 552 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi16ELi96ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi16ELi96ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE
+    8 bytes stack frame, 8 bytes spill stores, 8 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 8 bytes cumulative stack size, 552 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi16ELi64ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi16ELi64ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 127 registers, used 1 barriers, 480 bytes cmem[0]
+ptxas info    : Used 136 registers, used 1 barriers, 552 bytes cmem[0]
+ptxas info    : Compiling entry function '_ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi32ELi32ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE' for 'sm_70'
+ptxas info    : Function properties for _ZN17flash_attn_legacy18fwd_batched_kernelINS_11FwdTileSimtILi64ELi32ELi32ELi1EEENS_9PascalFwdEEEvNS_15FlashAttnParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 146 registers, used 1 barriers, 552 bytes cmem[0]
