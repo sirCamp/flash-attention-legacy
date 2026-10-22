@@ -20,10 +20,16 @@ namespace flash_attn_legacy {
 // ---------------------------------------------------------------------------
 // Precompute D = rowsum(dO * O) — launched as a separate kernel
 // D has the layout of L: [B, H, N] (batched) or [total, H] (varlen, B = 1).
+// Each row is read by kDLanes consecutive lanes in 16-byte chunks (coalesced:
+// a warp reads 4 rows; rows have d % 8 == 0 halves and 16-byte aligned starts).
 // With sinks (one logit per head, probability p_sink = exp(sink - L) in every
 // row): dsinks[h] += -p_sink * D over the rows of head h, as only the sink's
 // share of the normalization depends on it (dO . dO/dsink = -p_sink * D).
 // ---------------------------------------------------------------------------
+constexpr int kDLanes = 8;  // lanes per row
+constexpr int kDBlock = 256;  // threads per block: whole warps (full-mask shuffles)
+static_assert(kDBlock % 32 == 0 && 32 % kDLanes == 0, "row groups must not straddle warps");
+
 __global__ void precompute_D_kernel(
     const half* __restrict__ dO,   // [B, H, N, d]
     const half* __restrict__ O,    // [B, H, N, d]
@@ -35,41 +41,47 @@ __global__ void precompute_D_kernel(
     index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride
 ) {
-    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const bool valid = idx < int64_t(batch_size) * num_heads * seq_len;
+    const int64_t row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / kDLanes;
+    const int sub = threadIdx.x % kDLanes;  // lane within the row
+    const bool valid = row < int64_t(batch_size) * num_heads * seq_len;
 
-    // n fastest: the lanes of a warp are consecutive rows, mostly of one head
-    const int n = valid ? static_cast<int>(idx % seq_len) : 0;
-    const int h = valid ? static_cast<int>((idx / seq_len) % num_heads) : 0;
-    const int b = valid ? static_cast<int>(idx / (int64_t(num_heads) * seq_len)) : 0;
+    // n fastest: the rows of a warp are consecutive, mostly of one head
+    const int n = valid ? static_cast<int>(row % seq_len) : 0;
+    const int h = valid ? static_cast<int>((row / seq_len) % num_heads) : 0;
+    const int b = valid ? static_cast<int>(row / (int64_t(num_heads) * seq_len)) : 0;
     const index_t l_idx = b * l_batch_stride + h * l_head_stride + n * l_seq_stride;
 
     float sum = 0.0f;
     if (valid) {
-        const half* dO_row = dO + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
-        const half* O_row  = O  + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
-        const half2* dO2 = reinterpret_cast<const half2*>(dO_row);
-        const half2* O2  = reinterpret_cast<const half2*>(O_row);
-        const int d2 = head_dim / 2;
-        for (int j = 0; j < d2; j++) {
-            half2 a = dO2[j];
-            half2 b_val = O2[j];
-            sum += __half2float(a.x) * __half2float(b_val.x)
-                 + __half2float(a.y) * __half2float(b_val.y);
+        const index_t off = b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
+        const uint4* dO4 = reinterpret_cast<const uint4*>(dO + off);
+        const uint4* O4  = reinterpret_cast<const uint4*>(O + off);
+        for (int c = sub; c < head_dim / 8; c += kDLanes) {
+            const uint4 x = dO4[c], y = O4[c];
+            const half2* x2 = reinterpret_cast<const half2*>(&x);
+            const half2* y2 = reinterpret_cast<const half2*>(&y);
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const float2 xf = __half22float2(x2[k]), yf = __half22float2(y2[k]);
+                sum = fmaf(xf.x, yf.x, fmaf(xf.y, yf.y, sum));
+            }
         }
-        D[l_idx] = sum;
     }
+    #pragma unroll
+    for (int o = kDLanes / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const bool leader = valid && sub == 0;  // one lane per row writes / contributes
+    if (leader) D[l_idx] = sum;
 
     if (sinks == nullptr) return;  // uniform over the grid
     float g = 0.0f;
-    if (valid && sinks[h] > -INFINITY) g = -expf(sinks[h] - L[l_idx]) * sum;  // -inf: no sink
+    if (leader && sinks[h] > -INFINITY) g = -expf(sinks[h] - L[l_idx]) * sum;  // -inf: no sink
     // One atomic per warp when its rows share a head, else one per row.
     const int h0 = __shfl_sync(0xffffffffu, h, 0);
     if (__all_sync(0xffffffffu, !valid || h == h0)) {
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) g += __shfl_xor_sync(0xffffffffu, g, o);
         if ((threadIdx.x & 31) == 0 && valid) atomicAdd(&dsinks[h0], g);
-    } else if (valid) {
+    } else if (leader) {
         atomicAdd(&dsinks[h], g);
     }
 }
@@ -593,8 +605,8 @@ void precompute_D(
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
     cudaStream_t stream
 ) {
-    const int64_t total = int64_t(B) * H * N;
-    const int block_size = 256;
+    const int64_t total = int64_t(B) * H * N * kDLanes;  // threads
+    const int block_size = kDBlock;
     const int64_t grid_size = (total + block_size - 1) / block_size;
     if (grid_size > INT32_MAX) throw std::runtime_error("flash_attn_legacy: too many rows for precompute_D");
     precompute_D_kernel<<<grid_size, block_size, 0, stream>>>(

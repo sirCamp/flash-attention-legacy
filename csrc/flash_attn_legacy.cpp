@@ -388,6 +388,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     const index_t l_head_stride = N;
     torch::Tensor D_tensor = torch::empty({B, H_q, N}, Q.options().dtype(torch::kFloat32));
 
+    TORCH_CHECK(dO.strides() == O.strides(), "dO and O must share strides (precompute_D)");
     precompute_D(
         reinterpret_cast<const half*>(dO.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(O.data_ptr<at::Half>()),
@@ -552,6 +553,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor dK = torch::empty_like(K);
     torch::Tensor dV = torch::empty_like(V);
     torch::Tensor D_tensor = torch::empty({total_q, H_q}, Q.options().dtype(torch::kFloat32));
+    TORCH_CHECK(dO.strides() == O.strides(), "dO and O must share strides (precompute_D)");
     precompute_D(
         reinterpret_cast<const half*>(dO.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(O.data_ptr<at::Half>()),
