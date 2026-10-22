@@ -122,24 +122,15 @@ Check what happened in your run:
 import flash_attn_legacy
 flash_attn_legacy.reset_fallback_stats()
 model.generate(**inputs, max_new_tokens=32)
-print(flash_attn_legacy.fallback_stats())   # e.g. {'decode': 704} -> only decode steps fell back
+print(flash_attn_legacy.fallback_stats())   # {} -> prefill and every decode step ran on the kernels
 ```
 
 Run inference under `torch.inference_mode()` (or `torch.no_grad()`): with BF16/FP32 weights and gradients enabled outside FP16 autocast, calls fall back to SDPA.
 
-### Monkey-patch (transformers < 5.0)
+### Examples
 
-```python
-from transformers import AutoModelForCausalLM
-from examples.hf_llama_patch import patch_llama_attention
-
-model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-hf",
-    torch_dtype=torch.float16,
-    device_map="cuda",
-)
-patch_llama_attention(model)
-```
+- `examples/generate.py`: generation (batched, left padding), tokens per second and peak memory, `--compare` with SDPA and eager.
+- `examples/finetune.py`: mixed-precision fine-tuning (fp16 autocast + GradScaler) of the attention projections on a local text, `--compare` with SDPA. P100, TinyLlama-1.1B, batch 2 x 1024 tokens: 1,275 tok/s and 8.1 GiB vs SDPA 1,158 tok/s and 14.2 GiB (same loss); at 2048 tokens SDPA runs out of memory (11.8 GiB here).
 
 ### Direct API
 

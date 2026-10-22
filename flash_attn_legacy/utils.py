@@ -44,10 +44,14 @@ def get_device_info(device: Optional[int] = None) -> Dict:
     sm = props.major * 10 + props.minor
     arch = _SM_TO_ARCH.get(sm, f"Unknown (SM {sm})")
 
-    if sm >= 70:
-        kernel_info = "Volta path: wmma tensor cores"
+    # The device's family (the build may select an older one: compiled_arch_for in
+    # the extension); decode always runs on the CUDA-core decode kernel.
+    if sm >= 75:
+        kernel_info = "Turing path: mma.sync m16n8k8 tensor cores"
+    elif sm >= 70:
+        kernel_info = "Volta path: WMMA tensor cores"
     elif sm >= 60:
-        kernel_info = "Pascal path: half2 CUDA cores"
+        kernel_info = "Pascal path: fp32 CUDA cores"
     else:
         kernel_info = "Unsupported (SM >= 6.0 required)"
 
