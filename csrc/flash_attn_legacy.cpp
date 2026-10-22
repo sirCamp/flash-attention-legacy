@@ -256,6 +256,37 @@ static VarlenBlocks varlen_blocks(const torch::Tensor& cu_seqlens, const torch::
     return {torch::cat({torch::zeros({1}, cu_seqlens.options()), blocks.cumsum(0).to(torch::kInt32)}), total};
 }
 
+// GQA backward: when the blocks of B * H_kv heads and their key blocks would leave
+// SMs idle (one block loops over all H_q / H_kv query heads of its KV head), the
+// group is split over S blocks, the smallest divisor of it giving 2 blocks per SM.
+// Each slice writes its own fp16 dK / dV head (h * S + s), summed in fp32 after the
+// kernel (upstream FA2's dk_expanded). 1 without GQA or with enough blocks.
+// FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS=n (tests): the smallest divisor >= min(n, group).
+static int bwd_group_splits(int H_q, int H_kv, int64_t blocks) {
+    const int rep = H_q / H_kv;
+    if (const char* env = std::getenv("FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS")) {
+        const int n = std::atoi(env);
+        TORCH_CHECK(n >= 1, "FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS must be an integer >= 1");
+        int S = std::min(n, rep);
+        while (rep % S != 0) S++;
+        return S;
+    }
+    const int64_t want = 2 * int64_t(at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+    for (int S = 1; S < rep; S++) {
+        if (rep % S == 0 && blocks * S >= want) return S;
+    }
+    return rep;
+}
+
+// dK / dV of K's layout with heads [.., H_kv * S, ..] (dim 1) -> the sum of the S slices.
+static torch::Tensor sum_group_slices(const torch::Tensor& part, int S) {
+    if (S == 1) return part;
+    std::vector<int64_t> sizes = part.sizes().vec();
+    sizes[1] /= S;
+    sizes.insert(sizes.begin() + 2, S);
+    return part.view(sizes).sum(2);  // fp16 sum: accumulated in fp32, rounded once
+}
+
 // Data pointers of the backward (strides differ between batched and varlen and
 // are set by each entry point).
 static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, const torch::Tensor& Q,
@@ -414,9 +445,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
         return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V), dsink};  // O = 0: dsink = 0
     }
     torch::Tensor dQ_fp32 = torch::zeros({B, H_q, N, d}, Q.options().dtype(torch::kFloat32));
-    // dK, dV have KV head shape — each element written exactly once (no atomics)
-    torch::Tensor dK = torch::empty({B, H_kv, Nk, d}, K.options());
-    torch::Tensor dV = torch::empty({B, H_kv, Nk, d}, V.options());
+    // dK, dV: [B, H_kv * S, Nk, d], each element written exactly once (no atomics)
+    const int sm = get_sm_version();
+    const int S = bwd_group_splits(H_q, H_kv, int64_t(cdiv(Nk, flash_attn_bwd_block_cols(d, sm))) * B * H_kv);
+    torch::Tensor dK = torch::empty({B, H_kv * S, Nk, d}, K.options());
+    torch::Tensor dV = torch::empty({B, H_kv * S, Nk, d}, V.options());
 
     // Precompute D = rowsum(dO * O) → [B, H_q, N]
     const index_t l_batch_stride = index_t(H_q) * N;
@@ -435,7 +468,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
 
     FlashAttnBwdParams bwd = {};
     set_bwd_pointers(bwd, dO, Q, K, V, O, L, D_tensor, dQ_fp32, dK, dV);
-    bwd.batch_size = B; bwd.num_heads = H_q; bwd.num_heads_k = H_kv;
+    bwd.batch_size = B; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.kv_group_splits = S;
     bwd.seq_len_q = N; bwd.seq_len_k = Nk; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale;
     std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
@@ -456,11 +489,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
     bwd.dv_head_stride  = dV.stride(1);
     bwd.dv_seq_stride   = dV.stride(2);
 
-    flash_attn_bwd_launch(bwd, get_sm_version(), 0, stream);
+    flash_attn_bwd_launch(bwd, sm, 0, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
 
     torch::Tensor dQ = dQ_fp32.to(torch::kFloat16);
-    return {dQ, dK, dV, dsink};
+    return {dQ, sum_group_slices(dK, S), sum_group_slices(dV, S), dsink};
 }
 
 // ---------------------------------------------------------------------------
@@ -590,8 +623,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
 
     torch::Tensor dQ_fp32 = torch::zeros({total_q, H_q, d}, Q.options().dtype(torch::kFloat32));
     // Every key row belongs to one sequence and one key block: written exactly once
-    torch::Tensor dK = torch::empty_like(K);
-    torch::Tensor dV = torch::empty_like(V);
+    // ([total_k, H_kv * S, d])
+    const int S = bwd_group_splits(H_q, H_kv, int64_t(k_blocks.total) * H_kv);
+    torch::Tensor dK = torch::empty({total_k, H_kv * S, d}, K.options());
+    torch::Tensor dV = torch::empty({total_k, H_kv * S, d}, V.options());
     torch::Tensor D_tensor = torch::empty({total_q, H_q}, Q.options().dtype(torch::kFloat32));
     TORCH_CHECK(dO.strides() == O.strides(), "dO and O must share strides (precompute_D)");
     precompute_D(
@@ -607,7 +642,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
     set_bwd_pointers(bwd, dO, Q, K, V, O, L, D_tensor, dQ_fp32, dK, dV);
     // seq_len_q / seq_len_k stay 0: the varlen kernel takes each sequence's lengths
     // from cu_seqlens (max_seqlen_* are accepted for API symmetry, unused).
-    bwd.batch_size = 1; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.head_dim = d;
+    bwd.batch_size = 1; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.kv_group_splits = S; bwd.head_dim = d;
     bwd.softmax_scale = softmax_scale;
     std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
     bwd.softcap = logit_softcap(softcap);
@@ -627,7 +662,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
 
     if (k_blocks.total > 0) flash_attn_bwd_launch(bwd, sm, k_blocks.total, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
-    return {dQ_fp32.to(torch::kFloat16), dK, dV, dsink};
+    return {dQ_fp32.to(torch::kFloat16), sum_group_slices(dK, S), sum_group_slices(dV, S), dsink};
 }
 
 // ---------------------------------------------------------------------------

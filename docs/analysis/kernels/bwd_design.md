@@ -79,6 +79,18 @@ else PTX): >= 75 -> `BwdMma`, 70 -> `BwdWmma`, 6x -> `BwdSimt`; a T4 with a 7.0-
 keeps WMMA testable on a T4. Device code for `mma.sync` / `ldmatrix` exists only for `__CUDA_ARCH__ >= 750`; the stub bodies (as all
 stubs now) trap. sm_8x runs `BwdMma` through the PTX 7.5 JIT (untested there).
 
+## GQA: query-head groups split over blocks
+One block per (batch, KV head, key block) loops over every query head of its KV head (dK / dV accumulated once in registers,
+written once). With few KV heads and short sequences the grid is small (B=1, H_kv=2, N=1024, Bc=64: 32 blocks on 80 SMs) and each
+block runs the whole group serially: V100 fwd+bwd of GQA 16/2 d=128 causal N=1024 took 2.27 ms against SDPA's 0.77 (Qwen3.5-2B
+training at 1-2k: 0.90x of SDPA end to end). The host now splits the group over S blocks (`kv_group_splits`, the smallest divisor
+of H_q / H_kv giving 2 blocks per SM; 1 when the grid is already large): slice s of KV head h writes its own fp16 dK / dV head
+h * S + s, the slices are summed in fp32 after the kernel (upstream FA2's `dk_expanded` + sum). V100, backward: GQA 16/2 d=128
+N=1024 2.27 -> 0.78 ms (SDPA 0.77), N=2048 4.51 -> 2.55 (2.18); GQA 8/2 d=256 N=1024: kernel time equal to MHA 8/8 (1.26 ms). A
+4-blocks-per-SM target measured the same. Cost, only when the grid is small: S fp16 partials of dK / dV, one reduction each,
+and S fp16 roundings of the partials before the fp32 sum (instead of one of the register sum), as upstream.
+`FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS=n` forces the split (tests cover 1, 2 and the whole group on every GPU).
+
 ## Steps (one change at a time: tests on all GPUs, benchmark, ptxas, review)
 1. Done: `flash_attn_mma.h`: m16n8k8 MMA, `ldmatrix` x4 (+ trans), half2 packing.
 2. Done: `BwdMma` + tiles + dispatch.

@@ -89,9 +89,10 @@ __global__ void precompute_D_kernel(
 
 // ---------------------------------------------------------------------------
 // One key block of the backward, from the batched or the varlen grid: pointers
-// at the first row of the sequence, for the first Q head of the KV head's group
-// (Q, dO, L, D, dQ; add qh * *_head_stride for the others, GQA) and for the KV
-// head (K, V, dK, dV); row strides; key block start and sequence lengths.
+// at the first row of the sequence, for the first Q head of the block's slice of
+// the KV head's group (Q, dO, L, D, dQ; add qh * *_head_stride for the others,
+// GQA), for the KV head (K, V) and for the slice's dK / dV head (h * S + s); row
+// strides; key block start and sequence lengths.
 // ---------------------------------------------------------------------------
 struct BwdBlockArgs {
     const half* __restrict__ Q; const half* __restrict__ dO;
@@ -121,12 +122,14 @@ struct BwdBlockArgs {
     }
 };
 
-// b: batch (0 for varlen); q_tok0 / k_tok0: first row of the sequence (0 for batched).
+// b: batch (0 for varlen); q_tok0 / k_tok0: first row of the sequence (0 for batched);
+// slice: which of the kv_group_splits shares of the KV head's query heads.
 __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams& p, int b, int q_tok0,
                                                        int k_tok0, int seq_len_q, int seq_len_k,
-                                                       int kv_h, int kv_start) {
-    const int heads_per_kv = p.num_heads / p.num_heads_k;
-    const int h0 = kv_h * heads_per_kv;
+                                                       int kv_h, int slice, int kv_start) {
+    const int heads_per_kv = p.num_heads / p.num_heads_k / p.kv_group_splits;
+    const int h0 = (kv_h * p.kv_group_splits + slice) * heads_per_kv;
+    const int dkv_h = kv_h * p.kv_group_splits + slice;  // this slice's dK / dV head
     BwdBlockArgs a;
     a.Q  = p.Q  + b * p.q_batch_stride + h0 * p.q_head_stride + q_tok0 * p.q_seq_stride;
     a.dO = p.dO + b * p.o_batch_stride + h0 * p.o_head_stride + q_tok0 * p.o_seq_stride;
@@ -135,8 +138,8 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     a.dQ = p.dQ + b * p.dq_batch_stride + h0 * p.dq_head_stride + q_tok0 * p.dq_seq_stride;
     a.K  = p.K  + b * p.k_batch_stride + kv_h * p.k_head_stride + k_tok0 * p.k_seq_stride;
     a.V  = p.V  + b * p.v_batch_stride + kv_h * p.v_head_stride + k_tok0 * p.v_seq_stride;
-    a.dK = p.dK + b * p.dk_batch_stride + kv_h * p.dk_head_stride + k_tok0 * p.dk_seq_stride;
-    a.dV = p.dV + b * p.dv_batch_stride + kv_h * p.dv_head_stride + k_tok0 * p.dv_seq_stride;
+    a.dK = p.dK + b * p.dk_batch_stride + dkv_h * p.dk_head_stride + k_tok0 * p.dk_seq_stride;
+    a.dV = p.dV + b * p.dv_batch_stride + dkv_h * p.dv_head_stride + k_tok0 * p.dv_seq_stride;
     a.q_head_stride = p.q_head_stride; a.o_head_stride = p.o_head_stride;
     a.l_head_stride = p.l_head_stride; a.dq_head_stride = p.dq_head_stride;
     a.q_stride = p.q_seq_stride; a.o_stride = p.o_seq_stride; a.l_stride = p.l_seq_stride;
@@ -154,22 +157,23 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     return a;
 }
 
-// Flat grid: x = (batch * KV heads) * key_blocks + key_block (as the forward).
+// Flat grid: x = (batch * KV heads * group slices) * key_blocks + key_block (as the forward).
 template <typename Tile, typename Body>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 bwd_batched_kernel(FlashAttnBwdParams p) {
     const int key_blocks = cdiv(p.seq_len_k, Tile::Bc);
-    const int bh = blockIdx.x / key_blocks;
-    const int b = bh / p.num_heads_k;
-    const int kv_h = bh % p.num_heads_k;
+    const int bhs = blockIdx.x / key_blocks;
+    const int hs = bhs % (p.num_heads_k * p.kv_group_splits);
+    const int b = bhs / (p.num_heads_k * p.kv_group_splits);
     const int kv_start = (blockIdx.x % key_blocks) * Tile::Bc;
     if (kv_start >= p.seq_len_k) return;
-    BwdBlockArgs a = bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, kv_h, kv_start);
+    BwdBlockArgs a = bwd_block_args(p, b, 0, 0, p.seq_len_q, p.seq_len_k, hs / p.kv_group_splits,
+                                    hs % p.kv_group_splits, kv_start);
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     Body::template run<Tile>(a);
 }
 
-// Grid (key blocks of all sequences, H_kv): the sequence comes from
+// Grid (key blocks of all sequences, H_kv * group slices): the sequence comes from
 // key_block_offsets (varlen_seq_of_block).
 template <typename Tile, typename Body>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
@@ -181,7 +185,8 @@ bwd_varlen_kernel(FlashAttnBwdParams p) {
     const int kv_start = (blockIdx.x - p.key_block_offsets[seq]) * Tile::Bc;
     if (kv_start >= seq_len_k) return;
     BwdBlockArgs a = bwd_block_args(p, 0, q_tok0, k_tok0, p.cu_seqlens_q[seq + 1] - q_tok0,
-                                    seq_len_k, blockIdx.y, kv_start);
+                                    seq_len_k, blockIdx.y / p.kv_group_splits, blockIdx.y % p.kv_group_splits,
+                                    kv_start);
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     Body::template run<Tile>(a);
 }
@@ -942,11 +947,12 @@ static void launch_bwd(FlashAttnBwdParams& params, int total_k_blocks, cudaStrea
     constexpr int smem = Tile::smem_bytes();
     const bool varlen = params.cu_seqlens_q != nullptr;
     auto kernel = varlen ? bwd_varlen_kernel<Tile, Body> : bwd_batched_kernel<Tile, Body>;
-    const int64_t batched_blocks = int64_t(cdiv(params.seq_len_k, Tile::Bc)) * params.batch_size * params.num_heads_k;
+    const int heads = params.num_heads_k * params.kv_group_splits;  // dK / dV heads: one block row each
+    const int64_t batched_blocks = int64_t(cdiv(params.seq_len_k, Tile::Bc)) * params.batch_size * heads;
     if (!varlen && batched_blocks > INT32_MAX) {
         throw std::runtime_error("flash_attn_legacy: batch * heads * key blocks exceeds the grid limit");
     }
-    const dim3 grid = varlen ? dim3(total_k_blocks, params.num_heads_k) : dim3(static_cast<unsigned>(batched_blocks));
+    const dim3 grid = varlen ? dim3(total_k_blocks, heads) : dim3(static_cast<unsigned>(batched_blocks));
     FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
 }

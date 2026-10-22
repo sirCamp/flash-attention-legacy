@@ -330,6 +330,34 @@ class TestBackwardGQA:
         torch.testing.assert_close(dk_f, dk_r, rtol=0.15, atol=0.03)
         torch.testing.assert_close(dv_f, dv_r, rtol=0.15, atol=0.03)
 
+    @pytest.mark.parametrize("splits", [1, 2, 4], ids=["unsplit", "half", "whole_group"])
+    def test_gqa_group_splits(self, head_dim, splits, monkeypatch):
+        """The query heads of a KV head split over 1, 2 or 4 blocks (dK / dV partials summed):
+        batched vs the reference, varlen (causal, 2 sequences) vs the unsplit kernel."""
+        from flash_attn_legacy import flash_attention, flash_attn_varlen_func
+        H_q, H_kv, d = 8, 2, head_dim
+        scale = 1.0 / math.sqrt(d)
+        q = (torch.randn(1, H_q, 96, d, device='cuda', dtype=torch.float16) * 0.2).requires_grad_()
+        k = (torch.randn(1, H_kv, 96, d, device='cuda', dtype=torch.float16) * 0.2).requires_grad_()
+        v = (torch.randn(1, H_kv, 96, d, device='cuda', dtype=torch.float16) * 0.2).requires_grad_()
+        go = torch.randn(1, H_q, 96, d, device='cuda', dtype=torch.float16) * 0.1
+
+        def varlen_grads():
+            qp, kp, vp = (t.detach()[0].transpose(0, 1).contiguous().requires_grad_() for t in (q, k, v))
+            cu = torch.tensor([0, 40, 96], dtype=torch.int32, device='cuda')
+            flash_attn_varlen_func(qp, kp, vp, cu, cu, 56, 56, softmax_scale=scale, causal=True).backward(
+                go[0].transpose(0, 1).contiguous())
+            return qp.grad, kp.grad, vp.grad
+
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS", "1")
+        unsplit = varlen_grads()
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_BWD_GROUP_SPLITS", str(splits))
+        flash_attention(q, k, v, softmax_scale=scale).backward(go)
+        for got, ref in zip((q.grad, k.grad, v.grad), ref_backward(q.detach(), k.detach(), v.detach(), go, scale)):
+            torch.testing.assert_close(got, ref, rtol=0.15, atol=0.03)
+        for got, ref in zip(varlen_grads(), unsplit):
+            torch.testing.assert_close(got, ref, rtol=1e-2, atol=2e-3)
+
 
 # ---------------------------------------------------------------------------
 # Module tests

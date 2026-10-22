@@ -184,6 +184,9 @@ struct FlashAttnBwdParams {
     float softmax_scale;
     float softcap;                  // ScoreMap (0 = none)
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
+    // GQA: the H_q / H_kv query heads of a KV head split over this many blocks
+    // (a divisor of the group); slice s of KV head h writes dK / dV head h * S + s
+    int kv_group_splits = 1;
 
     // Strides for Q/dQ
     index_t q_batch_stride, q_head_stride, q_seq_stride;
