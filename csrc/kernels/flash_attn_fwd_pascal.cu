@@ -5,8 +5,11 @@
 // Key design (FA2-style, docs/analysis/kernels/p2_8_design.md):
 //   - the band forward of flash_attn_fwd_band.h (K/V loop, masking, online
 //     softmax, batched/varlen kernels), with fp32 FMA register micro-tiles
-//   - each warp owns 16 query rows; lane = 8 * rg + cg holds rows 4rg..4rg+3,
-//     keys cg + 8j (j < Bc/8) and O columns 4cg + 32i..+3 (i < d/32)
+//   - each band of 16 query rows belongs to Tile::kSplit warps, one per slice of
+//     d / kSplit columns; lane = 8 * rg + cg holds rows 4rg..4rg+3, keys cg + 8j
+//     (j < Bc/8) and O columns 4cg + 32i..+3 of its slice (i < d/kSplit/32).
+//     With kSplit > 1 the warps of a band sum their partial S in shared memory
+//     (one named barrier per band and block) and run the same softmax
 //   - Q, K, V converted to fp32 once, when stored to shared memory: the inner
 //     products run without conversions (on sm_6x a half->float conversion
 //     costs about four FMAs) and without fp16 products (no overflow)
@@ -18,6 +21,11 @@
 
 namespace flash_attn_legacy {
 
+// Barrier of the `threads` threads of one band (id 1 + band; 0 is __syncthreads).
+__device__ __forceinline__ void band_barrier(int band, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(1 + band), "r"(threads) : "memory");
+}
+
 struct PascalFwd {
 template <typename Tile>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
@@ -27,8 +35,10 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int NUM_THREADS = Tile::kNumWarps * 32;
     constexpr int LDF = Tile::kLdF;
     constexpr int LDP = Tile::kLdP;
-    constexpr int TN = Bc / 8;   // keys per lane
-    constexpr int TD = d / 32;   // float4 column groups of O per lane
+    constexpr int kSplit = Tile::kSplit;
+    constexpr int DS = d / kSplit;  // columns of this warp's slice
+    constexpr int TN = Bc / 8;      // keys per lane
+    constexpr int TD = DS / 32;     // float4 column groups of O per lane
 
     extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
     float* smem_Q = reinterpret_cast<float*>(smem_raw);
@@ -38,10 +48,15 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     const int warp_id = tid / 32;
     const int lane = tid % 32;
     float* smem_Pt = smem_V + Bc * LDF + warp_id * Bc * LDP;  // this warp's P^T [Bc, LDP]
+    const int band = warp_id / kSplit, part = warp_id % kSplit;
+    const int col0 = part * DS;               // first column of this warp's slice
+    // partial S of the band's warps (kSplit > 1): [kSplit][4][TN][32 lanes] per
+    // band, lane-major (each lane reads back only its own slots: no bank conflicts)
+    float* smem_S = smem_V + Bc * LDF + Tile::kNumWarps * Bc * LDP + (kSplit > 1 ? band * kSplit * 4 * TN * 32 : 0);
 
     const int rg = lane >> 3;                 // row group: rows 4rg..4rg+3 of the band
-    const int cg = lane & 7;                  // column group (keys cg + 8j, O cols 4cg + 32i)
-    const int band_row0 = warp_id * kBandRows;
+    const int cg = lane & 7;                  // column group (keys cg + 8j, O cols col0 + 4cg + 32i)
+    const int band_row0 = band * kBandRows;
     const bool band_active = band_row0 < a.valid_q;
     const int row0 = band_row0 + 4 * rg;      // first of this lane's rows, within the block
 
@@ -67,7 +82,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             for (int j = 0; j < TN; j++) s[i][j] = 0.0f;
         }
         #pragma unroll 4
-        for (int k = 0; k < d; k += 4) {
+        for (int k = col0; k < col0 + DS; k += 4) {
             float4 q[4];
             #pragma unroll
             for (int i = 0; i < 4; i++) q[i] = *reinterpret_cast<const float4*>(smem_Q + (row0 + i) * LDF + k);
@@ -86,6 +101,26 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
                 #pragma unroll
                 for (int i = 0; i < 4; i++) s[i][j] = fmaf(q[i].w, kk.w, s[i][j]);
             }
+        }
+        if constexpr (kSplit > 1) {  // S = sum of the band's partial S, same order in every warp
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < TN; j++) smem_S[((part * 4 + i) * TN + j) * 32 + lane] = s[i][j];
+            }
+            band_barrier(band, kSplit * 32);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int p = 0; p < kSplit; p++) sum += smem_S[((p * 4 + i) * TN + j) * 32 + lane];
+                    s[i][j] = sum;
+                }
+            }
+            // smem_S is rewritten only in the next K/V block, after fwd_band_loop's
+            // block-wide barrier (its contract)
         }
         fwd_logits<kMask>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
                           [&](int j) { return kv_start + cg + 8 * j; });
@@ -114,7 +149,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             const float pr[4] = {p.x, p.y, p.z, p.w};
             #pragma unroll
             for (int t = 0; t < TD; t++) {
-                const float4 v = *reinterpret_cast<const float4*>(smem_V + c * LDF + 4 * cg + 32 * t);
+                const float4 v = *reinterpret_cast<const float4*>(smem_V + c * LDF + col0 + 4 * cg + 32 * t);
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     O[i][t].x = fmaf(pr[i], v.x, O[i][t].x);
@@ -136,16 +171,17 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     for (int i = 0; i < 4; i++) {
         const int row = row0 + i;
         if (row >= a.valid_q) break;
-        if (cg == 0) a.L[row * a.l_stride] = lse[i];
+        if (cg == 0 && part == 0) a.L[row * a.l_stride] = lse[i];
         #pragma unroll
         for (int t = 0; t < TD; t++) {
-            if (4 * cg + 32 * t < a.head_dim) {  // not a zero-padded column (d=72/80)
+            const int col = col0 + 4 * cg + 32 * t;
+            if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
                 const half2 lo = __floats2half2_rn(O[i][t].x * inv[i], O[i][t].y * inv[i]);
                 const half2 hi = __floats2half2_rn(O[i][t].z * inv[i], O[i][t].w * inv[i]);
                 uint2 packed;
                 memcpy(&packed.x, &lo, 4);
                 memcpy(&packed.y, &hi, 4);
-                *reinterpret_cast<uint2*>(a.O + row * a.o_stride + 4 * cg + 32 * t) = packed;
+                *reinterpret_cast<uint2*>(a.O + row * a.o_stride + col) = packed;
             }
         }
     }

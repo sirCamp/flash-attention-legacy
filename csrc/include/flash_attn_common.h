@@ -205,28 +205,35 @@ struct FwdTileWmma {
 };
 
 // CUDA-core forward (Pascal SM 6.x), same band scheme as the WMMA one: each
-// warp owns 16 query rows; lane = 8 * rg + cg holds rows 4rg..4rg+3 of the band,
-// keys cg + 8j and O columns 4cg + 32i..+3, all in fp32 registers.
+// band of 16 query rows belongs to kSplit warps; lane = 8 * rg + cg holds rows
+// 4rg..4rg+3 of the band, keys cg + 8j and, of its warp's d / kSplit columns,
+// O columns 4cg + 32i..+3, all in fp32 registers. With kSplit > 1 each warp
+// computes S over its column slice and the slices are summed in shared memory
+// (more warps per byte of shared memory and fewer O registers: d=256).
 // Shared memory, fp32 (converted once when stored, no conversion in the inner
 // products): Q[Br,kLdF], K[Bc,kLdF], V[Bc,kLdF] (rows padded by 4 floats: the 8
 // K rows read at once start in different 4-bank groups), then per warp P^T
-// [Bc,kLdP] (key-major; stride 20 makes the 8 float4 stores conflict free).
-template <int Br_, int Bc_, int d_>
+// [Bc,kLdP] (key-major; stride 20 makes the 8 float4 stores conflict free),
+// then with kSplit > 1 the partial S of every warp [16, Bc].
+template <int Br_, int Bc_, int d_, int kSplit_ = 1>
 struct FwdTileSimt {
     static constexpr int Br = Br_;
     static constexpr int Bc = Bc_;
     static constexpr int d  = d_;
-    static constexpr int kNumWarps = Br_ / 16;
+    static constexpr int kSplit = kSplit_;
+    static constexpr int kNumWarps = Br_ / 16 * kSplit_;
     static constexpr int kLdF = d_ + 4;
     static constexpr int kLdP = 20;
     // Prefetch the next K/V block into registers only when it costs at most two
     // uint4 per thread and tile (else plain shared-memory loads); same count as
     // TileRegs<Bc, d, threads>::kPerThread, which is device-only.
     static constexpr bool kPrefetch = (Bc_ * d_ / 8 + kNumWarps * 32 - 1) / (kNumWarps * 32) <= 2;
+    static constexpr int kPartialFloats = kSplit_ > 1 ? kNumWarps * 16 * Bc_ : 0;
     static constexpr int smem_bytes() {
-        return ((Br + 2 * Bc) * kLdF + kNumWarps * Bc * kLdP) * 4;
+        return ((Br + 2 * Bc) * kLdF + kNumWarps * Bc * kLdP + kPartialFloats) * 4;
     }
-    static_assert(Br_ % 16 == 0 && Bc_ % 8 == 0 && d_ % 32 == 0, "invalid CUDA-core forward tile");
+    static_assert(Br_ % 16 == 0 && Bc_ % 8 == 0 && d_ % (32 * kSplit_) == 0, "invalid CUDA-core forward tile");
+    static_assert(Br_ / 16 < 16, "one named barrier per band (ids 1..15)");
 };
 
 // WMMA forward tiles, in order of preference (the first that fits the device's
@@ -249,13 +256,16 @@ using TileVolta_d256_64k = FwdTileWmma<64, 16, 256>;   // 56 KB
 // CUDA-core forward tiles (48 KB per block on Pascal). Measured, forward causal
 // B=2 H=16 N=4096, P100 / 1080 Ti in ms (thread-per-row kernel before P2.8):
 // d=32 6.1 / 7.3 (13.4 / 24); d=64 12.2 / 15.4 (27 / 74); d=96 21.8 / 23.8
-// (47 / 118); d=128 52 / 41 (81 / 176); d=256 285 / 189 (1768 on P100). fp32
-// shared memory limits d=256 to one-warp blocks (docs/PLAN.md P2.8).
+// (47 / 118); d=128 35 / 42 (81 / 176). d=256: fp32 shared memory leaves room
+// for one 16-row block per SM (P100), so its warps split the columns (P5):
+// kSplit 1 / 2 / 4 / 8 = 288 / 153 / 130 / 120 ms on P100, 99 with the
+// lane-major partial S (no bank conflicts); 1080 Ti 196 -> 121 (SDPA mem-efficient
+// 58 / 1049, eager 110 / 141). kSplit 2 at d=128: P100 -4%, 1080 Ti +5%, not taken.
 using TilePascal_d32  = FwdTileSimt<64, 32, 32>;    // 28 KB
 using TilePascal_d64  = FwdTileSimt<64, 16, 64>;    // 31 KB
 using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 43 KB
 using TilePascal_d128 = FwdTileSimt<32, 8, 128>;    // 26 KB
-using TilePascal_d256 = FwdTileSimt<16, 8, 256>;    // 33 KB
+using TilePascal_d256 = FwdTileSimt<16, 8, 256, 8>; // 42 KB, 8 warps on the 16 rows
 
 // First tile of the list whose smem_bytes() fits `smem_limit`: calls f(Tile{})
 // and returns true, or returns false if none fits. Shared by every launcher and

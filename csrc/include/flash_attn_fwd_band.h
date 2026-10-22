@@ -3,7 +3,7 @@
 // ============================================================================
 // FA2-style forward, shared by every kernel family (docs/PLAN.md P2.1 / P2.8).
 //
-// A Q block of Br rows is split in bands of 16 rows, one per warp. The parts
+// A Q block of Br rows is split in bands of 16 rows, one or more warps each. The parts
 // that do not depend on how S = Q K^T and O += P V are computed live here, once:
 //   - FwdBlockArgs: pointers and lengths of one Q block, from the batched or
 //     the varlen grid (fwd_batched_kernel / fwd_varlen_kernel)
@@ -28,7 +28,7 @@ namespace flash_attn_legacy {
 
 #ifdef __CUDACC__
 
-constexpr int kBandRows = 16;  // query rows per warp
+constexpr int kBandRows = 16;  // query rows per band (of one or more warps)
 
 // One Q block: its rows start at Q / O / L (row strides q_stride / o_stride /
 // l_stride); K and V start at key 0 of the sequence.
@@ -146,7 +146,10 @@ struct BandSoftmax {
 // causal, sliding window); fetch(j + 1) is issued right after block j is
 // committed, so its global loads overlap the computation of block j. Bands skip
 // blocks they cannot see and only mask the blocks that need it. Inactive bands
-// (rows past valid_q) still take part in every barrier.
+// (rows past valid_q) still take part in every barrier. Shared memory written
+// by step() for block j is not rewritten by step() for block j + 1 before every
+// warp is done with block j: the block-wide barrier closing each iteration
+// (the column-split Pascal forward relies on it for its partial S).
 template <int Br, int Bc, typename LoadQ, typename Fetch, typename Commit, typename Step>
 __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_row0, bool band_active,
                                               LoadQ&& load_q, Fetch&& fetch, Commit&& commit, Step&& step) {
