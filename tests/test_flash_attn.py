@@ -1191,9 +1191,10 @@ class TestKVCache:
             v[b, n:] = float("nan")
 
     @staticmethod
-    def _ref(q, k, v, seqlens, scale, causal=False, window=(-1, -1), softcap=0.0, sinks=None, leftpad=None):
+    def _ref(q, k, v, seqlens, scale, causal=False, window=(-1, -1), softcap=0.0, sinks=None, leftpad=None,
+             key_mask=None):
         """Per row b: reference over the keys [leftpad[b], seqlens[b]) (causal /
-        window aligned to seqlens[b]); out BSHD, lse [B, H_q, q_len]."""
+        window aligned to seqlens[b]) kept by key_mask[b]; out BSHD, lse [B, H_q, q_len]."""
         outs, lses = [], []
         for b, n in enumerate(seqlens):
             qb = q[b:b + 1].transpose(1, 2).float()        # [1, H_q, q_len, d]
@@ -1204,6 +1205,8 @@ class TestKVCache:
             logits = ref_logits(qb, kb, scale, causal, window, softcap)
             if leftpad is not None:
                 logits[..., :leftpad[b]] = float("-inf")
+            if key_mask is not None:
+                logits = logits.masked_fill(~key_mask[b, :n], float("-inf"))
             outs.append((ref_probs(logits, sinks) @ vb).transpose(1, 2))
             if sinks is not None:
                 logits = torch.cat([logits, sinks.float().view(1, -1, 1, 1).expand(*logits.shape[:-1], 1)], -1)
@@ -1372,6 +1375,61 @@ class TestKVCache:
                                      causal=causal, window=window, sinks=sinks, leftpad=leftpad)
         self._check(out, lse, ref_out, ref_lse, dtype)
         assert (out[2] == 0).all()
+
+    @pytest.mark.parametrize("num_splits", [0, 1, 4])
+    @pytest.mark.parametrize("mode", ["causal", "window40", "sinks", "leftpad", "paged"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_key_mask(self, head_dim, num_splits, mode, dtype):
+        """key_mask: holes, left padding, a row with no kept key (O = 0 or only the
+        sink), a full row; combined with seqlens / leftpad / window / paging;
+        masked slots hold NaN (never read)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        B, max_len = 5, 192
+        q, k, v = self._case(B, 1, 8, 2, head_dim, max_len, dtype, "bshd" if mode == "paged" else "bhsd_view")
+        seqlens = [192, 150, 60, 192, 33]
+        keep = torch.ones(B, max_len, dtype=torch.bool, device="cuda")
+        keep[0, 10:20] = keep[0, 100] = keep[0, 191] = False  # holes, last key masked
+        keep[1, :70] = False
+        keep[1, 120:125] = False                              # left padding + a hole
+        keep[2] = False                                       # no key
+        keep[4, ::3] = False                                  # every third key
+        leftpad = [0, 0, 0, 30, 5] if mode == "leftpad" else None
+        causal, window = True, (40, 0) if mode == "window40" else (-1, -1)
+        sinks = torch.randn(8, device="cuda") if mode == "sinks" else None
+        cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        kw = dict(cache_seqlens=cs, causal=causal, window_size=window, num_splits=num_splits, sinks=sinks,
+                  key_mask=keep, return_softmax_lse=True)
+        if leftpad is not None:
+            kw["cache_leftpad"] = torch.tensor(leftpad, dtype=torch.int32, device="cuda")
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), causal=causal, window=window,
+                                     sinks=sinks, leftpad=leftpad, key_mask=keep)
+        self._poison(k, v, seqlens)
+        k.masked_fill_(~keep[:, :, None, None], float("nan"))
+        v.masked_fill_(~keep[:, :, None, None], float("nan"))
+        kc, vc = k, v
+        if mode == "paged":  # blocks made from the poisoned caches
+            kc, vc, kw["block_table"] = self._paged(k, v, 64)
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, kc, vc, **kw)
+        self._check(out, lse, ref_out, ref_lse, dtype)
+        if sinks is None:
+            assert (out[2] == 0).all()
+
+    def test_key_mask_layouts_and_checked(self):
+        """A [1, max_len] mask expanded to the batch (stride 0), a strided view
+        (copied), q_len 3 with causal rows; wrong masks raise."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 3, 4, 2, 64, 64, torch.float16, "bshd")
+        keep = torch.rand(1, 64, device="cuda") > 0.3
+        strided = (torch.rand(3, 128, device="cuda") > 0.3)[:, ::2]
+        with torch.no_grad():
+            for mask in (keep.expand(3, -1), strided):
+                out = flash_attn_with_kvcache(q, k, v, cache_seqlens=60, causal=True, key_mask=mask)
+                ref_out, _ = self._ref(q, k, v, [60] * 3, 0.125, causal=True, key_mask=mask)
+                torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
+            for bad in (keep.int(), keep[:, :63].expand(3, -1), keep.expand(2, -1), keep.cpu().expand(3, -1)):
+                with pytest.raises(RuntimeError, match="key_mask"):
+                    flash_attn_with_kvcache(q, k, v, key_mask=bad)
 
     def test_leftpad_clamped_and_checked(self):
         """leftpad outside [0, seqlens] is clamped; an int cache_seqlens with a tensor

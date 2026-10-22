@@ -96,11 +96,11 @@ def test_decode_on_kernel(monkeypatch, dtype):
     assert len(counter.decode_calls) == 3 * n_layers and fallback_stats() == {}
 
 
-@pytest.mark.parametrize("case", ["broadcast_batch", "all_true", "holes", "too_many_rows"])
+@pytest.mark.parametrize("case", ["broadcast_batch", "all_true", "holes", "window", "too_many_rows"])
 def test_decode_4d_mask(monkeypatch, case):
-    """q_len == 1 with a boolean [B or 1, 1, 1, kv] mask: a contiguous block of
-    keys per row runs on the decode kernel; holes or more query heads per KV head
-    than the kernel handles go to SDPA with the mask as it is; all within FP32."""
+    """q_len == 1 with a boolean [B or 1, 1, 1, kv] mask: the decode kernel with
+    the mask (holes included); more query heads per KV head than the kernel
+    handles go to SDPA with the mask as it is; all within FP32."""
     torch.manual_seed(0)
     B, kv = 3, 40
     rows = integrations.DECODE_MAX_ROWS + 1 if case == "too_many_rows" else 4
@@ -113,13 +113,17 @@ def test_decode_4d_mask(monkeypatch, case):
     if case == "holes":
         keep[1, 12] = False
     mask = keep[:1, None, None, :] if case == "broadcast_batch" else keep[:, None, None, :]
+    kw, ref_mask = {}, mask.expand(B, -1, -1, -1)
+    if case == "window":  # sliding_window 8 ends at the query (key 29), not at the cache end
+        kw["sliding_window"] = 8
+        ref_mask = ref_mask & (torch.arange(kv, device="cuda") > 29 - 8)
     counter = KernelCounter(monkeypatch)
-    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, mask, scaling=0.125)
-    ref = _reference(q, k, v, 0.125, mask.expand(B, -1, -1, -1))
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, mask, scaling=0.125, **kw)
+    ref = _reference(q, k, v, 0.125, ref_mask)
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
-    kernel = case in ("broadcast_batch", "all_true")
+    kernel = case != "too_many_rows"
     assert bool(counter.decode_calls) == kernel
-    expected = {} if kernel else {"attention_mask" if case == "holes" else "decode": 1}
+    expected = {} if kernel else {"decode": 1}
     assert fallback_stats() == expected
 
 
@@ -164,7 +168,7 @@ def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
 @pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral", "gpt_oss"])
 def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation, pad):
     """Batched generation with left padding: the prefill runs unpadded on the
-    kernel, the decode steps on the decode kernel (cache_leftpad); every step's
+    kernel, the decode steps on the decode kernel (key_mask); every step's
     logits of every row within the noise of FP32 eager."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (2, 30), device="cuda")

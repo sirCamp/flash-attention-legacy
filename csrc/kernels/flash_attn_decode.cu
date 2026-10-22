@@ -18,11 +18,14 @@
 // softmax state (m, l, O) per row over its keys; groups and warps are merged
 // with the same decode_merge at the end (and splits in the combine). The sink of
 // a row enters once (group 0 of warp 0 of split 0 starts at m = sink, l = 1).
+// An optional key mask (padding of any shape): each block shrinks its split to
+// the first / last kept key (a scan of its own keys), masked keys are not read.
 // ============================================================================
 
 #include "flash_attn_common.h"
 
 #include <cuda_bf16.h>
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -165,13 +168,32 @@ decode_kernel(DecodeParams p) {
     const int key_first = max(w.first_key(0), leftpad), key_last = w.last_key(p.q_len - 1);
     const int range = max(key_last - key_first + 1, 0);
     const int chunk = (cdiv(range, p.num_splits) + NG - 1) / NG * NG;
-    const int key_begin = key_first + split * chunk;
-    const int key_end = min(key_last, key_begin + chunk - 1);  // inclusive (< key_begin: empty)
+    int key_begin = key_first + split * chunk;
+    int key_end = min(key_last, key_begin + chunk - 1);  // inclusive (< key_begin: empty)
+    const bool* mrow = p.key_mask ? p.key_mask + b * p.mask_batch_stride : nullptr;
+    if (mrow) {  // shrink this split's keys to its first / last kept one
+        int lo = INT_MAX, hi = -1;
+        for (int j = key_begin + threadIdx.x; j <= key_end; j += kDecodeWarps * 32) {
+            if (mrow[j]) { lo = min(lo, j); hi = max(hi, j); }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            lo = min(lo, __shfl_xor_sync(0xffffffffu, lo, off));
+            hi = max(hi, __shfl_xor_sync(0xffffffffu, hi, off));
+        }
+        __shared__ int s_lo[kDecodeWarps], s_hi[kDecodeWarps];
+        if (lane == 0) { s_lo[warp] = lo; s_hi[warp] = hi; }
+        __syncthreads();
+        #pragma unroll
+        for (int wp = 0; wp < kDecodeWarps; wp++) { lo = min(lo, s_lo[wp]); hi = max(hi, s_hi[wp]); }
+        key_begin = max(key_begin, min(lo, key_end + 1));  // no kept key: empty (no INT_MAX overflow)
+        key_end = min(key_end, hi);
+    }
     // Same trip count for every lane of a warp (the shuffles below need all 32):
     // the warp steps over GW keys at a time, keys past key_end are masked.
     for (int j0 = key_begin + warp * GW; j0 <= key_end; j0 += NG) {
         const int j = j0 + lane / G;
-        const bool in_range = j <= key_end;
+        const bool in_range = j <= key_end && (mrow == nullptr || mrow[j]);
         uint4 ku = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
         if (active && in_range) {
             ku = *reinterpret_cast<const uint4*>(K + key_offset(j, p.k_batch_stride, p.k_seq_stride) + 8 * li);

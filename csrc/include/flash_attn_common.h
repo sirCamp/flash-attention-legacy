@@ -141,6 +141,10 @@ struct DecodeParams {
     int max_blocks, block_size;
     int block_shift;  // log2(block_size) when a power of 2, else -1 (division)
     const float* __restrict__ sinks;        // [H_q] or nullptr
+    // [B, max_len] (True = attend; row b at b * mask_batch_stride), or nullptr: masked
+    // keys are not read; each split is shrunk to its first / last kept key
+    const bool* __restrict__ key_mask;
+    index_t mask_batch_stride;
     index_t q_batch_stride, q_seq_stride, q_head_stride;
     index_t k_batch_stride, k_seq_stride, k_head_stride;
     index_t v_batch_stride, v_seq_stride, v_head_stride;

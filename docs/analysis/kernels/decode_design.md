@@ -67,9 +67,10 @@ q_len (that re-reads K/V).
 - Decode steps (q_len == 1, short q_len with a cache) go to the kernel; output BSHD returned as it is (no transpose copy).
 - Dynamic cache: K/V contiguous BHSD [B, H_kv, past + 1, d], mask None: seqlens = N.
 - Static cache: pass the unsliced cache; cache_seqlens on the device from the valid prefix (no `int(q_offset)` sync).
-- Left padding: leftpad from the first 1 of the 2D mask, computed once per step on the shared mask object (one sync, as
-  `_cached_segments`), never through `_unpad_plan` (its gathers copy the cache). Holes inside a row keep falling back. Masks
-  built per layer type (sliding / full) give their own leftpad.
+- Padding (P6.5 step b): the 2D / 4D decode mask goes to the kernel as `key_mask` (each split shrunk to its first / last
+  kept key, masked keys skipped): any padding, holes included, without host sync, never through `_unpad_plan` (its gathers
+  copy the cache). With a 4D mask cache_seqlens = last kept key + 1 (on the device) keeps causal / window aligned to the
+  query. Before step b: leftpad from the 2D mask with one host sync per step, holes on the fallback.
 - Sliding caches: the dynamic sliding layer passes up to W - 1 + q_len keys (window satisfied); the padding scrolls out (leftpad
   -> 0): test decoding past W with and without left padding.
 - Beam search: reordered caches are plain tensors; low risk. Cross-attention decode (non-causal against encoder K/V): covered

@@ -62,7 +62,7 @@ def _register_fakes():
 
     @register("flash_attn_legacy::with_kvcache")
     def _(q, k_cache, v_cache, cache_seqlens, softmax_scale, is_causal=False, window_left=-1, window_right=-1,
-          softcap=0.0, sinks=None, num_splits=0, cache_leftpad=None, block_table=None):
+          softcap=0.0, sinks=None, num_splits=0, cache_leftpad=None, block_table=None, key_mask=None):
         B, q_len, H_q, _ = q.shape
         return q.new_empty(q.shape), q.new_empty((B, H_q, q_len), dtype=torch.float32)
 
@@ -565,6 +565,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     *,
     sinks: Optional[torch.Tensor] = None,
+    key_mask: Optional[torch.Tensor] = None,
 ):
     """
     Attention of a few new queries against a KV cache (decode), the upstream
@@ -602,6 +603,11 @@ def flash_attn_with_kvcache(
         return_softmax_lse: also return the logsumexp [B, H_q, q_len] (fp32;
             -inf for rows with no visible key nor sink)
         sinks: attention sinks [H_q] (keyword only, an extension)
+        key_mask: bool [B, max_len] or None (keyword only, an extension): only the
+            keys where it is True are attended, on top of cache_seqlens /
+            cache_leftpad / causal / window (padding of any shape, holes included,
+            without host sync; any batch stride, e.g. a [1, max_len] mask
+            expanded). Indexed by key position (paged caches too)
         k, v, rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes: not
             supported yet (NotImplementedError when given)
 
@@ -644,5 +650,5 @@ def flash_attn_with_kvcache(
     if cache_leftpad is not None:
         cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
     out, lse = _ops.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal, *window_size, softcap,
-                                 sinks, num_splits, cache_leftpad, block_table)
+                                 sinks, num_splits, cache_leftpad, block_table, key_mask)
     return (out, lse) if return_softmax_lse else out

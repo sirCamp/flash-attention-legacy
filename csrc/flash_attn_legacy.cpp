@@ -640,7 +640,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_att
 // H_kv, d] and block_table [B, max_blocks] int32 (max_len = max_blocks *
 // block_size; not with cache_leftpad); the table entries of the keys
 // < cache_seqlens must be in [0, num_blocks): not validated (no sync), as
-// upstream. fp16 or bf16, read natively.
+// upstream. key_mask: optional bool [B, max_len] (True = attend, any batch stride):
+// masked keys are skipped (padding of any shape, no host sync). fp16 or bf16, read
+// natively.
 // Returns out like q (BSHD) and lse [B, H_q, q_len] (natural log; -inf for rows
 // with no visible key nor sink).
 // ---------------------------------------------------------------------------
@@ -664,7 +666,7 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
     double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad,
-    c10::optional<torch::Tensor> block_table
+    c10::optional<torch::Tensor> block_table, c10::optional<torch::Tensor> key_mask
 ) {
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d] "
@@ -712,6 +714,14 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         leftpad = check_batch_int32(*cache_leftpad, q, B, "cache_leftpad");
     }
     const torch::Tensor sink = sink_logits(sinks, q, H_q);
+    torch::Tensor mask;
+    if (key_mask.has_value() && key_mask->defined()) {
+        mask = *key_mask;
+        TORCH_CHECK(mask.is_cuda() && mask.device() == q.device() && mask.dtype() == torch::kBool && mask.dim() == 2 &&
+                    mask.size(0) == B && mask.size(1) == max_len,
+                    "key_mask must be bool [B, max_len] = [", B, ", ", max_len, "] on q's device");
+        if (mask.stride(1) != 1) mask = mask.contiguous();  // any batch stride (0: broadcast)
+    }
 
     torch::Tensor out = torch::empty_like(q);
     torch::Tensor lse = torch::empty({B, H_q, q_len}, q.options().dtype(torch::kFloat32));
@@ -735,6 +745,8 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         while ((1 << p.block_shift) < p.block_size) p.block_shift++;
     }
     p.sinks = data_or_null(sink);
+    p.key_mask = mask.defined() ? mask.data_ptr<bool>() : nullptr;
+    p.mask_batch_stride = mask.defined() ? mask.stride(0) : 0;
     p.q_batch_stride = q.stride(0); p.q_seq_stride = q.stride(1); p.q_head_stride = q.stride(2);
     p.k_batch_stride = k_cache.stride(0); p.k_seq_stride = k_cache.stride(1); p.k_head_stride = k_cache.stride(2);
     p.v_batch_stride = v_cache.stride(0); p.v_seq_stride = v_cache.stride(1); p.v_head_stride = v_cache.stride(2);
@@ -782,7 +794,8 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "-> (Tensor, Tensor, Tensor, Tensor)");
     m.def("with_kvcache(Tensor q, Tensor k_cache, Tensor v_cache, Tensor cache_seqlens, float softmax_scale, "
           "bool is_causal=False, int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None, "
-          "int num_splits=0, Tensor? cache_leftpad=None, Tensor? block_table=None) -> (Tensor, Tensor)");
+          "int num_splits=0, Tensor? cache_leftpad=None, Tensor? block_table=None, Tensor? key_mask=None) "
+          "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {

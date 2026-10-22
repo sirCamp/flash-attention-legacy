@@ -35,9 +35,14 @@ the pybind kernels `forward` (7), `locals()` in `flash_attn_with_kvcache` (5), `
      call; the Python wrapper adds ~28 us on top in both cases).
    - `max_seqlen_q / k` stay `int` in the schema (unused by the kernels): a compiled varlen call specialises on them.
 3. **Decode key mask in the kernel** (`key_mask` [B, max_len] bool, keyword-only extension of `flash_attn_with_kvcache`):
-   the decode kernel skips masked keys. The HF decode path then passes its 2D / 4D mask as it is, with cache_seqlens /
-   cache_leftpad computed on the device (first and last kept key: they only bound the key range) -> no host sync, no
-   "padding inside a row" fallback, no per-mask caching (`_decode_padding`, `_DECODE_ATTR` removed).
+   each block shrinks its key split to the first / last kept key (a scan of its own keys) and skips masked keys (no K / V
+   read). The HF decode path passes its 2D / 4D mask as it is; with a 4D mask (static cache: empty slots after the query)
+   cache_seqlens = last kept key + 1 is computed on the device, so causal / window stay aligned to the query -> no host
+   sync, no "padding inside a row" fallback, no per-mask caching (`_decode_padding`, `_DECODE_ATTR` removed).
+   - Measured on T4 (GQA 32/8): an all-True mask costs 0% at B=1 16k d=128, +9% at B=8 4k d=128 (the per-key mask
+     load), -5% at d=64 R=8; masks are passed only with padding (all-True masks become None before the kernel).
+     Tried, no gain, not kept: one row scan per block for global bounds (B=1 +13%), K / V loads not waiting for the mask
+     byte (V of masked keys zeroed).
 4. **Mask builder without host reads when tracing or with a tensor q_offset** (static caches): `[B, kv_length]` bool key
    mask built on the device (`arange < q_offset + q_length`, & padding), never `int(q_offset)` / `bool(pad.all())`; the
    cache is never sliced (static shapes: no recompilation per step). Decode -> kernel with the mask; q_len > 1 (prefill of a
