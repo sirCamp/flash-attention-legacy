@@ -133,7 +133,8 @@ struct DecodeParams {
     const void* __restrict__ v;
     void* __restrict__ out;
     float* __restrict__ lse;
-    const int* __restrict__ cache_seqlens;  // [B]: end of the valid keys
+    const int* __restrict__ cache_seqlens;  // [B]: end of the valid keys, or nullptr: uniform_seqlen
+    int uniform_seqlen;                     // every row's end without cache_seqlens (a host int: no tensor)
     const int* __restrict__ cache_leftpad;  // [B]: first valid key (left padding), or nullptr
     // Paged cache: caches [num_blocks, block_size, H_kv, d], key j of row b in block
     // block_table[b * max_blocks + j / block_size], slot j % block_size; nullptr = contiguous

@@ -1466,3 +1466,30 @@ def test_compiled_decode(monkeypatch, cache_type):
             assert len(counter.decode_calls) == base.config.num_hidden_layers and fallback_stats() == {}
     assert breaks["flash_attn_legacy"] <= breaks["sdpa"], breaks
     torch.testing.assert_close(logits["flash_attn_legacy"], logits["sdpa"], atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not hasattr(torch, "compiler"), reason="torch.compile required")
+def test_compiled_decode_steps_do_not_recompile():
+    """Consecutive compiled decode steps on a DynamicCache (kv_len grows every
+    step) recompile no more often than SDPA: no per-step int reaches the ops."""
+    from torch._dynamo.utils import counters
+    base = tiny_llama()
+    ids = torch.randint(0, base.config.vocab_size, (1, 10), device="cuda")
+    graphs = {}
+    for impl in ("sdpa", "flash_attn_legacy"):
+        model = load_impl(base, impl)
+        torch._dynamo.reset()
+        counters.clear()
+        try:
+            step = torch.compile(lambda **kw: model(**kw), backend="aot_eager")
+            with torch.no_grad():
+                out = model(input_ids=ids, use_cache=True)
+                cache, nxt = out.past_key_values, out.logits[:, -1:].argmax(-1)
+                for _ in range(5):
+                    out = step(input_ids=nxt, past_key_values=cache, use_cache=True)
+                    nxt = out.logits[:, -1:].argmax(-1)
+            graphs[impl] = counters["stats"]["unique_graphs"]
+        finally:
+            torch._dynamo.reset()
+            counters.clear()
+    assert graphs["flash_attn_legacy"] <= graphs["sdpa"], graphs

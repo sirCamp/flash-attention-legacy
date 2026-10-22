@@ -547,7 +547,7 @@ def flash_attn_legacy_forward(
     softcap = float(kwargs.get("softcap") or 0.0)  # None or 0: no softcapping (Gemma 2: c > 0)
     sinks = kwargs.get("s_aux")  # [H_q] attention sinks (gpt-oss) or None
     unpad = decode_mask = None
-    decode_seqlens = kv_len
+    decode_seqlens = None  # every key slot (a compiled step's growing kv_len is no op argument)
     if reason is None and q_len == 1:
         # Decode: the kernel skips the masked keys itself (any padding, no host sync)
         if padding_2d:  # K / V already end at the query (sliced to the mask)

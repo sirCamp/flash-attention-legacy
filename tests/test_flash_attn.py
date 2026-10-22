@@ -2092,6 +2092,8 @@ class TestCompile:
             (ops.forward.default, (q[:0], k[:0], v[:0], 0.125, True, -1, -1, 0.0, None, None)),
             (ops.forward_varlen.default, (qp[:0], kp[:0], vp[:0], cu0, cu0, 0, 0, 0.125, True, -1, -1, 0.0,
                                           None, None, False)),
+            (ops.with_kvcache.default, (qd, k.transpose(1, 2), v.transpose(1, 2), None, 0.125, True, -1, -1, 0.0,
+                                        None, 0, None, None, None, 30)),  # int cache_seqlens: no tensor
             (ops.with_kvcache.default, (qd[:0], k[:0].transpose(1, 2), v[:0].transpose(1, 2), seqlens[:0], 0.125,
                                         True, -1, -1, 0.0, None, 0, None, None)),
         ]

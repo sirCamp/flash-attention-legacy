@@ -62,7 +62,8 @@ def _register_fakes():
 
     @register("flash_attn_legacy::with_kvcache")
     def _(q, k_cache, v_cache, cache_seqlens, softmax_scale, is_causal=False, window_left=-1, window_right=-1,
-          softcap=0.0, sinks=None, num_splits=0, cache_leftpad=None, block_table=None, key_mask=None):
+          softcap=0.0, sinks=None, num_splits=0, cache_leftpad=None, block_table=None, key_mask=None,
+          uniform_seqlen=-1):
         B, q_len, H_q, _ = q.shape
         return q.new_empty(q.shape), q.new_empty((B, H_q, q_len), dtype=torch.float32)
 
@@ -627,19 +628,17 @@ def flash_attn_with_kvcache(
         raise RuntimeError("flash_attn_with_kvcache is inference only (no autograd): run under torch.no_grad()")
     if q.dim() != 4 or k_cache.dim() != 4:
         raise ValueError("q must be [B, q_len, H_q, d] and k_cache / v_cache [B, max_len, H_kv, d]")
-    B = q.shape[0]
     if block_table is not None:
         block_table = _batch_int_tensor(block_table, "block_table", q.device)
         if block_table.dim() != 2:
             raise ValueError(f"block_table must be [B, max_blocks], got {tuple(block_table.shape)}")
     max_len = k_cache.shape[1] * (block_table.shape[1] if block_table is not None else 1)
-    if cache_seqlens is None:
-        cache_seqlens = max_len
+    uniform_seqlen = -1  # an int cache_seqlens goes to the kernel as it is (no tensor to build)
     if isinstance(cache_seqlens, numbers.Integral) and not isinstance(cache_seqlens, bool):
         if not 0 <= cache_seqlens <= max_len:
             raise ValueError(f"cache_seqlens={cache_seqlens} outside [0, max_len={max_len}]")
-        cache_seqlens = torch.full((B,), int(cache_seqlens), dtype=torch.int32, device=q.device)
-    else:
+        uniform_seqlen, cache_seqlens = int(cache_seqlens), None
+    elif cache_seqlens is not None:
         cache_seqlens = _batch_int_tensor(cache_seqlens, "cache_seqlens", q.device)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -650,5 +649,5 @@ def flash_attn_with_kvcache(
     if cache_leftpad is not None:
         cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
     out, lse = _ops.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal, *window_size, softcap,
-                                 sinks, num_splits, cache_leftpad, block_table, key_mask)
+                                 sinks, num_splits, cache_leftpad, block_table, key_mask, uniform_seqlen)
     return (out, lse) if return_softmax_lse else out

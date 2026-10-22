@@ -104,7 +104,7 @@ decode_kernel(DecodeParams p) {
     const int li = lane % G;                      // lane within the key group
     const int grp = warp * GW + lane / G;         // key group within the block
     const bool active = li < p.head_dim / 8;      // owns columns [8 li, 8 li + 8)
-    const int seqlen = min(max(p.cache_seqlens[b], 0), p.max_len);  // never past the cache
+    const int seqlen = min(max(p.cache_seqlens ? p.cache_seqlens[b] : p.uniform_seqlen, 0), p.max_len);  // in the cache
     const KeyWindow w(p.window_left, p.window_right, p.q_len, seqlen);
     const ScoreMap sm(p.softmax_scale, p.softcap);
 

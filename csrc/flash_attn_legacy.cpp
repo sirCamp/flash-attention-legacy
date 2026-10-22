@@ -663,10 +663,10 @@ static void check_decode_layout(const torch::Tensor& t, const char* name) {
 }
 
 std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, c10::optional<torch::Tensor> cache_seqlens,
     double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad,
-    c10::optional<torch::Tensor> block_table, c10::optional<torch::Tensor> key_mask
+    c10::optional<torch::Tensor> block_table, c10::optional<torch::Tensor> key_mask, int64_t uniform_seqlen
 ) {
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d] "
@@ -708,7 +708,12 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     q = contiguous_aligned(q);
     check_decode_layout(k_cache, "k_cache");
     check_decode_layout(v_cache, "v_cache");
-    cache_seqlens = check_batch_int32(cache_seqlens, q, B, "cache_seqlens");
+    torch::Tensor seqlens;  // undefined: every row ends at uniform_seqlen (-1: max_len)
+    if (cache_seqlens.has_value() && cache_seqlens->defined()) {
+        seqlens = check_batch_int32(*cache_seqlens, q, B, "cache_seqlens");
+    }
+    TORCH_CHECK(uniform_seqlen >= -1 && uniform_seqlen <= max_len, "uniform_seqlen=", uniform_seqlen,
+                " outside [0, max_len=", max_len, "] (-1: max_len)");
     torch::Tensor leftpad;
     if (cache_leftpad.has_value() && cache_leftpad->defined()) {
         leftpad = check_batch_int32(*cache_leftpad, q, B, "cache_leftpad");
@@ -734,7 +739,8 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     DecodeParams p = {};
     p.q = q.data_ptr(); p.k = k_cache.data_ptr(); p.v = v_cache.data_ptr(); p.out = out.data_ptr();
     p.lse = lse.data_ptr<float>();
-    p.cache_seqlens = cache_seqlens.data_ptr<int>();
+    p.cache_seqlens = seqlens.defined() ? seqlens.data_ptr<int>() : nullptr;
+    p.uniform_seqlen = uniform_seqlen >= 0 ? int(uniform_seqlen) : max_len;
     p.cache_leftpad = leftpad.defined() ? leftpad.data_ptr<int>() : nullptr;
     p.block_table = paged ? table.data_ptr<int>() : nullptr;
     p.max_blocks = paged ? table.size(1) : 0;
@@ -792,10 +798,10 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "Tensor cu_seqlens_k, int max_seqlen_q, int max_seqlen_k, float softmax_scale, bool is_causal=False, "
           "int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None, bool validate=True) "
           "-> (Tensor, Tensor, Tensor, Tensor)");
-    m.def("with_kvcache(Tensor q, Tensor k_cache, Tensor v_cache, Tensor cache_seqlens, float softmax_scale, "
+    m.def("with_kvcache(Tensor q, Tensor k_cache, Tensor v_cache, Tensor? cache_seqlens, float softmax_scale, "
           "bool is_causal=False, int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None, "
-          "int num_splits=0, Tensor? cache_leftpad=None, Tensor? block_table=None, Tensor? key_mask=None) "
-          "-> (Tensor, Tensor)");
+          "int num_splits=0, Tensor? cache_leftpad=None, Tensor? block_table=None, Tensor? key_mask=None, "
+          "int uniform_seqlen=-1) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
