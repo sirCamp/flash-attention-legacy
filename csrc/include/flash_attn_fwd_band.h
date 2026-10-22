@@ -249,7 +249,7 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.seq_len_q = p.seq_len_q;
     a.seq_len_k = p.seq_len_k;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
-    a.softmax_scale = p.softmax_scale;
+    a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
     a.softcap = p.softcap;
     a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
     a.window_left = p.window_left;
@@ -287,7 +287,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.seq_len_q = seq_len_q;
     a.seq_len_k = p.cu_seqlens_k[seq_idx + 1] - k_start_tok;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
-    a.softmax_scale = p.softmax_scale;
+    a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
     a.softcap = p.softcap;
     a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
     a.window_left = p.window_left;

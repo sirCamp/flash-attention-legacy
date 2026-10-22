@@ -247,17 +247,22 @@ def test_unpad_non_fp16_inference(monkeypatch, dtype):
     torch.testing.assert_close(out.float()[real], ref[real], atol=2e-2, rtol=2e-2)
 
 
-def test_unpad_fp16_overflow_falls_back_finite():
-    """fp32 padded inputs beyond the fp16 range: SDPA fallback with the padding and
-    causal mask; left-padded query rows (no visible key) stay finite."""
+def test_unpad_beyond_fp16_on_kernel(monkeypatch):
+    """fp32 padded inputs beyond the fp16 range: on the varlen kernel (scaled into
+    fp16 on the device), every valid row within fp16 accuracy of SDPA in fp32."""
+    torch.manual_seed(0)
     q, k, v = (torch.randn(2, 4, 16, 64, device="cuda", dtype=torch.float32) for _ in range(3))
     v[0, 0, 10, 0] = 1e6
     pad = torch.ones(2, 16, dtype=torch.bool, device="cuda")
     pad[1, :5] = False
+    counter = KernelCounter(monkeypatch)
     with torch.no_grad():
         out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad)
-    assert fallback_stats() == {"fp16_overflow": 1}
+    mask = pad[:, None, None, :] & torch.ones(16, 16, dtype=torch.bool, device="cuda").tril()
+    ref = torch.nan_to_num(torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)).transpose(1, 2)
+    assert counter.varlen_calls and fallback_stats() == {}
     assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[pad], ref[pad], atol=2e-2 * 1e6 / 16, rtol=2e-2)
 
 
 def test_fp16_autocast_training_runs_on_kernel(monkeypatch):
@@ -311,7 +316,7 @@ def test_autocast_mixed_dtypes_run_on_kernel(monkeypatch, padded):
 
 def test_autocast_skips_range_check():
     """fp16 autocast semantics (as SDPA there): values beyond fp16 are cast, not
-    rejected (no FP16RangeError, no fallback); the GradScaler handles inf."""
+    rejected (no fallback); the GradScaler handles inf."""
     q, k, v = (t.float() for t in _qkv())
     v[0, 0, 3, 0] = 1e6
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
@@ -1327,7 +1332,7 @@ def test_non_fp16_models_run_kernel(monkeypatch, arch, dtype):
     counter = KernelCounter(monkeypatch)
     out = logits(load_impl(base, "flash_attn_legacy", dtype), ids)
     # every layer, sliding ones included (P4.1)
-    assert len(counter.calls) == base.config.num_hidden_layers and "fp16_overflow" not in fallback_stats()
+    assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
     assert_close_to_gold(out, gold, noise, f"{arch} {dtype}")
 
 
@@ -1355,7 +1360,9 @@ def test_bf16_training_falls_back_and_matches_gold():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("where", ["v", "k", "segments"])
-def test_fp16_overflow_falls_back_in_original_dtype(dtype, where):
+def test_beyond_fp16_on_kernel(dtype, where):
+    """bf16 / fp32 values beyond the fp16 range run on the kernel (scaled into fp16
+    on the device), within fp16 accuracy of SDPA in the original dtype."""
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1], dtype=dtype)
     (k if where == "k" else v)[0, 0, 3, 5] = 1e5  # beyond fp16 (65504)
@@ -1370,9 +1377,9 @@ def test_fp16_overflow_falls_back_in_original_dtype(dtype, where):
     else:
         ref = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=0.125).transpose(1, 2)
-    assert fallback_stats() == {"fp16_overflow": 1}
+    assert fallback_stats() == {}
     assert out.dtype == dtype and torch.isfinite(out).all()
-    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2 * ref.float().abs().max().item(), rtol=3e-2)
 
 
 def test_bf16_eval_with_grad_enabled_warns(caplog):

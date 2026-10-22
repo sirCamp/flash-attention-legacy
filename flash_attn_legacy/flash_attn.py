@@ -23,8 +23,10 @@ except ImportError as e:
     )
 
 
-# The kernels compute in fp16. bf16 / fp32 inputs are converted (exact within the
-# fp16 range up to fp16 precision) and the output is converted back.
+# The kernels compute in fp16. bf16 / fp32 inputs are scaled by powers of 2 into
+# the fp16 range and converted (see _to_fp16); the output is converted back.
+# FP16RangeError / _check_fp16_range remain for FlashMultiHeadAttention training
+# with non-fp16 weights (a plain cast there, as before).
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _FP16_MAX = 65504.0
 
@@ -44,25 +46,61 @@ def _check_fp16_range(*tensors):
                              f"range or contain NaN (max |x| = {amax.item():.4g})")
 
 
-def _to_fp16(q, k, v):
-    """Convert non-fp16 inputs to fp16.
+# Peak magnitude of bf16 / fp32 inputs scaled into fp16 (65504 = 2^16 - 2^5): one
+# power of 2 below the max leaves room for the rounding of the largest values.
+_FP16_SCALED_PEAK = 2.0 ** 14
 
-    Under fp16 autocast this is autocast's own semantics (as SDPA there): a plain
-    cast, gradients allowed (the GradScaler that fp16 autocast training needs
-    handles underflow and inf). Otherwise the values are range-checked
-    (FP16RangeError, one host sync) and gradients are not supported: without loss
-    scaling, bf16/fp32 training gradients may underflow in fp16 (docs/PLAN.md P6.2)."""
+
+def _pow2_exponent(t):
+    """Exponent e (fp32 0-d tensor on t's device, no host sync) such that t * 2^e
+    peaks in [2^13, 2^14]; 126 for an all-zero t (stays zero). 0 when t holds an
+    inf or NaN or is empty: a plain cast, so a non-finite value only affects its
+    own rows, as in eager attention (not the scale of the whole tensor)."""
+    if t.numel() == 0:
+        return torch.zeros((), device=t.device)
+    amax = torch.linalg.vector_norm(t.detach(), float("inf")).float()
+    e = torch.floor(torch.log2(_FP16_SCALED_PEAK / amax)).clamp(-126, 126)
+    return torch.where(torch.isfinite(amax), e, torch.zeros_like(e))
+
+
+def _scaled_half(t, e):
+    """t * 2^e as fp16 in one pass (exact for a power of 2)."""
+    return torch.mul(t, torch.exp2(e).to(t.dtype), out=torch.empty(t.shape, dtype=torch.float16, device=t.device))
+
+
+def _to_fp16(q, k, v, sinks=None):
+    """fp16 inputs for the kernels, as (q, k, v, score_scale, out_scale).
+
+    fp16: unchanged. Under fp16 autocast: autocast's own semantics (as SDPA
+    there), a plain cast, gradients allowed (the GradScaler that fp16 autocast
+    training needs handles underflow and inf). Otherwise (bf16 / fp32 inference)
+    each of q, k, v is scaled by a power of 2 into the fp16 range on the device
+    (exact; no range check, no host sync, values beyond 65504 included): the
+    kernel multiplies softmax_scale by score_scale = 1 / (s_q s_k) (fp32 [1]) and
+    the output is multiplied by out_scale = 1 / s_v. One scale per tensor: rows far
+    below the tensor's peak (< 2^-24 of it) lose precision. Gradients (also of the
+    sinks) are not supported there: bf16 / fp32 training runs fp16 autocast +
+    GradScaler on these GPUs (transformers' Trainer refuses bf16 before Ampere)."""
     if q.dtype == torch.float16:
-        return q, k, v
+        return q, k, v, None, None
     if fp16_autocast_active():
-        return q.half(), k.half(), v.half()
-    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        return q.half(), k.half(), v.half(), None, None
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (q, k, v, sinks)):
         raise NotImplementedError(
             f"flash_attn_legacy: training with {q.dtype} inputs is not supported (the kernels "
-            "compute in fp16 and gradients may underflow without loss scaling); use fp16 "
+            "compute in fp16 and gradients may underflow without loss scaling); use fp16 autocast "
             "with a GradScaler, or run inference under torch.inference_mode()")
-    _check_fp16_range(q, k, v)
-    return q.half(), k.half(), v.half()
+    e_q, e_k, e_v = _pow2_exponent(q), _pow2_exponent(k), _pow2_exponent(v)
+    score_scale = torch.exp2(-(e_q + e_k)).reshape(1)  # from the exponents: no overflow of s_q * s_k
+    return _scaled_half(q, e_q), _scaled_half(k, e_k), _scaled_half(v, e_v), score_scale, torch.exp2(-e_v)
+
+
+def _from_fp16(out, dtype, out_scale):
+    """Kernel output back to the inputs' dtype (and scale, see _to_fp16)."""
+    if dtype == torch.float16:
+        return out
+    out = out.to(dtype)
+    return out if out_scale is None else out * out_scale.to(dtype)
 
 
 def _check_inputs(q, k, v, ndim):
@@ -124,7 +162,7 @@ class FlashAttentionFunc(Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal, window_size, softcap, sinks):
+    def forward(ctx, q, k, v, softmax_scale, causal, window_size, softcap, sinks, score_scale=None):
         _check_inputs(q, k, v, ndim=4)
         d = q.shape[-1]
         check_head_dim(d)
@@ -133,7 +171,8 @@ class FlashAttentionFunc(Function):
         if H_q % H_kv != 0:
             raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap, sinks)
+        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap, sinks,
+                                                score_scale)
 
         ctx.save_for_backward(q, k, v, o, lse, sinks)
         ctx.softmax_scale = softmax_scale
@@ -151,7 +190,7 @@ class FlashAttentionFunc(Function):
             ctx.softmax_scale, ctx.causal, *ctx.window_size, ctx.softcap,
             sinks if ctx.needs_input_grad[7] else None,  # None: no sink gradient computed
         )
-        return dq, dk, dv, None, None, None, None, _sinks_grad(dsinks, sinks)
+        return dq, dk, dv, None, None, None, None, _sinks_grad(dsinks, sinks), None
 
 
 def _sinks_grad(dsinks, sinks):
@@ -196,8 +235,9 @@ def flash_attention(
 
     Args:
         q: Query [B, H_q, N, d] float16. bfloat16 / float32 are converted to fp16:
-           under fp16 autocast like autocast does (training allowed, no range
-           check); otherwise for inference only, range-checked (FP16RangeError)
+           under fp16 autocast like autocast does (training allowed); otherwise
+           for inference only, scaled by powers of 2 into the fp16 range on the
+           device (exact, no host sync, any magnitude)
         k: Key   [B, H_kv, N, d], same dtype as q
         v: Value [B, H_kv, N, d], same dtype as q
         softmax_scale: default 1/sqrt(d)
@@ -224,8 +264,9 @@ def flash_attention(
     _check_inputs(q, k, v, ndim=4)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
     sinks = _check_sinks(sinks, q.shape[1], q.device)
-    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size, softcap, sinks)
-    return out if q.dtype == torch.float16 else out.to(q.dtype)
+    q16, k16, v16, score_scale, out_scale = _to_fp16(q, k, v, sinks)
+    out = FlashAttentionFunc.apply(q16, k16, v16, softmax_scale, causal, window_size, softcap, sinks, score_scale)
+    return _from_fp16(out, q.dtype, out_scale)
 
 
 class FlashAttnVarlenFunc(Function):
@@ -236,7 +277,8 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate):
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate,
+                score_scale=None):
         _check_inputs(q, k, v, ndim=3)
         check_head_dim(q.shape[-1])
 
@@ -246,7 +288,7 @@ class FlashAttnVarlenFunc(Function):
 
         o, lse = flash_attn_legacy_cuda.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, sinks, validate,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, sinks, score_scale, validate,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k, sinks)
@@ -267,7 +309,7 @@ class FlashAttnVarlenFunc(Function):
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal, *ctx.window_size,
             ctx.softcap, sinks if ctx.needs_input_grad[11] else None, ctx.validate,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, _sinks_grad(dsinks, sinks), None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, _sinks_grad(dsinks, sinks), None, None
 
 
 def flash_attn_varlen_func(
@@ -335,11 +377,12 @@ def flash_attn_varlen_func(
     _check_inputs(q, k, v, ndim=3)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
     sinks = _check_sinks(sinks, q.shape[1], q.device)
+    q16, k16, v16, score_scale, out_scale = _to_fp16(q, k, v, sinks)
     out = FlashAttnVarlenFunc.apply(
-        *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate,
+        q16, k16, v16, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate, score_scale,
     )
-    return out if q.dtype == torch.float16 else out.to(q.dtype)
+    return _from_fp16(out, q.dtype, out_scale)
 
 
 class FlashAttention(nn.Module):
@@ -436,7 +479,7 @@ class FlashMultiHeadAttention(nn.Module):
             _check_fp16_range(q, k, v)
             q, k, v = q.half(), k.half(), v.half()
 
-        out = flash_attention(q, k, v, self.scale, self.causal)  # bf16/fp32: range-checked
+        out = flash_attention(q, k, v, self.scale, self.causal)  # bf16/fp32 inference: scaled into fp16
         out = out.to(orig_dtype)
 
         out = out.transpose(1, 2).contiguous().view(B, N, self.embed_dim)

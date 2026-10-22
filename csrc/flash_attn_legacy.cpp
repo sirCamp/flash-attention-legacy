@@ -150,6 +150,15 @@ static float logit_softcap(double softcap) {
     return c;
 }
 
+// softmax_scale multiplier on the device (fp32 [1]) or undefined: the power-of-2
+// scales of bf16 / fp32 inputs converted to fp16 without a host sync.
+static torch::Tensor device_score_scale(const c10::optional<torch::Tensor>& t, const torch::Tensor& Q) {
+    if (!t.has_value() || !t->defined()) return {};
+    TORCH_CHECK(t->is_cuda() && t->device() == Q.device() && t->dtype() == torch::kFloat32 && t->numel() == 1,
+                "score_scale must be one fp32 value on the device of Q");
+    return t->contiguous();
+}
+
 // Attention sinks (gpt-oss s_aux): one logit per Q head, any float dtype on Q's
 // device -> fp32 [H_q] contiguous; undefined = none. Values are not checked
 // (no host sync): a finite logit, or -inf for a head without sink.
@@ -266,7 +275,7 @@ static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, con
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
-    c10::optional<torch::Tensor> sinks
+    c10::optional<torch::Tensor> sinks, c10::optional<torch::Tensor> score_scale
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
@@ -319,6 +328,8 @@ std::vector<torch::Tensor> flash_attn_forward(
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
     p.softcap = logit_softcap(softcap);
     p.sinks = data_or_null(sink);
+    const torch::Tensor scale_dev = device_score_scale(score_scale, Q);
+    p.score_scale = data_or_null(scale_dev);
 
     p.q_batch_stride = Q.stride(0); p.q_head_stride = Q.stride(1); p.q_seq_stride = Q.stride(2);
     p.k_batch_stride = K.stride(0); p.k_head_stride = K.stride(1); p.k_seq_stride = K.stride(2);
@@ -454,7 +465,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
     float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
-    c10::optional<torch::Tensor> sinks, bool validate
+    c10::optional<torch::Tensor> sinks, c10::optional<torch::Tensor> score_scale, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
     check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
@@ -504,6 +515,8 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
     p.softcap = logit_softcap(softcap);
     p.sinks = data_or_null(sink);
+    const torch::Tensor scale_dev = device_score_scale(score_scale, Q);
+    p.score_scale = data_or_null(scale_dev);
 
     p.q_token_stride = Q.stride(0); p.q_head_stride = Q.stride(1);
     p.k_token_stride = K.stride(0); p.k_head_stride = K.stride(1);
@@ -750,14 +763,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none());
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(),
+          py::arg("score_scale") = py::none());
     m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
           "Flash Attention v2 forward — variable-length packed sequences",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(), py::arg("validate") = true);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(),
+          py::arg("score_scale") = py::none(), py::arg("validate") = true);
     m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
           "Flash Attention v2 backward — variable-length packed sequences, one launch",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),

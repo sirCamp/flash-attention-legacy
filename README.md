@@ -44,7 +44,7 @@ Head dimensions: **d = 32, 64, 72, 80, 96, 128, 256** (72 and 80, as in SigLIP /
 
 The kernels compute in **FP16**.
 - **Mixed precision** (`torch.autocast("cuda", dtype=torch.float16)` with a `GradScaler`): BF16/FP32 inputs are cast to FP16 exactly as autocast does for SDPA (no range check), training included.
-- **Outside autocast**, BF16 and FP32 inputs are accepted for inference: they are converted to FP16 with a range check (values beyond 65504 raise `FP16RangeError`; through HuggingFace the call falls back to SDPA in the original dtype). Training with BF16/FP32 inputs outside fp16 autocast is not supported by the kernels (FP16 gradients without loss scaling may underflow); through HuggingFace it falls back to SDPA.
+- **Outside autocast**, BF16 and FP32 inputs (e.g. a checkpoint loaded in bf16 as it is) run on the kernels for inference: q, k, v are scaled by powers of 2 into the FP16 range on the GPU (exact, no host sync, any magnitude) and the output comes back in the input dtype; the decode kernel reads BF16 caches natively. Training with BF16/FP32 inputs outside fp16 autocast is not supported by the kernels (FP16 gradients without loss scaling may underflow; transformers' Trainer itself requires fp16 AMP before Ampere); through HuggingFace it falls back to SDPA.
 
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 
@@ -108,7 +108,7 @@ The integration decides **per attention call** whether our kernel can run, and n
 | Sliding-window layers (Mistral, Gemma 3, Phi-3, ...), also with padding or packing | kernel (`window_size`, blocks outside the window skipped) |
 | Packed sequences (`position_ids` restarting at 0, or `cu_seq_lens`), VLM vision encoders (Qwen2/2.5/3-VL, Pixtral, ...) | kernel (varlen) |
 | Padded batches (left or right padding, training and generation prefill), encoders and cross-attention with padded inputs | kernel (varlen, unpadded; causal: padded query rows output 0, as FlashAttention-2) |
-| BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
+| BF16 / FP32 inference | kernel (FP16 compute, inputs scaled into range on the GPU) |
 | Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
 | Decode (`q_len == 1`): dynamic / static caches, left padding, sliding window, softcap, sinks, FP16 or BF16 caches | decode kernel (`flash_attn_with_kvcache`, split-KV, the cache read in place) |
 | Padding with holes inside a row, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast, FP32 decode, more than 8 query heads per KV head in decode | SDPA fallback |

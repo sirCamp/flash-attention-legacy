@@ -5,11 +5,29 @@ Run:  pytest tests/test_flash_attn.py -v
       pytest tests/test_flash_attn.py -v -k "gqa"     # GQA tests only
 """
 
+import contextlib
 import math
+import warnings
+
 import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@contextlib.contextmanager
+def no_host_sync():
+    """Fail on any host-device synchronization inside the block (torch's sync
+    debug mode; its "prototype feature" warning silenced)."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Synchronization debug mode")
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Synchronization debug mode")
+            torch.cuda.set_sync_debug_mode("default")
 
 
 # ---------------------------------------------------------------------------
@@ -1488,22 +1506,41 @@ class TestValidation:
             flash_attention(q, k.bfloat16(), v)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
-    def test_non_fp16_inference_is_fp16_compute(self, dtype):
-        """bf16/fp32 inputs: same result as converting to fp16 first, output in dtype."""
+    @pytest.mark.parametrize("qk_mag,v_mag", [(1.0, 1.0), (1e3, 1e6), (1e-3, 1e-6), (300.0, 7e4)],
+                             ids=["unit", "huge", "tiny", "beyond_fp16"])
+    def test_non_fp16_inference_scaled(self, dtype, qk_mag, v_mag):
+        """bf16 / fp32 inputs of any magnitude: scaled by powers of 2 into fp16 on
+        the device (no host sync), output in dtype, relative accuracy of fp16."""
         from flash_attn_legacy import flash_attention
-        q, k, v = self._qkv(dtype=dtype)
-        out = flash_attention(q, k, v, causal=True)
-        ref = flash_attention(q.half(), k.half(), v.half(), causal=True)
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(2, 4, 130, 64, device="cuda", dtype=dtype) for _ in range(3))
+        q, k, v = q * qk_mag, k * qk_mag, v * v_mag
+        scale = 0.125 / (qk_mag * qk_mag)  # keeps the logits O(1) whatever the input magnitude
+        with no_host_sync():
+            out = flash_attention(q, k, v, softmax_scale=scale, causal=True)
+        s = (q.double() @ k.double().transpose(-1, -2)) * scale
+        s = s.masked_fill(ref_hidden(130, 130, True, (-1, -1), "cuda"), float("-inf"))
+        ref = torch.softmax(s, -1) @ v.double()
         assert out.dtype == dtype
-        torch.testing.assert_close(out, ref.to(dtype), atol=0, rtol=0)
+        torch.testing.assert_close(out.double(), ref, atol=2e-2 * v_mag, rtol=2e-2)
 
-    def test_non_fp16_out_of_range_raises(self):
-        from flash_attn_legacy import flash_attention
-        from flash_attn_legacy.flash_attn import FP16RangeError
-        q, k, v = self._qkv(dtype=torch.bfloat16)
-        k[0, 0, 1, 2] = 7e4
-        with pytest.raises(FP16RangeError):
-            flash_attention(q, k, v)
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+    def test_non_fp16_varlen_scaled(self, dtype):
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        lens = [5, 70, 33]
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
+        q, k, v = (torch.randn(sum(lens), 4, 64, device="cuda", dtype=dtype) for _ in range(3))
+        v = v * 1e5  # beyond fp16
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max(lens), max(lens), causal=True)
+        s0 = 0
+        for n in lens:
+            def seq(t):
+                return t[s0:s0 + n].permute(1, 0, 2).unsqueeze(0).float()
+            ref = ref_attention(seq(q), seq(k), seq(v) / 1e5, 0.125, True).float() * 1e5
+            torch.testing.assert_close(out[s0:s0 + n].float(), ref.squeeze(0).permute(1, 0, 2),
+                                       atol=2e-2 * 1e5, rtol=2e-2)
+            s0 += n
 
     @pytest.mark.parametrize("n_q,n_k", [(0, 16), (16, 0), (0, 0)])
     def test_empty_sequences(self, n_q, n_k):
@@ -1546,25 +1583,73 @@ class TestValidation:
         with pytest.raises(RuntimeError, match="no .* tile for head_dim 256 fits 32768"):
             flash_attention(q, k, v)
 
-    def test_nan_does_not_hide_overflow(self):
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")], ids=["inf", "nan"])
+    def test_non_finite_stays_local(self, bad):
+        """An inf / NaN in one head of bf16 inputs: that tensor gets a plain cast
+        (no scale computed from a non-finite peak), the other heads are exact."""
         from flash_attn_legacy import flash_attention
-        from flash_attn_legacy.flash_attn import FP16RangeError
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+        k[0, 2, 5, 3] = bad
+        out = flash_attention(q, k, v, causal=True)
+        ref = ref_attention(q.float(), k.float(), v.float(), 0.125, True).float()
+        keep = [0, 1, 3]
+        torch.testing.assert_close(out[:, keep].float(), ref[:, keep], atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize("what", ["zero_qk", "zero_v", "softcap_sinks"])
+    def test_non_fp16_special_inputs(self, what):
+        """All-zero tensors (scale 2^126, still zero) and softcap / sinks, whose
+        logits use the corrected softmax scale, with fp32 inputs at large scale."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(2, 4, 50, 64, device="cuda", dtype=torch.float32) for _ in range(3))
+        kw, ref_kw = {}, {}
+        if what == "zero_qk":
+            q, k = q * 0, k * 0
+        elif what == "zero_v":
+            v = v * 0
+        else:
+            q, k = q * 100, k * 100
+            sinks = torch.randn(4, device="cuda")
+            kw = dict(softcap=5.0, sinks=sinks)
+            ref_kw = dict(softcap=5.0, sinks=sinks)
+        scale = 0.125 / (1e4 if what == "softcap_sinks" else 1)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=True, **kw)
+        ref = ref_attention(q, k, v, scale, True, **ref_kw).float()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    def test_non_fp16_varlen_no_sync(self):
+        from flash_attn_legacy import flash_attn_varlen_func
+        q = torch.randn(50, 4, 64, device="cuda", dtype=torch.bfloat16)
+        cu = torch.tensor([0, 20, 50], dtype=torch.int32, device="cuda")
+        with no_host_sync():
+            flash_attn_varlen_func(q, q, q, cu, cu, 30, 30, causal=True, validate=False)
+
+    def test_non_fp16_sink_gradient_raises(self):
+        """bf16 inputs with trainable sinks is training: not supported (no silent
+        backward through scaled tensors)."""
+        from flash_attn_legacy import flash_attention
+        q = torch.randn(1, 4, 16, 64, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.zeros(4, device="cuda", requires_grad=True)
+        with pytest.raises(NotImplementedError):
+            flash_attention(q, q, q, sinks=sinks)
+
+    def test_nan_propagates(self):
+        """A NaN input gives NaN outputs, as eager attention (no exception)."""
+        from flash_attn_legacy import flash_attention
         q, k, v = self._qkv(dtype=torch.float32)
         k[0, 0, 0, 0], k[0, 0, 1, 1] = float("nan"), 1e5
-        with pytest.raises(FP16RangeError):
-            flash_attention(q, k, v)
+        assert torch.isnan(flash_attention(q, k, v)).any()
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
     def test_mha_module_non_fp16(self, dtype):
-        """FlashMultiHeadAttention: range-checked in inference, warns in training."""
+        """FlashMultiHeadAttention: any magnitude in inference, warns in training."""
         from flash_attn_legacy import FlashMultiHeadAttention
-        from flash_attn_legacy.flash_attn import FP16RangeError
         mha = FlashMultiHeadAttention(256, num_heads=4, causal=True).cuda().to(dtype)
         x = torch.randn(1, 32, 256, device="cuda", dtype=dtype)
         with torch.no_grad():
             assert mha(x).dtype == dtype
-            with pytest.raises(FP16RangeError):
-                mha(x * 1e6)
+            assert torch.isfinite(mha(x * 1e6)).all()
         with pytest.warns(UserWarning, match="GradScaler"):
             mha(x).sum().backward()
 

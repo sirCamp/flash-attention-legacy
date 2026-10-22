@@ -68,8 +68,6 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "head_dim": FallbackReason(f"head_dim not in {SUPPORTED_HEAD_DIMS}"),
     "v_head_dim": FallbackReason("V head_dim != Q head_dim (e.g. MLA)"),
     "dropout": FallbackReason("attention dropout in training mode"),
-    "fp16_overflow": FallbackReason(
-        "non-fp16 inputs (bf16/fp32) exceed the fp16 range the kernel computes in"),
     "non_fp16_training": FallbackReason(
         "bf16/fp32 training: kernel gradients are fp16 and may underflow without loss "
         "scaling (docs/PLAN.md P6.2)"),
@@ -593,44 +591,41 @@ def flash_attn_legacy_forward(
     attn_output = None
     if reason is None:
         # Our flash kernel (O(N) memory), batched or varlen. bf16 / fp32 inputs are
-        # converted to fp16 by the API, which raises FP16RangeError on overflow.
-        from .flash_attn import FP16RangeError, flash_attention, flash_attn_varlen_func, flash_attn_with_kvcache
+        # scaled into fp16 by the API on the device (any magnitude, no host sync).
+        from .flash_attn import flash_attention, flash_attn_varlen_func, flash_attn_with_kvcache
 
-        try:
-            if q_len == 1:
-                # Decode: the cache [B, H_kv, N, d] read in place as a [B, N, H_kv, d] view
-                leftpad, seqlens = decode_pad if decode_pad is not None else (None, kv_len)
-                attn_output = flash_attn_with_kvcache(
-                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-                    cache_seqlens=seqlens, cache_leftpad=leftpad, softmax_scale=scaling, causal=is_causal,
-                    window_size=window_size, softcap=softcap, sinks=sinks).transpose(1, 2)
-            elif unpad is not None:
-                # [B, H, n, d] -> rows [B * n, H, d] for the varlen kernel; query rows
-                # left out of the plan (causal padding) get 0 (index_copy keeps autograd)
-                q_idx, k_idx, cu_q, cu_k, max_q, max_k = unpad
+        if q_len == 1:
+            # Decode: the cache [B, H_kv, N, d] read in place as a [B, N, H_kv, d] view
+            leftpad, seqlens = decode_pad if decode_pad is not None else (None, kv_len)
+            attn_output = flash_attn_with_kvcache(
+                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+                cache_seqlens=seqlens, cache_leftpad=leftpad, softmax_scale=scaling, causal=is_causal,
+                window_size=window_size, softcap=softcap, sinks=sinks).transpose(1, 2)
+        elif unpad is not None:
+            # [B, H, n, d] -> rows [B * n, H, d] for the varlen kernel; query rows
+            # left out of the plan (causal padding) get 0 (index_copy keeps autograd)
+            q_idx, k_idx, cu_q, cu_k, max_q, max_k = unpad
 
-                def rows(t, idx):
-                    return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
-                out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
-                                             cu_q, cu_k, max_q, max_k, softmax_scale=scaling,
-                                             causal=is_causal, window_size=window_size, softcap=softcap,
-                                             sinks=sinks, validate=False)  # built by _unpad_plan
-                attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
-                               .view(B, q_len, H_q, -1).transpose(1, 2))
-            elif segments is None:
-                attn_output = flash_attention(query, key, value, softmax_scale=scaling, causal=is_causal,
-                                              window_size=window_size, softcap=softcap, sinks=sinks)
-            else:
-                cu_seqlens, max_len = segments
-                packed = [t[0].transpose(0, 1) for t in (query, key, value)]  # [N, H, d]
-                attn_output = flash_attn_varlen_func(
-                    *packed, cu_seqlens, cu_seqlens, max_len, max_len,
-                    softmax_scale=scaling, causal=is_causal, window_size=window_size, softcap=softcap,
-                    sinks=sinks, validate=False,  # validated / built by _packed_segments
-                ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
-        except FP16RangeError:
-            reason, detail = "fp16_overflow", f" ({query.dtype})"
-        if attn_output is not None and query.dtype == torch.float32:
+            def rows(t, idx):
+                return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
+            out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
+                                         cu_q, cu_k, max_q, max_k, softmax_scale=scaling,
+                                         causal=is_causal, window_size=window_size, softcap=softcap,
+                                         sinks=sinks, validate=False)  # built by _unpad_plan
+            attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
+                           .view(B, q_len, H_q, -1).transpose(1, 2))
+        elif segments is None:
+            attn_output = flash_attention(query, key, value, softmax_scale=scaling, causal=is_causal,
+                                          window_size=window_size, softcap=softcap, sinks=sinks)
+        else:
+            cu_seqlens, max_len = segments
+            packed = [t[0].transpose(0, 1) for t in (query, key, value)]  # [N, H, d]
+            attn_output = flash_attn_varlen_func(
+                *packed, cu_seqlens, cu_seqlens, max_len, max_len,
+                softmax_scale=scaling, causal=is_causal, window_size=window_size, softcap=softcap,
+                sinks=sinks, validate=False,  # validated / built by _packed_segments
+            ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
+        if query.dtype == torch.float32:
             _warn_once("fp32_compute", "flash_attn_legacy: float32 inputs are computed in "
                                        "float16 by the kernel (inference only)")
 
