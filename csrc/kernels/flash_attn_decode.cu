@@ -7,14 +7,16 @@
 // fp32 CUDA-core kernel serves SM 6.0-7.5. The caches are read in their own
 // dtype (fp16 or bf16) and converted in registers: no copy of the cache.
 //
-// One block per (batch row, KV head), 4 warps; the block computes the R = rep x
-// q_len query rows of that KV head (GQA: K / V read once for the group). Each
+// One block per (batch row, KV head, key split), 4 warps; the block computes the
+// R = rep x q_len query rows of that KV head (GQA: K / V read once for the group)
+// over its split of the rows' visible keys. With more than one split each block
+// writes its normalized O (fp32) and lse, and decode_combine_kernel merges them. Each
 // lane loads one 16-byte chunk of a key row: G = next_pow2(d / 8) lanes per key,
 // 32 / G keys per warp step; the group that scores key j also reads V row j and
 // owns output columns [8 * lane_in_group, +8). Each group keeps an online
 // softmax state (m, l, O) per row over its keys; groups and warps are merged
-// with the same decode_merge at the end. The sink of a row enters once (group 0
-// of warp 0 starts at m = sink, l = 1).
+// with the same decode_merge at the end (and splits in the combine). The sink of
+// a row enters once (group 0 of warp 0 of split 0 starts at m = sink, l = 1).
 // ============================================================================
 
 #include "flash_attn_common.h"
@@ -91,6 +93,7 @@ decode_kernel(DecodeParams p) {
     static_assert(D / 8 <= 32, "one 16-byte chunk per lane");
 
     const int b = blockIdx.x / p.num_heads_k, hk = blockIdx.x % p.num_heads_k;
+    const int split = blockIdx.y;
     const int rep = p.num_heads / p.num_heads_k;
     const int nrows = rep * p.q_len;              // <= R (host check)
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -114,17 +117,23 @@ decode_kernel(DecodeParams p) {
         Elem::to_float(u, q[r]);
         #pragma unroll
         for (int i = 0; i < 8; i++) o[r][i] = 0.0f;
-        const bool sink = p.sinks != nullptr && grp == 0 && r < nrows;
+        const bool sink = p.sinks != nullptr && grp == 0 && split == 0 && r < nrows;
         m[r] = sink ? p.sinks[h] * kLog2e : -INFINITY;  // the sink once per row
         l[r] = sink ? 1.0f : 0.0f;
     }
 
     const typename Elem::T* K = static_cast<const typename Elem::T*>(p.k) + b * p.k_batch_stride + hk * p.k_head_stride;
     const typename Elem::T* V = static_cast<const typename Elem::T*>(p.v) + b * p.v_batch_stride + hk * p.v_head_stride;
-    const int key_end = w.last_key(p.q_len - 1);  // inclusive; rows see keys in [first_key(0), key_end]
+    // The rows see keys [first_key(0), last_key(q_len - 1)]; this split takes
+    // `chunk` of them (a multiple of the block's NG keys per step)
+    const int key_first = w.first_key(0), key_last = w.last_key(p.q_len - 1);
+    const int range = max(key_last - key_first + 1, 0);
+    const int chunk = (cdiv(range, p.num_splits) + NG - 1) / NG * NG;
+    const int key_begin = key_first + split * chunk;
+    const int key_end = min(key_last, key_begin + chunk - 1);  // inclusive (< key_begin: empty)
     // Same trip count for every lane of a warp (the shuffles below need all 32):
     // the warp steps over GW keys at a time, keys past key_end are masked.
-    for (int j0 = w.first_key(0) + warp * GW; j0 <= key_end; j0 += NG) {
+    for (int j0 = key_begin + warp * GW; j0 <= key_end; j0 += NG) {
         const int j = j0 + lane / G;
         const bool in_range = j <= key_end;
         uint4 ku = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
@@ -188,23 +197,61 @@ decode_kernel(DecodeParams p) {
         }
         const int qi = r / rep, h = hk * rep + r % rep;
         const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;  // no visible key nor sink: O = 0
-        if (active) {
-            float f[8];
-            #pragma unroll
-            for (int i = 0; i < 8; i++) f[i] = o[r][i] * inv;
-            *reinterpret_cast<uint4*>(static_cast<typename Elem::T*>(p.out) + b * p.o_batch_stride +
-                                      qi * p.o_seq_stride + h * p.o_head_stride + 8 * li) = Elem::from_float(f);
-        }
-        if (li == 0) {
-            p.lse[(index_t(b) * p.num_heads + h) * p.q_len + qi] =
-                l[r] > 0.0f ? m[r] * kLn2 + logf(l[r]) : -INFINITY;
+        const float lse2 = l[r] > 0.0f ? m[r] + log2f(l[r]) : -INFINITY;  // log2 domain
+        float f[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) f[i] = o[r][i] * inv;
+        const index_t row = (index_t(b) * p.num_heads + h) * p.q_len + qi;  // [B, H_q, q_len]
+        if (p.num_splits == 1) {
+            if (active) {
+                *reinterpret_cast<uint4*>(static_cast<typename Elem::T*>(p.out) + b * p.o_batch_stride +
+                                          qi * p.o_seq_stride + h * p.o_head_stride + 8 * li) = Elem::from_float(f);
+            }
+            if (li == 0) p.lse[row] = lse2 * kLn2;
+        } else {  // partials of this split (empty splits too: O = 0, lse = -inf)
+            const index_t prow = index_t(split) * p.batch_size * p.num_heads * p.q_len + row;
+            if (active) {
+                float4* dst = reinterpret_cast<float4*>(p.o_part + prow * p.head_dim + 8 * li);
+                dst[0] = make_float4(f[0], f[1], f[2], f[3]);
+                dst[1] = make_float4(f[4], f[5], f[6], f[7]);
+            }
+            if (li == 0) p.lse_part[prow] = lse2;
         }
     }
 }
 
+// Merge of the splits: one thread per 8 columns of a (row, head, query); each
+// split's normalized (O_s, lse_s in log2) is the state (m = lse_s, l = 1, O_s).
+template <typename Elem>
+__global__ void decode_combine_kernel(DecodeParams p) {
+    const int vecs = p.head_dim / 8;
+    const index_t rows = index_t(p.batch_size) * p.num_heads * p.q_len;
+    const index_t idx = index_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= rows * vecs) return;
+    const index_t row = idx / vecs;
+    const int c = static_cast<int>(idx % vecs);
+    float m = -INFINITY, l = 0.0f, o[8] = {};
+    for (int s = 0; s < p.num_splits; s++) {
+        const index_t prow = index_t(s) * rows + row;
+        const float4* src = reinterpret_cast<const float4*>(p.o_part + prow * p.head_dim + 8 * c);
+        const float4 lo = src[0], hi = src[1];
+        const float o2[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        decode_merge(m, l, o, p.lse_part[prow], 1.0f, o2);
+    }
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) o[i] *= inv;
+    const int qi = static_cast<int>(row % p.q_len);
+    const int h = static_cast<int>((row / p.q_len) % p.num_heads);
+    const int b = static_cast<int>(row / (index_t(p.num_heads) * p.q_len));
+    *reinterpret_cast<uint4*>(static_cast<typename Elem::T*>(p.out) + b * p.o_batch_stride + qi * p.o_seq_stride +
+                              h * p.o_head_stride + 8 * c) = Elem::from_float(o);
+    if (c == 0) p.lse[row] = l > 0.0f ? (m + log2f(l)) * kLn2 : -INFINITY;
+}
+
 template <typename Elem, int R>
 void launch_decode_d(DecodeParams& p, cudaStream_t stream) {
-    const dim3 grid(p.batch_size * p.num_heads_k);
+    const dim3 grid(p.batch_size * p.num_heads_k, p.num_splits);
     switch (p.head_dim) {
         case 32:  decode_kernel<Elem, 32, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
         case 64:  decode_kernel<Elem, 64, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
@@ -223,12 +270,30 @@ void launch_decode_r(DecodeParams& p, cudaStream_t stream) {
     if (rows <= 1)      launch_decode_d<Elem, 1>(p, stream);
     else if (rows <= 2) launch_decode_d<Elem, 2>(p, stream);
     else                launch_decode_d<Elem, 4>(p, stream);  // rows <= 4 (host check)
+    if (p.num_splits > 1) {
+        const index_t threads = index_t(p.batch_size) * p.num_heads * p.q_len * (p.head_dim / 8);
+        decode_combine_kernel<Elem><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(p);
+    }
 }
 
 }  // namespace
 
 // Query rows per KV head the decode kernel handles in one block.
 int flash_attn_decode_max_rows() { return 4; }
+
+constexpr int kMaxDecodeSplits = 128;
+int flash_attn_decode_max_splits() { return kMaxDecodeSplits; }
+
+// Key splits for a grid of `blocks` (B * H_kv) on `sms` SMs and a cache of
+// max_len keys (no device read: CUDA-graph friendly): ~2 waves of blocks, at
+// least 256 keys per split, at most kMaxDecodeSplits. Sized by the capacity:
+// a large preallocated cache holding few keys gets more (empty) splits than
+// it needs.
+int flash_attn_decode_num_splits(int blocks, int sms, int max_len) {
+    const int want = cdiv(2 * sms * 4, blocks);  // ~4 resident blocks of 4 warps per SM, 2 waves
+    const int by_len = max(max_len / 256, 1);
+    return max(1, min(min(want, by_len), kMaxDecodeSplits));
+}
 
 void flash_attn_decode(DecodeParams& p, bool bf16, cudaStream_t stream) {
     if (bf16) launch_decode_r<Bf16Elem>(p, stream);

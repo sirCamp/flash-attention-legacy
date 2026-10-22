@@ -1197,7 +1197,8 @@ class TestKVCache:
                                                 (1, 3, 1)])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
     @pytest.mark.parametrize("layout", ["bshd", "bhsd_view"])
-    def test_decode(self, head_dim, q_len, H_q, H_kv, dtype, layout):
+    @pytest.mark.parametrize("num_splits", [1, 4], ids=["one_split", "splits4"])  # 4: empty splits for short rows
+    def test_decode(self, head_dim, q_len, H_q, H_kv, dtype, layout, num_splits):
         from flash_attn_legacy import flash_attn_with_kvcache
         max_len = 300
         q, k, v = self._case(5, q_len, H_q, H_kv, head_dim, max_len, dtype, layout)
@@ -1206,14 +1207,16 @@ class TestKVCache:
         scale = 1.0 / math.sqrt(head_dim)
         cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
         with torch.no_grad():
-            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=True, return_softmax_lse=True)
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=True, num_splits=num_splits,
+                                               return_softmax_lse=True)
         ref_out, ref_lse = self._ref(q, k, v, seqlens, scale, causal=True)
         self._check(out, lse, ref_out, ref_lse, dtype)
         assert (out[2] == 0).all()  # no key: O = 0, lse = -inf
 
     @pytest.mark.parametrize("feature", ["window", "window_right", "softcap", "sinks", "non_causal", "int_seqlens"])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-    def test_features(self, head_dim, feature, dtype):
+    @pytest.mark.parametrize("num_splits", [1, 3], ids=["one_split", "splits3"])  # sinks once across splits
+    def test_features(self, head_dim, feature, dtype, num_splits):
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(3, 2, 4, 2, head_dim, 200, dtype, "bshd", seed=1)
         seqlens = [200, 50, 1]
@@ -1237,7 +1240,8 @@ class TestKVCache:
             cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
         self._poison(k, v, seqlens)
         with torch.no_grad():
-            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=causal, return_softmax_lse=True, **kw)
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=causal, num_splits=num_splits,
+                                               return_softmax_lse=True, **kw)
         ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), **ref_kw)
         self._check(out, lse, ref_out, ref_lse, dtype)
 
@@ -1255,15 +1259,56 @@ class TestKVCache:
                 with pytest.raises(ValueError, match="cache_seqlens"):
                     flash_attn_with_kvcache(q, k, v, cache_seqlens=bad)
 
-    def test_sinks_without_keys(self):
-        """A row whose window is empty keeps the sink only: O = 0, lse = sink."""
+    @pytest.mark.parametrize("num_splits", [1, 5])
+    def test_sinks_without_keys(self, num_splits):
+        """A row whose window is empty keeps the sink only: O = 0, lse = sink
+        (also when every split is empty)."""
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(1, 1, 2, 2, 64, 32, torch.float16, "bshd")
         sinks = torch.tensor([0.5, -1.0], device="cuda")
         with torch.no_grad():
-            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=0, sinks=sinks, return_softmax_lse=True)
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=0, sinks=sinks, num_splits=num_splits,
+                                               return_softmax_lse=True)
         assert (out == 0).all()
         torch.testing.assert_close(lse.view(-1), sinks)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_splits_long_context(self, dtype):
+        """Batch 1 with a long cache: the automatic split count (> 1 here), the cap
+        (128, values above it clamp) and one split agree with the reference."""
+        import flash_attn_legacy_cuda
+        from flash_attn_legacy import flash_attn_with_kvcache
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        assert flash_attn_legacy_cuda.decode_num_splits(1 * 2, sms, 8192) > 1
+        q, k, v = self._case(1, 1, 4, 2, 128, 8192, dtype, "bhsd_view")
+        ref_out, ref_lse = self._ref(q, k, v, [8000], 1.0 / math.sqrt(128))
+        with torch.no_grad():
+            one, lse_1 = flash_attn_with_kvcache(q, k, v, cache_seqlens=8000, num_splits=1, return_softmax_lse=True)
+            for n in (0, 128, 1000):
+                out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=8000, num_splits=n, return_softmax_lse=True)
+                self._check(out, lse, ref_out, ref_lse, dtype)
+                torch.testing.assert_close(out, one, atol=4e-3, rtol=4e-3)
+                torch.testing.assert_close(lse, lse_1, atol=1e-3, rtol=1e-4)
+
+    def test_window_with_many_splits(self):
+        """Visible range starting past key 0 (sliding window) cut into many splits."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(2, 2, 4, 2, 64, 256, torch.float16, "bshd")
+        seqlens = [200, 256]
+        self._poison(k, v, seqlens)
+        cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=True, window_size=(64, 0),
+                                               num_splits=16, return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 0.125, causal=True, window=(64, 0))
+        self._check(out, lse, ref_out, ref_lse, torch.float16)
+
+    @pytest.mark.parametrize("bad", [-1, 1.5, True])
+    def test_invalid_num_splits(self, bad):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(1, 1, 4, 4, 64, 32, torch.float16, "bshd")
+        with torch.no_grad(), pytest.raises(ValueError, match="num_splits"):
+            flash_attn_with_kvcache(q, k, v, num_splits=bad)
 
     def test_bf16_beyond_fp16_range(self):
         """bf16 caches are read as they are: values beyond the fp16 range are fine."""

@@ -488,8 +488,11 @@ def flash_attn_with_kvcache(
         causal: bottom-right aligned (query i of q_len sees keys
             <= cache_seqlens - q_len + i); irrelevant for q_len == 1
         window_size, softcap: as flash_attention
-        num_splits: accepted for compatibility (ignored: this version does not
-            split the keys)
+        num_splits: key splits per (row, KV head): 0 = automatic (enough blocks
+            to fill the GPU at batch 1 and long contexts; sized by the cache
+            capacity: with a large preallocated cache holding few keys pass a
+            small value), >= 1 forced (capped at 128; the fp32 partials take
+            num_splits * B * H_q * q_len * d * 4 bytes)
         return_softmax_lse: also return the logsumexp [B, H_q, q_len] (fp32;
             -inf for rows with no visible key nor sink)
         sinks: attention sinks [H_q] (keyword only, an extension)
@@ -521,8 +524,10 @@ def flash_attn_with_kvcache(
         cache_seqlens = cache_seqlens.to(device=q.device, dtype=torch.int32)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if not isinstance(num_splits, numbers.Integral) or isinstance(num_splits, bool) or num_splits < 0:
+        raise ValueError(f"num_splits must be an int >= 0 (0 = automatic), got {num_splits!r}")
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
     sinks = _check_sinks(sinks, q.shape[2], q.device)
     out, lse = flash_attn_legacy_cuda.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal,
-                                                   *window_size, softcap, sinks)
+                                                   *window_size, softcap, sinks, num_splits)
     return (out, lse) if return_softmax_lse else out

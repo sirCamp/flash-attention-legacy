@@ -8,6 +8,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -38,6 +40,8 @@ void flash_attn_bwd_launch(FlashAttnBwdParams& params, int sm, int total_k_block
 int flash_attn_bwd_block_cols(int head_dim, int sm);
 void flash_attn_decode(DecodeParams& params, bool bf16, cudaStream_t stream);
 int flash_attn_decode_max_rows();
+int flash_attn_decode_num_splits(int blocks, int sms, int max_len);
+int flash_attn_decode_max_splits();
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -626,7 +630,7 @@ static void check_decode_layout(const torch::Tensor& t, const char* name) {
 std::vector<torch::Tensor> flash_attn_with_kvcache(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
     float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
-    c10::optional<torch::Tensor> sinks
+    c10::optional<torch::Tensor> sinks, int64_t num_splits
 ) {
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d]");
@@ -673,6 +677,18 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
     p.o_batch_stride = out.stride(0); p.o_seq_stride = out.stride(1); p.o_head_stride = out.stride(2);
     p.batch_size = B; p.q_len = q_len; p.num_heads = H_q; p.num_heads_k = H_kv; p.head_dim = d;
     p.max_len = max_len;
+    // Key splits: num_splits > 0 forced (capped), 0 = chosen from the grid
+    TORCH_CHECK(num_splits >= 0, "num_splits must be >= 0 (0 = automatic)");
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    p.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_decode_max_splits()))
+                                  : flash_attn_decode_num_splits(B * H_kv, sms, max_len);
+    torch::Tensor o_part, lse_part;
+    if (p.num_splits > 1) {
+        o_part = torch::empty({p.num_splits, B, H_q, q_len, d}, q.options().dtype(torch::kFloat32));
+        lse_part = torch::empty({p.num_splits, B, H_q, q_len}, q.options().dtype(torch::kFloat32));
+        p.o_part = o_part.data_ptr<float>();
+        p.lse_part = lse_part.data_ptr<float>();
+    }
     p.softmax_scale = softmax_scale;
     p.softcap = logit_softcap(softcap);
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, q_len, max_len);
@@ -712,7 +728,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_seqlens"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
           py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
-          py::arg("sinks") = py::none());
+          py::arg("sinks") = py::none(), py::arg("num_splits") = 0);
+    m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,
+          "Automatic key splits of flash_attn_with_kvcache for (B * H_kv, SMs, max_len)",
+          py::arg("blocks"), py::arg("sms"), py::arg("max_len"));
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),

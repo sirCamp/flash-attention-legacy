@@ -137,6 +137,9 @@ struct DecodeParams {
     index_t o_batch_stride, o_seq_stride, o_head_stride;
     int batch_size, q_len, num_heads, num_heads_k, head_dim;
     int max_len;                    // cache capacity: cache_seqlens are clamped to [0, max_len]
+    int num_splits;                 // key splits per (row, KV head); > 1: partials + combine
+    float* __restrict__ o_part;     // [splits, B, H_q, q_len, d] fp32, normalized (num_splits > 1)
+    float* __restrict__ lse_part;   // [splits, B, H_q, q_len], log2 domain
     float softmax_scale, softcap;
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 };
