@@ -187,6 +187,52 @@ bwd_varlen_kernel(FlashAttnBwdParams p) {
 }
 
 // ---------------------------------------------------------------------------
+// Query-block loop of every backward body: for each Q head of the KV head (GQA)
+// and each query block that can see the key block, Q and dO (rows padded to LDH)
+// and L * log2(e), D of the block go to shared memory (rows past the sequence:
+// zeros; P = 0 through the mask, D unused), then one block barrier, then
+// step(qh, q_start, valid_q). The next block's copies are ordered after step()'s
+// readers by the barriers inside step().
+// ---------------------------------------------------------------------------
+template <int Br, int Bc, int D, int NT, int LDH, typename Step>
+__device__ __forceinline__ void bwd_q_loop(const BwdBlockArgs& a, half* smem_Q, half* smem_dO,
+                                           float* smem_L, float* smem_D, Step&& step) {
+    const int2 q_blks = a.template q_blocks<Br, Bc>();
+    for (int qh = 0; qh < a.heads_per_kv; qh++) {
+        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
+            const int q_start = q_blk * Br;
+            const int valid_q = min(Br, a.seq_len_q - q_start);
+            load_tile_g2s<Br, D, NT, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
+                                          smem_Q, valid_q, a.head_dim);
+            load_tile_g2s<Br, D, NT, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
+                                          smem_dO, valid_q, a.head_dim);
+            for (int i = threadIdx.x; i < Br; i += NT) {
+                const index_t lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
+                smem_L[i] = (i < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
+                smem_D[i] = (i < valid_q) ? a.D[lrow] : 0.0f;
+            }
+            __syncthreads();
+            step(qh, q_start, valid_q);
+        }
+    }
+}
+
+// P and dS of one element, in place: s (raw score) -> P = exp2(x(s) - L), dp ->
+// dS = P (dP - D) dx/ds (ScoreMap); masked elements -> 0 by selects (the WMMA /
+// mma callers prefer them to diverging: V100 fwd+bwd -3%; the SIMT caller
+// branches before, to skip its dot products, and passes masked = false).
+// L_log2 = L * log2(e).
+template <bool kSoftcap>
+__device__ __forceinline__ void bwd_p_ds(const ScoreMap& m, bool masked, float L_log2, float D_row,
+                                         float& s, float& dp) {
+    float dx_ds;
+    const float x = m.template log2_logit<kSoftcap>(s, dx_ds);
+    const float p = masked ? 0.0f : exp2f(x - L_log2);
+    dp = masked ? 0.0f : p * (dp - D_row) * dx_ds;
+    s = p;
+}
+
+// ---------------------------------------------------------------------------
 // Backward kernel — CUDA cores (Pascal), KV-outer loop, tiled like FA2.
 //
 // One block per (KV block of Bc rows, batch x KV head). For every Q head of
@@ -248,90 +294,67 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     #pragma unroll
     for (int c = 0; c < KV_COLS; c++) { acc_dK[c] = 0.0f; acc_dV[c] = 0.0f; }
 
-    const int2 q_blks = a.template q_blocks<Br, Bc>();
-
-    for (int qh = 0; qh < a.heads_per_kv; qh++) {
-        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
-            const int q_start = q_blk * Br;
-            const int valid_q = min(Br, a.seq_len_q - q_start);
-
-            // The previous iteration's readers of Q/dO/P/dS passed the barrier
-            // at the end of the loop body.
-            load_tile_g2s<Br, D, NT, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
-                                          smem_Q, valid_q, a.head_dim);
-            load_tile_g2s<Br, D, NT, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
-                                          smem_dO, valid_q, a.head_dim);
-            if (tid < Br) {
-                const index_t lrow = qh * a.l_head_stride + (q_start + tid) * a.l_stride;
-                smem_L[tid] = (tid < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
-                smem_D[tid] = (tid < valid_q) ? a.D[lrow] : 0.0f;
+    bwd_q_loop<Br, Bc, D, NT, LDH>(a, smem_Q, smem_dO, smem_L, smem_D, [&](int qh, int q_start, int valid_q) {
+        // 1. P and dS for the [Br, Bc] tile (j fastest across threads)
+        score_map.dispatch([&](auto softcap) {
+            #pragma unroll
+            for (int e = tid; e < Br * Bc; e += NT) {
+                const int i = e / Bc, j = e % Bc;
+                float p = 0.0f, ds = 0.0f;
+                const bool valid = i < valid_q && !w.masked(q_start + i, kv_start + j);
+                if (valid) {  // a branch here: it skips the two dot products
+                    p = half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH);
+                    ds = half_dot<D>(smem_dO + i * LDH, smem_V + j * LDH);
+                    bwd_p_ds<decltype(softcap)::value>(score_map, false, smem_L[i], smem_D[i], p, ds);
+                }
+                smem_P[i * LDF + j] = p;
+                smem_dS[i * LDF + j] = ds;
             }
-            __syncthreads();
+        });
+        __syncthreads();
 
-            // 1. P and dS for the [Br, Bc] tile (j fastest across threads)
-            score_map.dispatch([&](auto softcap) {
-                #pragma unroll
-                for (int e = tid; e < Br * Bc; e += NT) {
-                    const int i = e / Bc, j = e % Bc;
-                    float p = 0.0f, ds = 0.0f;
-                    const bool valid = i < valid_q && !w.masked(q_start + i, kv_start + j);
-                    if (valid) {
-                        float dx_ds;
-                        const float x = score_map.template log2_logit<decltype(softcap)::value>(
-                            half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH), dx_ds);
-                        p = exp2f(x - smem_L[i]);
-                        const float dp = half_dot<D>(smem_dO + i * LDH, smem_V + j * LDH);
-                        ds = p * (dp - smem_D[i]) * dx_ds;
-                    }
-                    smem_P[i * LDF + j] = p;
-                    smem_dS[i * LDF + j] = ds;
-                }
-            });
-            __syncthreads();
-
-            // 2. dV[j] += P^T dO, dK[j] += dS^T Q (registers; row j, column slice)
-            #pragma unroll 4
-            for (int i = 0; i < Br; i++) {
-                const float p = smem_P[i * LDF + kv_j];
-                const float ds = smem_dS[i * LDF + kv_j];
-                const half2* do2 = reinterpret_cast<const half2*>(smem_dO + i * LDH + kv_c0);
-                const half2* q2  = reinterpret_cast<const half2*>(smem_Q + i * LDH + kv_c0);
-                #pragma unroll
-                for (int c = 0; c < KV_COLS / 2; c++) {
-                    const float2 dof = __half22float2(do2[c]);
-                    const float2 qf  = __half22float2(q2[c]);
-                    acc_dV[2 * c]     = fmaf(p, dof.x, acc_dV[2 * c]);
-                    acc_dV[2 * c + 1] = fmaf(p, dof.y, acc_dV[2 * c + 1]);
-                    acc_dK[2 * c]     = fmaf(ds, qf.x, acc_dK[2 * c]);
-                    acc_dK[2 * c + 1] = fmaf(ds, qf.y, acc_dK[2 * c + 1]);
-                }
+        // 2. dV[j] += P^T dO, dK[j] += dS^T Q (registers; row j, column slice)
+        #pragma unroll 4
+        for (int i = 0; i < Br; i++) {
+            const float p = smem_P[i * LDF + kv_j];
+            const float ds = smem_dS[i * LDF + kv_j];
+            const half2* do2 = reinterpret_cast<const half2*>(smem_dO + i * LDH + kv_c0);
+            const half2* q2  = reinterpret_cast<const half2*>(smem_Q + i * LDH + kv_c0);
+            #pragma unroll
+            for (int c = 0; c < KV_COLS / 2; c++) {
+                const float2 dof = __half22float2(do2[c]);
+                const float2 qf  = __half22float2(q2[c]);
+                acc_dV[2 * c]     = fmaf(p, dof.x, acc_dV[2 * c]);
+                acc_dV[2 * c + 1] = fmaf(p, dof.y, acc_dV[2 * c + 1]);
+                acc_dK[2 * c]     = fmaf(ds, qf.x, acc_dK[2 * c]);
+                acc_dK[2 * c + 1] = fmaf(ds, qf.y, acc_dK[2 * c + 1]);
             }
-
-            // 3. dQ[i] += dS K over the whole KV block, one atomicAdd per element
-            if (q_i < valid_q) {
-                float acc_dQ[Q_COLS];
-                #pragma unroll
-                for (int c = 0; c < Q_COLS; c++) acc_dQ[c] = 0.0f;
-                #pragma unroll 4
-                for (int j = 0; j < Bc; j++) {
-                    const float ds = smem_dS[q_i * LDF + j];
-                    const half2* k2 = reinterpret_cast<const half2*>(smem_K + j * LDH + q_c0);
-                    #pragma unroll
-                    for (int c = 0; c < Q_COLS / 2; c++) {
-                        const float2 kf = __half22float2(k2[c]);
-                        acc_dQ[2 * c]     = fmaf(ds, kf.x, acc_dQ[2 * c]);
-                        acc_dQ[2 * c + 1] = fmaf(ds, kf.y, acc_dQ[2 * c + 1]);
-                    }
-                }
-                float* dq_row = a.dQ + qh * a.dq_head_stride + (q_start + q_i) * a.dq_stride + q_c0;
-                #pragma unroll
-                for (int c = 0; c < Q_COLS; c++) {
-                    if (q_c0 + c < a.head_dim) atomicAdd(&dq_row[c], acc_dQ[c]);
-                }
-            }
-            __syncthreads();  // P/dS/Q/dO are overwritten by the next iteration
         }
-    }
+
+        // 3. dQ[i] += dS K over the whole KV block, one atomicAdd per element
+        if (q_i < valid_q) {
+            float acc_dQ[Q_COLS];
+            #pragma unroll
+            for (int c = 0; c < Q_COLS; c++) acc_dQ[c] = 0.0f;
+            #pragma unroll 4
+            for (int j = 0; j < Bc; j++) {
+                const float ds = smem_dS[q_i * LDF + j];
+                const half2* k2 = reinterpret_cast<const half2*>(smem_K + j * LDH + q_c0);
+                #pragma unroll
+                for (int c = 0; c < Q_COLS / 2; c++) {
+                    const float2 kf = __half22float2(k2[c]);
+                    acc_dQ[2 * c]     = fmaf(ds, kf.x, acc_dQ[2 * c]);
+                    acc_dQ[2 * c + 1] = fmaf(ds, kf.y, acc_dQ[2 * c + 1]);
+                }
+            }
+            float* dq_row = a.dQ + qh * a.dq_head_stride + (q_start + q_i) * a.dq_stride + q_c0;
+            #pragma unroll
+            for (int c = 0; c < Q_COLS; c++) {
+                if (q_c0 + c < a.head_dim) atomicAdd(&dq_row[c], acc_dQ[c]);
+            }
+        }
+        __syncthreads();  // P/dS/Q/dO are overwritten by the next iteration
+    });
 
     // Write dK, dV (row j of this KV block, column slice)
     if (kv_j < valid_kv) {
@@ -428,140 +451,117 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
 
-    const int2 q_blks = a.template q_blocks<Br, Bc>();
     const half* K_band = smem_K + band * T * LDH;
     const half* V_band = smem_V + band * T * LDH;
 
-    for (int qh = 0; qh < a.heads_per_kv; qh++) {
-        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
-            const int q_start = q_blk * Br;
-            const int valid_q = min(Br, a.seq_len_q - q_start);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
-                                                   smem_Q, valid_q, a.head_dim);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
-                                                   smem_dO, valid_q, a.head_dim);
-            for (int i = tid; i < Br; i += NUM_THREADS) {
-                // Rows past the sequence: P = 0 through the mask, D never used
-                const index_t lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
-                smem_L[i] = (i < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
-                smem_D[i] = (i < valid_q) ? a.D[lrow] : 0.0f;
-            }
-            __syncthreads();
-
-            // S^T and dP^T for the band: [16 keys, Br queries] as QT fragments
-            Acc S[QT], dP[QT];
+    bwd_q_loop<Br, Bc, D, NUM_THREADS, LDH>(a, smem_Q, smem_dO, smem_L, smem_D, [&](int qh, int q_start, int valid_q) {
+        // S^T and dP^T for the band: [16 keys, Br queries] as QT fragments
+        Acc S[QT], dP[QT];
+        #pragma unroll
+        for (int qt = 0; qt < QT; qt++) {
+            wmma::fill_fragment(S[qt], 0.0f);
+            wmma::fill_fragment(dP[qt], 0.0f);
+        }
+        #pragma unroll
+        for (int k = 0; k < D; k += T) {
+            FragA ka, va;
+            wmma::load_matrix_sync(ka, K_band + k, LDH);
+            wmma::load_matrix_sync(va, V_band + k, LDH);
             #pragma unroll
             for (int qt = 0; qt < QT; qt++) {
-                wmma::fill_fragment(S[qt], 0.0f);
-                wmma::fill_fragment(dP[qt], 0.0f);
+                FragBt qb, ob;  // Q^T, dO^T: [k, queries] = rows of Q / dO read column-major
+                wmma::load_matrix_sync(qb, smem_Q + qt * T * LDH + k, LDH);
+                wmma::load_matrix_sync(ob, smem_dO + qt * T * LDH + k, LDH);
+                wmma::mma_sync(S[qt], ka, qb, S[qt]);
+                wmma::mma_sync(dP[qt], va, ob, dP[qt]);
             }
-            #pragma unroll
-            for (int k = 0; k < D; k += T) {
-                FragA ka, va;
-                wmma::load_matrix_sync(ka, K_band + k, LDH);
-                wmma::load_matrix_sync(va, V_band + k, LDH);
-                #pragma unroll
-                for (int qt = 0; qt < QT; qt++) {
-                    FragBt qb, ob;  // Q^T, dO^T: [k, queries] = rows of Q / dO read column-major
-                    wmma::load_matrix_sync(qb, smem_Q + qt * T * LDH + k, LDH);
-                    wmma::load_matrix_sync(ob, smem_dO + qt * T * LDH + k, LDH);
-                    wmma::mma_sync(S[qt], ka, qb, S[qt]);
-                    wmma::mma_sync(dP[qt], va, ob, dP[qt]);
-                }
-            }
+        }
 
-            // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as
-            // half into the warp buffer for dV += P^T dO
-            score_map.dispatch([&](auto softcap) {
-                #pragma unroll
-                for (int qt = 0; qt < QT; qt++) {
-                    #pragma unroll
-                    for (int i = 0; i < NE; i++) {
-                        const int key = kv_start + band * T + e_row[i];
-                        const int q = qt * T + e_col[i];  // row within the query block
-                        // selects, not a branch: the map of masked elements is
-                        // cheaper than diverging (V100 fwd+bwd -3%)
-                        const bool masked = q >= valid_q || w.masked(q_start + q, key);
-                        float dx_ds;
-                        const float x = score_map.template log2_logit<decltype(softcap)::value>(S[qt].x[i], dx_ds);
-                        const float p = masked ? 0.0f : exp2f(x - smem_L[q]);
-                        S[qt].x[i] = p;
-                        dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * dx_ds;
-                        wbuf[e_row[i] * LDB + q] = __float2half(p);
-                    }
-                }
-            });
-            __syncwarp();
-            #pragma unroll
-            for (int k = 0; k < Br; k += T) {
-                FragA pa;
-                wmma::load_matrix_sync(pa, wbuf + k, LDB);
-                #pragma unroll
-                for (int t = 0; t < DPT; t++) {
-                    FragB ob;
-                    wmma::load_matrix_sync(ob, smem_dO + k * LDH + part * DP + t * T, LDH);
-                    wmma::mma_sync(dV[t], pa, ob, dV[t]);
-                }
-            }
-            __syncwarp();  // P^T reads done before dS^T overwrites the buffer
-
-            // dS^T: into the warp buffer (dK += dS^T Q) and, once per band, into the
-            // shared dS^T for dQ
+        // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as
+        // half into the warp buffer for dV += P^T dO
+        score_map.dispatch([&](auto softcap) {
             #pragma unroll
             for (int qt = 0; qt < QT; qt++) {
                 #pragma unroll
                 for (int i = 0; i < NE; i++) {
-                    const half ds = __float2half(dP[qt].x[i]);
-                    wbuf[e_row[i] * LDB + qt * T + e_col[i]] = ds;
-                    if (part == 0) smem_dSt[(band * T + e_row[i]) * LDB + qt * T + e_col[i]] = ds;
+                    const int key = kv_start + band * T + e_row[i];
+                    const int q = qt * T + e_col[i];  // row within the query block
+                    const bool masked = q >= valid_q || w.masked(q_start + q, key);
+                    bwd_p_ds<decltype(softcap)::value>(score_map, masked, smem_L[q], smem_D[q], S[qt].x[i], dP[qt].x[i]);
+                    wbuf[e_row[i] * LDB + q] = __float2half(S[qt].x[i]);
+                }
+            }
+        });
+        __syncwarp();
+        #pragma unroll
+        for (int k = 0; k < Br; k += T) {
+            FragA pa;
+            wmma::load_matrix_sync(pa, wbuf + k, LDB);
+            #pragma unroll
+            for (int t = 0; t < DPT; t++) {
+                FragB ob;
+                wmma::load_matrix_sync(ob, smem_dO + k * LDH + part * DP + t * T, LDH);
+                wmma::mma_sync(dV[t], pa, ob, dV[t]);
+            }
+        }
+        __syncwarp();  // P^T reads done before dS^T overwrites the buffer
+
+        // dS^T: into the warp buffer (dK += dS^T Q) and, once per band, into the
+        // shared dS^T for dQ
+        #pragma unroll
+        for (int qt = 0; qt < QT; qt++) {
+            #pragma unroll
+            for (int i = 0; i < NE; i++) {
+                const half ds = __float2half(dP[qt].x[i]);
+                wbuf[e_row[i] * LDB + qt * T + e_col[i]] = ds;
+                if (part == 0) smem_dSt[(band * T + e_row[i]) * LDB + qt * T + e_col[i]] = ds;
+            }
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k = 0; k < Br; k += T) {
+            FragA dsa;
+            wmma::load_matrix_sync(dsa, wbuf + k, LDB);
+            #pragma unroll
+            for (int t = 0; t < DPT; t++) {
+                FragB qb;
+                wmma::load_matrix_sync(qb, smem_Q + k * LDH + part * DP + t * T, LDH);
+                wmma::mma_sync(dK[t], dsa, qb, dK[t]);
+            }
+        }
+        __syncthreads();  // shared dS^T complete; warp buffers free for staging
+
+        // dQ[Br, D] += dS K: output tiles spread over the warps, staged per warp
+        // and added with coalesced atomics
+        float* dQ_blk = a.dQ + qh * a.dq_head_stride + q_start * a.dq_stride;
+        constexpr int DQ_TILES = QT * (D / T);
+        #pragma unroll
+        for (int tile = warp_id; tile < DQ_TILES; tile += NUM_WARPS) {
+            const int qr = tile / (D / T), dc = tile % (D / T);
+            Acc acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int k = 0; k < Bc; k += T) {
+                FragAt dsa;  // dS [queries, keys] = shared dS^T read column-major
+                FragB kb;
+                wmma::load_matrix_sync(dsa, smem_dSt + k * LDB + qr * T, LDB);
+                wmma::load_matrix_sync(kb, smem_K + k * LDH + dc * T, LDH);
+                wmma::mma_sync(acc, dsa, kb, acc);
+            }
+            wmma::store_matrix_sync(wstage, acc, T, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int e = lane; e < T * T; e += 32) {
+                const int row = qr * T + e / T;
+                if (row < valid_q && dc * T + e % T < a.head_dim) {
+                    ::atomicAdd(dQ_blk + row * a.dq_stride + dc * T + e % T, wstage[e]);
                 }
             }
             __syncwarp();
-            #pragma unroll
-            for (int k = 0; k < Br; k += T) {
-                FragA dsa;
-                wmma::load_matrix_sync(dsa, wbuf + k, LDB);
-                #pragma unroll
-                for (int t = 0; t < DPT; t++) {
-                    FragB qb;
-                    wmma::load_matrix_sync(qb, smem_Q + k * LDH + part * DP + t * T, LDH);
-                    wmma::mma_sync(dK[t], dsa, qb, dK[t]);
-                }
-            }
-            __syncthreads();  // shared dS^T complete; warp buffers free for staging
-
-            // dQ[Br, D] += dS K: output tiles spread over the warps, staged per warp
-            // and added with coalesced atomics
-            float* dQ_blk = a.dQ + qh * a.dq_head_stride + q_start * a.dq_stride;
-            constexpr int DQ_TILES = QT * (D / T);
-            #pragma unroll
-            for (int tile = warp_id; tile < DQ_TILES; tile += NUM_WARPS) {
-                const int qr = tile / (D / T), dc = tile % (D / T);
-                Acc acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (int k = 0; k < Bc; k += T) {
-                    FragAt dsa;  // dS [queries, keys] = shared dS^T read column-major
-                    FragB kb;
-                    wmma::load_matrix_sync(dsa, smem_dSt + k * LDB + qr * T, LDB);
-                    wmma::load_matrix_sync(kb, smem_K + k * LDH + dc * T, LDH);
-                    wmma::mma_sync(acc, dsa, kb, acc);
-                }
-                wmma::store_matrix_sync(wstage, acc, T, wmma::mem_row_major);
-                __syncwarp();
-                #pragma unroll
-                for (int e = lane; e < T * T; e += 32) {
-                    const int row = qr * T + e / T;
-                    if (row < valid_q && dc * T + e % T < a.head_dim) {
-                        ::atomicAdd(dQ_blk + row * a.dq_stride + dc * T + e % T, wstage[e]);
-                    }
-                }
-                __syncwarp();
-            }
-            // No barrier here: the next query block first writes Q, dO, L, D (not
-            // read by the dQ step) and writes dS^T only after its first barrier.
         }
-    }
+        // No barrier here: the next query block first writes Q, dO, L, D (not
+        // read by the dQ step) and writes dS^T only after its first barrier.
+    });
 
     // dK, dV of the warp's band and slice, through the 16x16 float staging
     half* dK_out = a.dK + (kv_start + band * T) * a.dk_stride + part * DP;
@@ -599,11 +599,6 @@ struct BwdWmma {
 // TURING mma.sync Backward — SM >= 7.5 (docs/analysis/kernels/bwd_design.md)
 // ============================================================================
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
-
-// Barrier of the `threads` threads of one band (id 1 + band; 0 is __syncthreads).
-__device__ __forceinline__ void bwd_band_barrier(int band, int threads) {
-    asm volatile("bar.sync %0, %1;" :: "r"(1 + band), "r"(threads) : "memory");
-}
 
 // ---------------------------------------------------------------------------
 // Same block geometry as BwdWmma (key blocks of Bc, loop over the Q heads of the
@@ -675,185 +670,163 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
 
-    const int2 q_blks = a.template q_blocks<Br, Bc>();
     // A operand rows of the band (ldmatrix x4: rows 0-7 / 8-15, k and k + 8)
     const half* K_rows = smem_K + (band * 16 + (lm & 1) * 8 + lr) * LDH + (lm >> 1) * 8;
     const half* V_rows = smem_V + (band * 16 + (lm & 1) * 8 + lr) * LDH + (lm >> 1) * 8;
 
-    for (int qh = 0; qh < a.heads_per_kv; qh++) {
-        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
-            const int q_start = q_blk * Br;
-            const int valid_q = min(Br, a.seq_len_q - q_start);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
-                                                   smem_Q, valid_q, a.head_dim);
-            load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.dO + qh * a.o_head_stride + q_start * a.o_stride, a.o_stride,
-                                                   smem_dO, valid_q, a.head_dim);
-            for (int i = tid; i < Br; i += NUM_THREADS) {
-                // Rows past the sequence: P = 0 through the mask, D never used
-                const index_t lrow = qh * a.l_head_stride + (q_start + i) * a.l_stride;
-                smem_L[i] = (i < valid_q) ? a.L[lrow] * kLog2e : 0.0f;
-                smem_D[i] = (i < valid_q) ? a.D[lrow] : 0.0f;
-            }
-            __syncthreads();
-
-            // S^T and dP^T for the band and this warp's queries: n-tile j = queries
-            // qw0 + 8j..+7. B = Q^T / dO^T from query rows (ldmatrix, no trans).
-            float S[QWN][4], dP[QWN][4];
+    bwd_q_loop<Br, Bc, D, NUM_THREADS, LDH>(a, smem_Q, smem_dO, smem_L, smem_D, [&](int qh, int q_start, int valid_q) {
+        // S^T and dP^T for the band and this warp's queries: n-tile j = queries
+        // qw0 + 8j..+7. B = Q^T / dO^T from query rows (ldmatrix, no trans).
+        float S[QWN][4], dP[QWN][4];
+        #pragma unroll
+        for (int j = 0; j < QWN; j++) {
             #pragma unroll
-            for (int j = 0; j < QWN; j++) {
+            for (int e = 0; e < 4; e++) { S[j][e] = 0.0f; dP[j][e] = 0.0f; }
+        }
+        if constexpr (QWN % 2 == 0) {
+            #pragma unroll
+            for (int k = 0; k < D; k += 16) {
+                uint32_t ka[4], va[4];  // {rows 0-7, 8-15} x {k, k + 8}
+                ldmatrix_x4(ka, K_rows + k);
+                ldmatrix_x4(va, V_rows + k);
                 #pragma unroll
-                for (int e = 0; e < 4; e++) { S[j][e] = 0.0f; dP[j][e] = 0.0f; }
-            }
-            if constexpr (QWN % 2 == 0) {
-                #pragma unroll
-                for (int k = 0; k < D; k += 16) {
-                    uint32_t ka[4], va[4];  // {rows 0-7, 8-15} x {k, k + 8}
-                    ldmatrix_x4(ka, K_rows + k);
-                    ldmatrix_x4(va, V_rows + k);
-                    #pragma unroll
-                    for (int j = 0; j < QWN; j += 2) {
-                        // matrices (j, k), (j, k + 8), (j + 1, k), (j + 1, k + 8)
-                        const int row = qw0 + (j + (lm >> 1)) * 8 + lr, col = k + (lm & 1) * 8;
-                        uint32_t qb[4], ob[4];
-                        ldmatrix_x4(qb, smem_Q + row * LDH + col);
-                        ldmatrix_x4(ob, smem_dO + row * LDH + col);
-                        mma_m16n8k8(S[j], ka[0], ka[1], qb[0]);
-                        mma_m16n8k8(S[j], ka[2], ka[3], qb[1]);
-                        mma_m16n8k8(S[j + 1], ka[0], ka[1], qb[2]);
-                        mma_m16n8k8(S[j + 1], ka[2], ka[3], qb[3]);
-                        mma_m16n8k8(dP[j], va[0], va[1], ob[0]);
-                        mma_m16n8k8(dP[j], va[2], va[3], ob[1]);
-                        mma_m16n8k8(dP[j + 1], va[0], va[1], ob[2]);
-                        mma_m16n8k8(dP[j + 1], va[2], va[3], ob[3]);
-                    }
-                }
-            } else {  // one n-tile: B matrices (k, k + 8, k + 16, k + 24) of the 8 queries
-                #pragma unroll
-                for (int k = 0; k < D; k += 32) {
-                    uint32_t ka[4], kb2[4], va[4], vb2[4];
-                    ldmatrix_x4(ka, K_rows + k);
-                    ldmatrix_x4(kb2, K_rows + k + 16);
-                    ldmatrix_x4(va, V_rows + k);
-                    ldmatrix_x4(vb2, V_rows + k + 16);
-                    const int row = qw0 + lr, col = k + lm * 8;
+                for (int j = 0; j < QWN; j += 2) {
+                    // matrices (j, k), (j, k + 8), (j + 1, k), (j + 1, k + 8)
+                    const int row = qw0 + (j + (lm >> 1)) * 8 + lr, col = k + (lm & 1) * 8;
                     uint32_t qb[4], ob[4];
                     ldmatrix_x4(qb, smem_Q + row * LDH + col);
                     ldmatrix_x4(ob, smem_dO + row * LDH + col);
-                    mma_m16n8k8(S[0], ka[0], ka[1], qb[0]);
-                    mma_m16n8k8(S[0], ka[2], ka[3], qb[1]);
-                    mma_m16n8k8(S[0], kb2[0], kb2[1], qb[2]);
-                    mma_m16n8k8(S[0], kb2[2], kb2[3], qb[3]);
-                    mma_m16n8k8(dP[0], va[0], va[1], ob[0]);
-                    mma_m16n8k8(dP[0], va[2], va[3], ob[1]);
-                    mma_m16n8k8(dP[0], vb2[0], vb2[1], ob[2]);
-                    mma_m16n8k8(dP[0], vb2[2], vb2[3], ob[3]);
+                    mma_m16n8k8(S[j], ka[0], ka[1], qb[0]);
+                    mma_m16n8k8(S[j], ka[2], ka[3], qb[1]);
+                    mma_m16n8k8(S[j + 1], ka[0], ka[1], qb[2]);
+                    mma_m16n8k8(S[j + 1], ka[2], ka[3], qb[3]);
+                    mma_m16n8k8(dP[j], va[0], va[1], ob[0]);
+                    mma_m16n8k8(dP[j], va[2], va[3], ob[1]);
+                    mma_m16n8k8(dP[j + 1], va[0], va[1], ob[2]);
+                    mma_m16n8k8(dP[j + 1], va[2], va[3], ob[3]);
                 }
             }
+        } else {  // one n-tile: B matrices (k, k + 8, k + 16, k + 24) of the 8 queries
+            #pragma unroll
+            for (int k = 0; k < D; k += 32) {
+                uint32_t ka[4], kb2[4], va[4], vb2[4];
+                ldmatrix_x4(ka, K_rows + k);
+                ldmatrix_x4(kb2, K_rows + k + 16);
+                ldmatrix_x4(va, V_rows + k);
+                ldmatrix_x4(vb2, V_rows + k + 16);
+                const int row = qw0 + lr, col = k + lm * 8;
+                uint32_t qb[4], ob[4];
+                ldmatrix_x4(qb, smem_Q + row * LDH + col);
+                ldmatrix_x4(ob, smem_dO + row * LDH + col);
+                mma_m16n8k8(S[0], ka[0], ka[1], qb[0]);
+                mma_m16n8k8(S[0], ka[2], ka[3], qb[1]);
+                mma_m16n8k8(S[0], kb2[0], kb2[1], qb[2]);
+                mma_m16n8k8(S[0], kb2[2], kb2[3], qb[3]);
+                mma_m16n8k8(dP[0], va[0], va[1], ob[0]);
+                mma_m16n8k8(dP[0], va[2], va[3], ob[1]);
+                mma_m16n8k8(dP[0], vb2[0], vb2[1], ob[2]);
+                mma_m16n8k8(dP[0], vb2[2], vb2[3], ob[3]);
+            }
+        }
 
-            // P^T (in S) and dS^T (in dP), element-wise: e = 0, 1 key g, e = 2, 3 key g + 8;
-            // query qw0 + 8j + 2t + (e & 1)
-            score_map.dispatch([&](auto softcap) {
-                #pragma unroll
-                for (int j = 0; j < QWN; j++) {
-                    #pragma unroll
-                    for (int e = 0; e < 4; e++) {
-                        const int key = kv_start + band * 16 + g + (e >> 1) * 8;
-                        const int q = qw0 + j * 8 + 2 * t + (e & 1);  // row within the query block
-                        // selects, not a branch (as BwdWmma)
-                        const bool masked = q >= valid_q || w.masked(q_start + q, key);
-                        float dx_ds;
-                        const float x = score_map.template log2_logit<decltype(softcap)::value>(S[j][e], dx_ds);
-                        const float p = masked ? 0.0f : exp2f(x - smem_L[q]);
-                        S[j][e] = p;
-                        dP[j][e] = masked ? 0.0f : p * (dP[j][e] - smem_D[q]) * dx_ds;
-                    }
-                }
-            });
-
-            // dS^T (and P^T with kSplitD > 1) to shared memory, key-major: half2 of
-            // queries 2t, 2t + 1 of each n-tile
+        // P^T (in S) and dS^T (in dP), element-wise: e = 0, 1 key g, e = 2, 3 key g + 8;
+        // query qw0 + 8j + 2t + (e & 1)
+        score_map.dispatch([&](auto softcap) {
             #pragma unroll
             for (int j = 0; j < QWN; j++) {
-                const int qcol = qw0 + j * 8 + 2 * t;
-                const int r0 = (band * 16 + g) * LDS + qcol, r1 = r0 + 8 * LDS;
-                *reinterpret_cast<uint32_t*>(smem_dSt + r0) = pack_half2(dP[j][0], dP[j][1]);
-                *reinterpret_cast<uint32_t*>(smem_dSt + r1) = pack_half2(dP[j][2], dP[j][3]);
-                if constexpr (SPLIT > 1) {
-                    *reinterpret_cast<uint32_t*>(smem_Pt + r0) = pack_half2(S[j][0], S[j][1]);
-                    *reinterpret_cast<uint32_t*>(smem_Pt + r1) = pack_half2(S[j][2], S[j][3]);
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int key = kv_start + band * 16 + g + (e >> 1) * 8;
+                    const int q = qw0 + j * 8 + 2 * t + (e & 1);  // row within the query block
+                    const bool masked = q >= valid_q || w.masked(q_start + q, key);
+                    bwd_p_ds<decltype(softcap)::value>(score_map, masked, smem_L[q], smem_D[q], S[j][e], dP[j][e]);
                 }
             }
-            if constexpr (SPLIT > 1) bwd_band_barrier(band, SPLIT * 32);  // the band's P^T / dS^T complete
+        });
 
-            // dV += P^T dO and dK += dS^T Q over this warp's columns and all queries:
-            // k-step j = queries 8j..8j+7; B = dO / Q [query, column] with
-            // ldmatrix.trans: matrices (j, c), (j, c + 8), (j + 1, c), (j + 1, c + 8)
-            #pragma unroll
-            for (int j = 0; j < QN; j += 2) {
-                uint32_t pa[4], sa[4];  // A of k-steps j ({0, 1}) and j + 1 ({2, 3})
-                if constexpr (SPLIT > 1) {
-                    // key-major rows of the band: matrices (keys 0-7, j), (8-15, j), (0-7, j + 1), (8-15, j + 1)
-                    const int off = (band * 16 + (lm & 1) * 8 + lr) * LDS + (j + (lm >> 1)) * 8;
-                    ldmatrix_x4(pa, smem_Pt + off);
-                    ldmatrix_x4(sa, smem_dSt + off);
-                } else {
-                    pa[0] = pack_half2(S[j][0], S[j][1]);         pa[1] = pack_half2(S[j][2], S[j][3]);
-                    pa[2] = pack_half2(S[j + 1][0], S[j + 1][1]); pa[3] = pack_half2(S[j + 1][2], S[j + 1][3]);
-                    sa[0] = pack_half2(dP[j][0], dP[j][1]);         sa[1] = pack_half2(dP[j][2], dP[j][3]);
-                    sa[2] = pack_half2(dP[j + 1][0], dP[j + 1][1]); sa[3] = pack_half2(dP[j + 1][2], dP[j + 1][3]);
-                }
-                const int row = (j + (lm >> 1)) * 8 + lr;
-                #pragma unroll
-                for (int n = 0; n < DN; n += 2) {
-                    const int col = part * DP + n * 8 + (lm & 1) * 8;
-                    uint32_t ob[4], qb[4];
-                    ldmatrix_x4_trans(ob, smem_dO + row * LDH + col);
-                    ldmatrix_x4_trans(qb, smem_Q + row * LDH + col);
-                    mma_m16n8k8(dV[n], pa[0], pa[1], ob[0]);
-                    mma_m16n8k8(dV[n + 1], pa[0], pa[1], ob[1]);
-                    mma_m16n8k8(dV[n], pa[2], pa[3], ob[2]);
-                    mma_m16n8k8(dV[n + 1], pa[2], pa[3], ob[3]);
-                    mma_m16n8k8(dK[n], sa[0], sa[1], qb[0]);
-                    mma_m16n8k8(dK[n + 1], sa[0], sa[1], qb[1]);
-                    mma_m16n8k8(dK[n], sa[2], sa[3], qb[2]);
-                    mma_m16n8k8(dK[n + 1], sa[2], sa[3], qb[3]);
-                }
+        // dS^T (and P^T with kSplitD > 1) to shared memory, key-major: half2 of
+        // queries 2t, 2t + 1 of each n-tile
+        #pragma unroll
+        for (int j = 0; j < QWN; j++) {
+            const int qcol = qw0 + j * 8 + 2 * t;
+            const int r0 = (band * 16 + g) * LDS + qcol, r1 = r0 + 8 * LDS;
+            *reinterpret_cast<uint32_t*>(smem_dSt + r0) = pack_half2(dP[j][0], dP[j][1]);
+            *reinterpret_cast<uint32_t*>(smem_dSt + r1) = pack_half2(dP[j][2], dP[j][3]);
+            if constexpr (SPLIT > 1) {
+                *reinterpret_cast<uint32_t*>(smem_Pt + r0) = pack_half2(S[j][0], S[j][1]);
+                *reinterpret_cast<uint32_t*>(smem_Pt + r1) = pack_half2(S[j][2], S[j][3]);
             }
-            __syncthreads();  // dS^T complete; P^T reads done
-
-            // dQ[Br, D] += dS K: units of 16 queries x 16 columns over the warps.
-            // A = dS [query, key] from the key-major dS^T (ldmatrix.trans: matrices
-            // (keys k, queries q0), (k, q0 + 8), (k + 8, q0), (k + 8, q0 + 8));
-            // B = K [key, column] (ldmatrix.trans: (k, c), (k + 8, c), (k, c + 8), (k + 8, c + 8))
-            float* dQ_blk = a.dQ + qh * a.dq_head_stride + q_start * a.dq_stride;
-            constexpr int UNITS = (Br / 16) * (D / 16);
-            #pragma unroll
-            for (int u = warp_id; u < UNITS; u += NUM_WARPS) {
-                const int q0 = (u / (D / 16)) * 16, c0 = (u % (D / 16)) * 16;
-                float acc[2][4] = {};
-                #pragma unroll
-                for (int k = 0; k < Bc; k += 16) {
-                    uint32_t da[4], kb[4];
-                    ldmatrix_x4_trans(da, smem_dSt + (k + (lm >> 1) * 8 + lr) * LDS + q0 + (lm & 1) * 8);
-                    ldmatrix_x4_trans(kb, smem_K + (k + (lm & 1) * 8 + lr) * LDH + c0 + (lm >> 1) * 8);
-                    mma_m16n8k8(acc[0], da[0], da[1], kb[0]);
-                    mma_m16n8k8(acc[0], da[2], da[3], kb[1]);
-                    mma_m16n8k8(acc[1], da[0], da[1], kb[2]);
-                    mma_m16n8k8(acc[1], da[2], da[3], kb[3]);
-                }
-                #pragma unroll
-                for (int n = 0; n < 2; n++) {
-                    #pragma unroll
-                    for (int e = 0; e < 4; e++) {
-                        const int row = q0 + g + (e >> 1) * 8, col = c0 + n * 8 + 2 * t + (e & 1);
-                        if (row < valid_q && col < a.head_dim) ::atomicAdd(dQ_blk + row * a.dq_stride + col, acc[n][e]);
-                    }
-                }
-            }
-            // No barrier here: the next query block first writes Q, dO, L, D (not
-            // read by the dQ step) and writes dS^T / P^T only after its first barrier.
         }
-    }
+        if constexpr (SPLIT > 1) band_barrier(band, SPLIT * 32);  // the band's P^T / dS^T complete
+
+        // dV += P^T dO and dK += dS^T Q over this warp's columns and all queries:
+        // k-step j = queries 8j..8j+7; B = dO / Q [query, column] with
+        // ldmatrix.trans: matrices (j, c), (j, c + 8), (j + 1, c), (j + 1, c + 8)
+        #pragma unroll
+        for (int j = 0; j < QN; j += 2) {
+            uint32_t pa[4], sa[4];  // A of k-steps j ({0, 1}) and j + 1 ({2, 3})
+            if constexpr (SPLIT > 1) {
+                // key-major rows of the band: matrices (keys 0-7, j), (8-15, j), (0-7, j + 1), (8-15, j + 1)
+                const int off = (band * 16 + (lm & 1) * 8 + lr) * LDS + (j + (lm >> 1)) * 8;
+                ldmatrix_x4(pa, smem_Pt + off);
+                ldmatrix_x4(sa, smem_dSt + off);
+            } else {
+                pa[0] = pack_half2(S[j][0], S[j][1]);         pa[1] = pack_half2(S[j][2], S[j][3]);
+                pa[2] = pack_half2(S[j + 1][0], S[j + 1][1]); pa[3] = pack_half2(S[j + 1][2], S[j + 1][3]);
+                sa[0] = pack_half2(dP[j][0], dP[j][1]);         sa[1] = pack_half2(dP[j][2], dP[j][3]);
+                sa[2] = pack_half2(dP[j + 1][0], dP[j + 1][1]); sa[3] = pack_half2(dP[j + 1][2], dP[j + 1][3]);
+            }
+            const int row = (j + (lm >> 1)) * 8 + lr;
+            #pragma unroll
+            for (int n = 0; n < DN; n += 2) {
+                const int col = part * DP + n * 8 + (lm & 1) * 8;
+                uint32_t ob[4], qb[4];
+                ldmatrix_x4_trans(ob, smem_dO + row * LDH + col);
+                ldmatrix_x4_trans(qb, smem_Q + row * LDH + col);
+                mma_m16n8k8(dV[n], pa[0], pa[1], ob[0]);
+                mma_m16n8k8(dV[n + 1], pa[0], pa[1], ob[1]);
+                mma_m16n8k8(dV[n], pa[2], pa[3], ob[2]);
+                mma_m16n8k8(dV[n + 1], pa[2], pa[3], ob[3]);
+                mma_m16n8k8(dK[n], sa[0], sa[1], qb[0]);
+                mma_m16n8k8(dK[n + 1], sa[0], sa[1], qb[1]);
+                mma_m16n8k8(dK[n], sa[2], sa[3], qb[2]);
+                mma_m16n8k8(dK[n + 1], sa[2], sa[3], qb[3]);
+            }
+        }
+        __syncthreads();  // dS^T complete; P^T reads done
+
+        // dQ[Br, D] += dS K: units of 16 queries x 16 columns over the warps.
+        // A = dS [query, key] from the key-major dS^T (ldmatrix.trans: matrices
+        // (keys k, queries q0), (k, q0 + 8), (k + 8, q0), (k + 8, q0 + 8));
+        // B = K [key, column] (ldmatrix.trans: (k, c), (k + 8, c), (k, c + 8), (k + 8, c + 8))
+        float* dQ_blk = a.dQ + qh * a.dq_head_stride + q_start * a.dq_stride;
+        constexpr int UNITS = (Br / 16) * (D / 16);
+        #pragma unroll
+        for (int u = warp_id; u < UNITS; u += NUM_WARPS) {
+            const int q0 = (u / (D / 16)) * 16, c0 = (u % (D / 16)) * 16;
+            float acc[2][4] = {};
+            #pragma unroll
+            for (int k = 0; k < Bc; k += 16) {
+                uint32_t da[4], kb[4];
+                ldmatrix_x4_trans(da, smem_dSt + (k + (lm >> 1) * 8 + lr) * LDS + q0 + (lm & 1) * 8);
+                ldmatrix_x4_trans(kb, smem_K + (k + (lm & 1) * 8 + lr) * LDH + c0 + (lm >> 1) * 8);
+                mma_m16n8k8(acc[0], da[0], da[1], kb[0]);
+                mma_m16n8k8(acc[0], da[2], da[3], kb[1]);
+                mma_m16n8k8(acc[1], da[0], da[1], kb[2]);
+                mma_m16n8k8(acc[1], da[2], da[3], kb[3]);
+            }
+            #pragma unroll
+            for (int n = 0; n < 2; n++) {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = q0 + g + (e >> 1) * 8, col = c0 + n * 8 + 2 * t + (e & 1);
+                    if (row < valid_q && col < a.head_dim) ::atomicAdd(dQ_blk + row * a.dq_stride + col, acc[n][e]);
+                }
+            }
+        }
+        // No barrier here: the next query block first writes Q, dO, L, D (not
+        // read by the dQ step) and writes dS^T / P^T only after its first barrier.
+    });
 
     // dK, dV of the warp's band and slice: half2 at their accumulator positions
     #pragma unroll

@@ -534,6 +534,15 @@ __device__ __forceinline__ void load_tile_g2s(
 }
 
 // ---------------------------------------------------------------------------
+// Barrier of the `threads` threads of one band of warps (named barrier id
+// 1 + band; 0 is __syncthreads). Used by the column-split Pascal forward and the
+// query-split Turing backward.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void band_barrier(int band, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(1 + band), "r"(threads) : "memory");
+}
+
+// ---------------------------------------------------------------------------
 // fp16 dot product with fp32 products and accumulation, 128-bit loads.
 // The products are NOT formed in fp16 (__hmul2): a single |q_i * k_i| > 65504
 // would overflow to inf even with in-range inputs, and on sm_61 fp16 math runs

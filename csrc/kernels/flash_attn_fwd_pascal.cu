@@ -21,11 +21,6 @@
 
 namespace flash_attn_legacy {
 
-// Barrier of the `threads` threads of one band (id 1 + band; 0 is __syncthreads).
-__device__ __forceinline__ void band_barrier(int band, int threads) {
-    asm volatile("bar.sync %0, %1;" :: "r"(1 + band), "r"(threads) : "memory");
-}
-
 struct PascalFwd {
 template <typename Tile>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
