@@ -901,7 +901,8 @@ static void dispatch_bwd_wmma_tile(int head_dim, F&& f) {
     bool ok = false;
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 32>>(limit, f); break;
-        case 64:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 64>>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<BwdTileWmma<64, 64, 64, 2>>(limit, f); break;  // V100 bwd N=4096: 11.4 -> 8.0 ms
+                  // with the query split (<32,64,64,2>: 9.2-10.9); d=32 tiles with kSplitD 2: no gain
         case 72:
         case 80:  ok = with_first_fitting_tile<BwdTileWmma<32, 64, 80>>(limit, f); break;  // 72 zero-padded;
                   // fwd+bwd N=4096 d=72/80: V100 11.9 ms (SDPA 16.0), T4 26.2 (37.5)
