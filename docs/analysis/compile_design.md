@@ -43,11 +43,15 @@ the pybind kernels `forward` (7), `locals()` in `flash_attn_with_kvcache` (5), `
      load), -5% at d=64 R=8; masks are passed only with padding (all-True masks become None before the kernel).
      Tried, no gain, not kept: one row scan per block for global bounds (B=1 +13%), K / V loads not waiting for the mask
      byte (V of masked keys zeroed).
-4. **Mask builder without host reads when tracing or with a tensor q_offset** (static caches): `[B, kv_length]` bool key
-   mask built on the device (`arange < q_offset + q_length`, & padding), never `int(q_offset)` / `bool(pad.all())`; the
-   cache is never sliced (static shapes: no recompilation per step). Decode -> kernel with the mask; q_len > 1 (prefill of a
-   static cache, chunked prefill) -> the unpad plan (host sync / graph break: data-dependent shapes, as upstream FA2's
-   unpad), acceptable since HF compiles the decode steps only.
+4. **Mask builder without host reads for compiled decode steps.** transformers 5.x already disables the mask skip for
+   compileable caches (StaticCache) at q_length == 1, in eager and compiled mode: the builder then returns SDPA's 4D
+   boolean mask (causal, padding, window, built without host reads), the cache is not sliced (static shapes), and
+   decision 3 runs it on the decode kernel (key mask, cache_seqlens from the last kept key). What broke the graph there
+   was the builder's `from transformers import masking_utils` (an import of transformers' lazy module inside traced
+   code): it is imported in `register()`. For the other compiled decode steps (DynamicCache, no cache) the builder
+   returns SDPA's 4D mask too under tracing, instead of reading `bool(pad.all())`. Prefill keeps the slicing of a static
+   cache (one `int(q_offset)` read); q_len > 1 under tracing (compiled training with an attention_mask, chunked prefill)
+   still reads the mask on the host (graph break), as upstream FA2's unpad.
 
 Out of scope: the varlen `validate=True` sync (callers that build cu_seqlens pass `validate=False`, as HF does); the
 unpad plan of padded prefills; `_mask_window`'s value read when its tag is lost (models pass `sliding_window`).
@@ -59,6 +63,17 @@ a. Native op registration + fake implementations + traceable wrappers. Tests: `t
 b. Decode key mask in the kernel; HF decode path without host syncs.
 c. Mask builder without host reads under tracing / static caches.
 d. Measure (probe above, end-to-end generate on a real model on P100 / T4), docs.
+
+## Results (step c, T4, tiny Llama, B=2, 64 new tokens, one StaticCache reused across calls)
+| | eager | compiled (HF generate, inductor) |
+|---|---|---|
+| sdpa | 254 ms | 102 ms |
+| flash_attn_legacy | 259 ms | 103 ms |
+No graph break in a compiled decode step (as SDPA), logits within fp16 noise of eager. The gain comes from step b (the
+static cache's 4D decode mask on the kernel, no host sync) and the import moved out of the builder. Note: `generate` with
+`cache_implementation="static"` allocates a new cache per call and recompiles on every call (guards on the cache tensors'
+identity, SDPA alike): pass a StaticCache as `past_key_values` and reuse it. Inductor needs Triton (SM >= 7.0): on Pascal
+compile with `backend="aot_eager"` or run eager.
 
 ## Acceptance
 - No graph break from flash_attn_legacy in a compiled decode step with a static cache (`torch._dynamo` counters), and a

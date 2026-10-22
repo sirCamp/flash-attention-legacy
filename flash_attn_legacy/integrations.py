@@ -693,6 +693,12 @@ def _add_bias_to_mask(bias, mask, kv_len, dtype):
     return (bias + mask.to(dtype)).clamp_min(lowest), False
 
 
+# transformers.masking_utils, set by register() before the builder can run: imported
+# there, not in the builder (an import of transformers' lazy module breaks
+# torch.compile graphs).
+_masking_utils = None
+
+
 def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offset=0,
                             mask_function=None, attention_mask=None, local_size=None,
                             allow_is_causal_skip=True, allow_is_bidirectional_skip=False,
@@ -709,13 +715,14 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
         onto the varlen kernel when the padding is contiguous per row;
       - causal sliding window (P4.1): always a [batch, n_valid] mask, as above,
         holding the window in its values (_WINDOW_ATTR) -> the kernel's window_size.
-    Anything else gets the SDPA builder's boolean 4D mask (-> SDPA fallback).
+    Anything else gets the SDPA builder's boolean 4D mask (-> SDPA fallback; for a
+    decode step the decode kernel with that mask: transformers disables the skip for
+    static caches at q_length == 1, and compiled decode steps get it too).
     The SDPA builder is always called with both skips disabled: an SDPA `None`
     means "slice K/V to q_len" (causal, top-left) or "no mask at all", which is
     not what our kernel does with a pre-allocated cache (B1).
     """
-    from transformers import masking_utils as mu
-
+    mu = _masking_utils
     if mask_function is None:
         mask_function = mu.causal_mask_function
 
@@ -735,6 +742,10 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
     skip_allowed = (causal and allow_is_causal_skip) or (bidirectional and allow_is_bidirectional_skip)
     if not skip_allowed:
         return sdpa_mask()  # packing, overlays, custom mask functions, bidirectional windows
+    if q_length == 1 and is_compiling():
+        # Compiled decode (static caches: tensor q_offset): no host read, no slicing
+        # (static shapes). SDPA's 4D mask -> the decode kernel's key mask (P6.5)
+        return sdpa_mask()
     if window is None and local_size is not None and kv_length >= local_size:
         return sdpa_mask()  # a window we did not recognise
     # Static caches may pass offsets as 0-d tensors; reading them syncs (see P6.5).
@@ -811,8 +822,10 @@ def register():
         # mask at all for an unknown implementation and passes attention_mask=None
         # even for padded batches (padding silently ignored).
         try:
-            from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
-            ALL_MASK_ATTENTION_FUNCTIONS.register("flash_attn_legacy", _flash_attn_legacy_mask)
+            global _masking_utils
+            from transformers import masking_utils
+            _masking_utils = masking_utils
+            masking_utils.ALL_MASK_ATTENTION_FUNCTIONS.register("flash_attn_legacy", _flash_attn_legacy_mask)
         except (ImportError, AttributeError):
             pass  # older transformers: masks are built per model
 

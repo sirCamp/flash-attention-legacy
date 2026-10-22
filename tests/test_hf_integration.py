@@ -1422,3 +1422,47 @@ def test_is_causal_kwarg_vs_module_attribute(module_causal, kwarg, expected):
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=expected,
                                                            scale=0.125).transpose(1, 2)
     torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not hasattr(torch, "compiler"), reason="torch.compile required")
+@pytest.mark.parametrize("cache_type", ["static", "dynamic"])
+def test_compiled_decode(monkeypatch, cache_type):
+    """P6.5: a compiled decode step with left padding runs the decode kernel with
+    the step's mask (static: HF's 4D mask for compileable caches; dynamic: our
+    builder's compiled branch), matches eager, and breaks the graph no more often
+    than SDPA (none for either)."""
+    import copy
+    from torch._dynamo.utils import counters
+    from transformers import DynamicCache, StaticCache
+    base = tiny_llama()
+    ids = torch.randint(0, base.config.vocab_size, (2, 10), device="cuda")
+    mask = torch.ones_like(ids)
+    mask[1, :3] = 0
+    breaks, logits = {}, {}
+    for impl in ("sdpa", "flash_attn_legacy"):
+        model = load_impl(base, impl)
+        cache = StaticCache(config=model.config, max_cache_len=32) if cache_type == "static" else DynamicCache()
+        with torch.no_grad():
+            nxt = model(input_ids=ids, attention_mask=mask, past_key_values=cache).logits[:, -1:].argmax(-1)
+            step_mask = torch.cat([mask, torch.ones_like(nxt)], 1)
+            pos = torch.tensor([ids.shape[1]], device="cuda")
+
+            def step(c):
+                return model(input_ids=nxt, attention_mask=step_mask, past_key_values=c, cache_position=pos).logits
+
+            eager = step(copy.deepcopy(cache))
+            counter = KernelCounter(monkeypatch)
+            torch._dynamo.reset()
+            counters.clear()
+            try:
+                compiled = torch.compile(step, backend="aot_eager")(copy.deepcopy(cache))
+                breaks[impl] = sum(counters["graph_break"].values())
+            finally:
+                torch._dynamo.reset()
+                counters.clear()
+        torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=2e-2)
+        logits[impl] = eager.float()
+        if impl == "flash_attn_legacy":
+            assert len(counter.decode_calls) == base.config.num_hidden_layers and fallback_stats() == {}
+    assert breaks["flash_attn_legacy"] <= breaks["sdpa"], breaks
+    torch.testing.assert_close(logits["flash_attn_legacy"], logits["sdpa"], atol=5e-2, rtol=5e-2)
