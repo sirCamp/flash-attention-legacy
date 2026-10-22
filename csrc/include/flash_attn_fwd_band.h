@@ -7,11 +7,13 @@
 // that do not depend on how S = Q K^T and O += P V are computed live here, once:
 //   - FwdBlockArgs: pointers and lengths of one Q block, from the batched or
 //     the varlen grid (fwd_batched_kernel / fwd_varlen_kernel)
-//   - fwd_key_masked: tail and bottom-right causal masking
+//   - fwd_key_masked: the KeyWindow of the sequence (causal, sliding window,
+//     tail of the keys)
 //   - BandSoftmax: online softmax in the log2 domain for the rows a thread holds,
 //     reduced over the lanes that share a row
-//   - fwd_band_loop: the K/V loop (causal limit, blocks without masking, blocks
-//     a band cannot see, K/V prefetch, the two block-wide barriers)
+//   - fwd_band_loop: the K/V loop (the blocks the Q block can see, blocks
+//     without masking, blocks a band cannot see, K/V prefetch, the two
+//     block-wide barriers)
 //   - fwd_band_run: fwd_band_loop with the Q/K/V tile copies (half or fp32
 //     shared memory, optional K/V register prefetch); launch_fwd(_varlen)
 // A family provides a Body with `template <class Tile> static void run(const
@@ -39,13 +41,17 @@ struct FwdBlockArgs {
     int q_row_start, valid_q, seq_len_q, seq_len_k;
     int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero)
     float softmax_scale;
-    bool is_causal;
+    int window_left, window_right;  // KeyWindow of the sequence
+
+    __device__ __forceinline__ KeyWindow window() const {
+        return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
+    }
 };
 
-// Key `key` is not visible to sequence row `q_row`: past the end, or (causal,
-// bottom-right aligned) after row + seq_len_k - seq_len_q.
+// Key `key` is not visible to sequence row `q_row` (KeyWindow; includes keys
+// past the end).
 __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row, int key) {
-    return key >= a.seq_len_k || (a.is_causal && key > q_row + a.seq_len_k - a.seq_len_q);
+    return a.window().masked(q_row, key);
 }
 
 // Online softmax state of the ROWS rows a thread holds; each row is spread over
@@ -111,30 +117,37 @@ struct BandSoftmax {
 //   commit()          leave the fetched block fully in shared memory (the
 //                     barrier that follows publishes it)
 //   step(mask, kv_start)  this warp's band on the block in shared memory;
-//                     mask is std::true_type when tail/causal masking is needed
-// fetch(j + 1) is issued right after block j is committed, so its global loads
-// overlap the computation of block j. Bands skip blocks they cannot see
-// (causal) and only mask the blocks that need it. Inactive bands (rows past
-// valid_q) still take part in every barrier.
+//                     mask is std::true_type when some key of the block is
+//                     outside the KeyWindow of some row of the band
+// The loop visits the K/V blocks some row of the Q block can see (KeyWindow:
+// causal, sliding window); fetch(j + 1) is issued right after block j is
+// committed, so its global loads overlap the computation of block j. Bands skip
+// blocks they cannot see and only mask the blocks that need it. Inactive bands
+// (rows past valid_q) still take part in every barrier.
 template <int Br, int Bc, typename LoadQ, typename Fetch, typename Commit, typename Step>
 __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_row0, bool band_active,
                                               LoadQ&& load_q, Fetch&& fetch, Commit&& commit, Step&& step) {
-    const int kv_limit = fwd_kv_limit(a.is_causal, a.q_row_start, Br, Bc, a.seq_len_q, a.seq_len_k);
-    // Every row of the band is at or below its first row: blocks before this
-    // limit need no masking for any of them.
-    const int nomask_limit = fwd_kv_nomask_limit(a.is_causal, a.q_row_start + band_row0, Bc,
-                                                 a.seq_len_q, a.seq_len_k);
-    const int band_last_key = a.q_row_start + band_row0 + kBandRows - 1 + (a.seq_len_k - a.seq_len_q);
-    if (kv_limit > 0) fetch(0);  // in flight while Q is loaded
+    // First / last key of a row grow with the row: the Q block sees keys
+    // [first_key(first row), last_key(last row)], a band likewise, and a block
+    // inside [first_key(last row), last_key(first row)] of the band needs no mask.
+    const KeyWindow w = a.window();
+    const int q_first = a.q_row_start, q_last = a.q_row_start + a.valid_q - 1;
+    const int kv_begin = w.first_key(q_first) / Bc;
+    const int last_key = w.last_key(q_last);
+    const int kv_end = last_key < 0 ? 0 : last_key / Bc + 1;
+    const int band_first = a.q_row_start + band_row0, band_last = band_first + kBandRows - 1;
+    const int band_first_key = w.first_key(band_first), band_last_key = w.last_key(band_last);
+    const int nomask_first = w.first_key(band_last), nomask_last = w.last_key(band_first);
+    if (kv_begin < kv_end) fetch(kv_begin);  // in flight while Q is loaded
     load_q();
-    for (int kv_blk = 0; kv_blk < kv_limit; kv_blk++) {
+    for (int kv_blk = kv_begin; kv_blk < kv_end; kv_blk++) {
         const int kv_start = kv_blk * Bc;
         commit();
         __syncthreads();
-        if (kv_blk + 1 < kv_limit) fetch(kv_blk + 1);
-        if (band_active && !(a.is_causal && kv_start > band_last_key)) {  // warp-uniform
-            if (kv_blk < nomask_limit) step(std::false_type{}, kv_start);
-            else                       step(std::true_type{}, kv_start);
+        if (kv_blk + 1 < kv_end) fetch(kv_blk + 1);
+        if (band_active && kv_start <= band_last_key && kv_start + Bc - 1 >= band_first_key) {  // warp-uniform
+            if (kv_start >= nomask_first && kv_start + Bc - 1 <= nomask_last) step(std::false_type{}, kv_start);
+            else                                                              step(std::true_type{}, kv_start);
         }
         __syncthreads();  // all warps done with K/V before the next commit
     }
@@ -211,7 +224,8 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.seq_len_k = p.seq_len_k;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
-    a.is_causal = p.is_causal;
+    a.window_left = p.window_left;
+    a.window_right = p.window_right;
     Body::template run<Tile>(a);
 }
 
@@ -246,7 +260,8 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.seq_len_k = p.cu_seqlens_k[seq_idx + 1] - k_start_tok;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
-    a.is_causal = p.is_causal;
+    a.window_left = p.window_left;
+    a.window_right = p.window_right;
     Body::template run<Tile>(a);
 }
 

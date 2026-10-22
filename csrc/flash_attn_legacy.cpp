@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include "include/flash_attn_common.h"
 
 namespace flash_attn_legacy {
@@ -109,6 +110,20 @@ static void check_head_dim(int d) {
                 "head_dim must be 32, 64, 72, 80, 96, 128, or 256, got ", d);
 }
 
+// (window_left, window_right) of the kernels' KeyWindow from the API arguments:
+// -1 = unbounded, causal sets right = 0 (as upstream flash-attn). A side that
+// reaches every key of the longest possible sequence (max_q query rows, max_k
+// keys) is unbounded: no masking work for it, and no int overflow in KeyWindow.
+static std::pair<int, int> key_window(bool is_causal, int64_t left, int64_t right,
+                                      int64_t max_q, int64_t max_k) {
+    TORCH_CHECK(left >= -1 && right >= -1,
+                "window_size entries must be >= -1 (-1 = unbounded), got (", left, ", ", right, ")");
+    if (is_causal) right = 0;
+    if (left >= max_k - 1) left = -1;   // first key of every row: <= N_kv - 1 - left <= 0
+    if (right >= max_q - 1) right = -1; // last key of every row: >= N_kv - N_q + right >= N_kv - 1
+    return {int(left), int(right)};
+}
+
 // Input checks shared by the varlen entry points: Q [total_q, H_q, d],
 // K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
 static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
@@ -204,11 +219,12 @@ static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, con
 // ---------------------------------------------------------------------------
 // Forward — supports GQA and N_q != N_kv:
 //   Q is [B, H_q, N_q, d], K/V are [B, H_kv, N_kv, d]; H_q % H_kv == 0.
-// Causal masking is bottom-right aligned (query i sees keys j <= i + N_kv - N_q).
+// Causal masking is bottom-right aligned (query i sees keys j <= i + N_kv - N_q);
+// window_left / window_right restrict each row further (KeyWindow, -1 = unbounded).
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    float softmax_scale, bool is_causal
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
@@ -255,7 +271,8 @@ std::vector<torch::Tensor> flash_attn_forward(
 
     p.batch_size = B; p.num_heads = H_q; p.num_heads_k = H_kv;
     p.seq_len_q = N; p.seq_len_k = Nk; p.head_dim = d;
-    p.softmax_scale = softmax_scale; p.is_causal = is_causal;
+    p.softmax_scale = softmax_scale;
+    std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
 
     p.q_batch_stride = Q.stride(0); p.q_head_stride = Q.stride(1); p.q_seq_stride = Q.stride(2);
     p.k_batch_stride = K.stride(0); p.k_head_stride = K.stride(1); p.k_seq_stride = K.stride(2);
@@ -285,7 +302,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     torch::Tensor dO,
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor O, torch::Tensor L,
-    float softmax_scale, bool is_causal
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -347,7 +364,8 @@ std::vector<torch::Tensor> flash_attn_backward(
     set_bwd_pointers(bwd, dO, Q, K, V, O, L, D_tensor, dQ_fp32, dK, dV);
     bwd.batch_size = B; bwd.num_heads = H_q; bwd.num_heads_k = H_kv;
     bwd.seq_len_q = N; bwd.seq_len_k = Nk; bwd.head_dim = d;
-    bwd.softmax_scale = softmax_scale; bwd.is_causal = is_causal;
+    bwd.softmax_scale = softmax_scale;
+    std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
 
     bwd.q_batch_stride = Q.stride(0); bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(2);
     bwd.k_batch_stride = K.stride(0); bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(2);
@@ -380,7 +398,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
     check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
@@ -425,7 +443,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     p.num_heads_k = H_kv;
     p.head_dim = d;
     p.softmax_scale = softmax_scale;
-    p.is_causal = is_causal;
+    std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
 
     p.q_token_stride = Q.stride(0); p.q_head_stride = Q.stride(1);
     p.k_token_stride = K.stride(0); p.k_head_stride = K.stride(1);
@@ -454,7 +472,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor O, torch::Tensor L,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, bool validate
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -503,7 +521,8 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     // seq_len_q / seq_len_k stay 0: the varlen kernel takes each sequence's lengths
     // from cu_seqlens (max_seqlen_* are accepted for API symmetry, unused).
     bwd.batch_size = 1; bwd.num_heads = H_q; bwd.num_heads_k = H_kv; bwd.head_dim = d;
-    bwd.softmax_scale = softmax_scale; bwd.is_causal = is_causal;
+    bwd.softmax_scale = softmax_scale;
+    std::tie(bwd.window_left, bwd.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
     // Packed layout: no batch stride, "seq" stride = token stride
     bwd.q_head_stride = Q.stride(1); bwd.q_seq_stride = Q.stride(0);
     bwd.k_head_stride = K.stride(1); bwd.k_seq_stride = K.stride(0);
@@ -531,23 +550,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &flash_attn_legacy::flash_attn_forward,
           "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false);
+          py::arg("softmax_scale"), py::arg("is_causal") = false,
+          py::arg("window_left") = -1, py::arg("window_right") = -1);
     m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
           "Flash Attention v2 forward — variable-length packed sequences",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false, py::arg("validate") = true);
+          py::arg("softmax_scale"), py::arg("is_causal") = false,
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("validate") = true);
     m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
           "Flash Attention v2 backward — variable-length packed sequences, one launch",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("L"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false, py::arg("validate") = true);
+          py::arg("softmax_scale"), py::arg("is_causal") = false,
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("validate") = true);
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("L"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false);
+          py::arg("softmax_scale"), py::arg("is_causal") = false,
+          py::arg("window_left") = -1, py::arg("window_right") = -1);
 }

@@ -16,7 +16,24 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 # Reference implementations
 # ---------------------------------------------------------------------------
 
-def ref_attention(q, k, v, scale, is_causal=False):
+def ref_hidden(Nq, Nk, is_causal, window, device):
+    """[Nq, Nk] True where the key is hidden. Bottom-right aligned: query i sits at
+    key i + (Nk - Nq) and sees keys [i + off - left, i + off + right] (-1 =
+    unbounded side; causal: right = 0), as upstream flash-attn."""
+    left, right = window
+    if is_causal:
+        right = 0
+    rel = (torch.arange(Nk, device=device)[None, :]
+           - torch.arange(Nq, device=device)[:, None] - (Nk - Nq))  # key - row position
+    hidden = torch.zeros(Nq, Nk, dtype=torch.bool, device=device)
+    if left >= 0:
+        hidden |= rel < -left
+    if right >= 0:
+        hidden |= rel > right
+    return hidden
+
+
+def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1)):
     """Standard attention in FP32. Handles GQA by repeating K/V heads."""
     H_q, H_kv = q.shape[1], k.shape[1]
     if H_kv < H_q:
@@ -24,18 +41,13 @@ def ref_attention(q, k, v, scale, is_causal=False):
         k = k.repeat_interleave(reps, dim=1)
         v = v.repeat_interleave(reps, dim=1)
     s = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-    if is_causal:
-        Nq, Nk = q.shape[-2], k.shape[-2]
-        # bottom-right aligned: query i sees keys j <= i + (Nk - Nq)
-        mask = torch.triu(torch.ones(Nq, Nk, device=q.device, dtype=torch.bool),
-                          diagonal=1 + Nk - Nq)
-        s.masked_fill_(mask, float('-inf'))
+    s.masked_fill_(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
     p = torch.softmax(s, dim=-1)
     p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     return torch.matmul(p, v.float()).half()
 
 
-def ref_backward(q, k, v, grad_out, scale, is_causal=False):
+def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1)):
     """Reference backward in FP32. Returns dQ [H_q], dK [H_kv], dV [H_kv]."""
     H_q, H_kv = q.shape[1], k.shape[1]
     reps = H_q // H_kv
@@ -46,12 +58,7 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False):
     v_f = v.float().detach().repeat_interleave(reps, dim=1).requires_grad_(True)
 
     s = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
-    if is_causal:
-        Nq, Nk = q.shape[-2], k.shape[-2]
-        # bottom-right aligned: query i sees keys j <= i + (Nk - Nq)
-        mask = torch.triu(torch.ones(Nq, Nk, device=q.device, dtype=torch.bool),
-                          diagonal=1 + Nk - Nq)
-        s.masked_fill_(mask, float('-inf'))
+    s = s.masked_fill(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
     p = torch.softmax(s, dim=-1)
     p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
     o = torch.matmul(p, v_f)
@@ -745,6 +752,102 @@ class TestCrossLength:
                 torch.testing.assert_close(v.grad[k_s:k_s + lk], rdv.squeeze(0).permute(1, 0, 2), atol=5e-2, rtol=5e-2)
                 qs += lq
                 k_s += lk
+
+
+class TestWindow:
+    """window_size=(left, right) (docs/PLAN.md P4.1): forward + backward vs the
+    FP32 reference, batched and varlen, with blocks outside the window skipped."""
+
+    WINDOWS = [(0, 0), (16, 0), (63, -1), (-1, 40), (100, 100), (3, 7), (200, -1)]
+
+    @pytest.mark.parametrize("n_q,n_k", [(256, 256), (100, 300), (300, 100)])
+    @pytest.mark.parametrize("window", WINDOWS, ids=str)
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_forward_backward(self, head_dim, n_q, n_k, window, causal):
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        scale = 1.0 / math.sqrt(head_dim)
+        H_q, H_kv = 4, 2
+        q = torch.randn(2, H_q, n_q, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        k = torch.randn(2, H_kv, n_k, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        v = torch.randn(2, H_kv, n_k, head_dim, device="cuda", dtype=torch.float16, requires_grad=True)
+        go = torch.randn(2, H_q, n_q, head_dim, device="cuda", dtype=torch.float16)
+
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=causal, window_size=window)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        ref = ref_attention(*args, scale, is_causal=causal, window=window)
+        rdq, rdk, rdv = ref_backward(*args, go, scale, is_causal=causal, window=window)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(q.grad, rdq, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(k.grad, rdk, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(v.grad, rdv, atol=5e-2, rtol=5e-2)
+
+    @pytest.mark.parametrize("window", [(31, 0), (0, 31), (5, 70)], ids=str)
+    def test_window_is_not_shifted(self, window):
+        """Mutation check: the kernel matches its own window, not the window +- 1."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(1)
+        q, k, v = (torch.randn(1, 2, 192, 64, device="cuda", dtype=torch.float16) for _ in range(3))
+        out = flash_attention(q, k, v, window_size=window)
+        scale = 1.0 / math.sqrt(64)
+        torch.testing.assert_close(out, ref_attention(q, k, v, scale, window=window), atol=2e-2, rtol=2e-2)
+        for shifted in ((window[0] + 1, window[1]), (window[0], window[1] + 1)):
+            assert (out - ref_attention(q, k, v, scale, window=shifted)).abs().max() > 0.05
+
+    def test_wide_window_is_unbounded(self, head_dim):
+        """A window reaching every key is exactly no window (normalised to -1 on
+        the host: same kernel work)."""
+        from flash_attn_legacy import flash_attention
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(2, 4, 200, head_dim, device="cuda", dtype=torch.float16) for _ in range(3))
+        for causal in (False, True):
+            ref = flash_attention(q, k, v, causal=causal)
+            assert torch.equal(flash_attention(q, k, v, causal=causal, window_size=(199, 199)), ref)
+            assert torch.equal(flash_attention(q, k, v, causal=causal, window_size=(10**9, 10**9)), ref)
+
+    @pytest.mark.parametrize("window", [(15, 0), (5, 20), (40, -1), (-1, 7)], ids=str)
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen(self, window, causal):
+        """Per-sequence windows, forward + backward, sequences longer and shorter
+        than the window, Q shorter and longer than K (rows with no visible key)."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        torch.manual_seed(0)
+        H_q, H_kv, d = 4, 2, 64
+        lens_q, lens_k = [1, 70, 200, 33, 128, 90], [5, 70, 260, 33, 300, 20]
+        cu_q = torch.tensor([0] + list(torch.tensor(lens_q).cumsum(0)), dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0] + list(torch.tensor(lens_k).cumsum(0)), dtype=torch.int32, device="cuda")
+        q = torch.randn(sum(lens_q), H_q, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        k = torch.randn(sum(lens_k), H_kv, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        v = torch.randn(sum(lens_k), H_kv, d, device="cuda", dtype=torch.float16, requires_grad=True)
+        go = torch.randn_like(q)
+        scale = 1.0 / math.sqrt(d)
+        out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k),
+                                     softmax_scale=scale, causal=causal, window_size=window)
+        out.backward(go)
+        qs = ks = 0
+        for lq, lk in zip(lens_q, lens_k):
+            def seq(t, s0, n):
+                return t[s0:s0 + n].detach().permute(1, 0, 2).unsqueeze(0)
+
+            def tok(t):
+                return t.squeeze(0).permute(1, 0, 2)
+            qi, ki, vi, goi = seq(q, qs, lq), seq(k, ks, lk), seq(v, ks, lk), seq(go, qs, lq)
+            ref = ref_attention(qi, ki, vi, scale, is_causal=causal, window=window)
+            rdq, rdk, rdv = ref_backward(qi, ki, vi, goi, scale, is_causal=causal, window=window)
+            torch.testing.assert_close(out[qs:qs + lq], tok(ref), atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(q.grad[qs:qs + lq], tok(rdq), atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(k.grad[ks:ks + lk], tok(rdk), atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(v.grad[ks:ks + lk], tok(rdv), atol=5e-2, rtol=5e-2)
+            qs += lq
+            ks += lk
+
+    @pytest.mark.parametrize("window", [(-2, 0), (0, -5), (1,), "12", None, (3.7, 0), (True, 0)])
+    def test_invalid_window_raises(self, window):
+        from flash_attn_legacy import flash_attention
+        q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+        with pytest.raises(ValueError, match="window_size"):
+            flash_attention(q, q, q, window_size=window)
 
 
 class TestValidation:

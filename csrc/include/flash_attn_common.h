@@ -73,8 +73,8 @@ struct FlashAttnParams {
     // Softmax scale  (typically 1/sqrt(d))
     float softmax_scale;
 
-    // Causal mask
-    bool is_causal;
+    // Visible keys of each query row: KeyWindow (-1 = unbounded; causal is right = 0)
+    int window_left, window_right;
 };
 
 // ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ struct FlashAttnVarlenParams {
     index_t o_head_stride;
 
     float softmax_scale;
-    bool is_causal;
+    int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 };
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ struct FlashAttnBwdParams {
     // Dimensions
     int batch_size, num_heads, num_heads_k, seq_len_q, seq_len_k, head_dim;
     float softmax_scale;
-    bool is_causal;
+    int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 
     // Strides for Q/dQ
     index_t q_batch_stride, q_head_stride, q_seq_stride;
@@ -526,42 +526,38 @@ __device__ __forceinline__ float half_dot(
 #endif  // __CUDACC__
 
 // ---------------------------------------------------------------------------
-// Causal masking with N_q != N_kv is bottom-right aligned (same as upstream
-// flash-attn): query row i may attend to keys j <= i + (N_kv - N_q).
-// For N_q == N_kv this is the usual j <= i.
+// Keys visible to a query row (docs/PLAN.md P4.1). Rows are bottom-right
+// aligned, as in upstream flash-attn: row i sits at key i + (N_kv - N_q), and
+// sees the keys [i + off - left, i + off + right] inside [0, N_kv); a negative
+// left / right is unbounded on that side. Causal is right = 0 (with N_q == N_kv:
+// key j <= i); a sliding window of W keys back (HF) is left = W - 1. Rows may
+// see no key at all (e.g. causal with N_q > N_kv): they end with O = 0.
 // ---------------------------------------------------------------------------
+struct KeyWindow {
+    int left, right;            // < 0: unbounded
+    int offset;                 // N_kv - N_q
+    int seq_len_q, seq_len_k;
 
-// Number of K/V blocks a Q block starting at q_row_start has to visit (forward).
-__host__ __device__ __forceinline__ int fwd_kv_limit(
-    bool causal, int q_row_start, int Br, int Bc, int seq_len_q, int seq_len_k
-) {
-    const int nkv = cdiv(seq_len_k, Bc);
-    if (!causal) return nkv;
-    const int last_visible_key = q_row_start + Br - 1 + (seq_len_k - seq_len_q);
-    const int lim = (last_visible_key < 0) ? 0 : cdiv(last_visible_key + 1, Bc);
-    return lim < nkv ? lim : nkv;
-}
+    __host__ __device__ __forceinline__ KeyWindow(int left_, int right_, int seq_len_q_, int seq_len_k_)
+        : left(left_), right(right_), offset(seq_len_k_ - seq_len_q_), seq_len_q(seq_len_q_), seq_len_k(seq_len_k_) {}
 
-// Number of leading K/V blocks that need no masking for any row of the Q block
-// [q_row_start, q_row_start + Br): fully inside seq_len_k and, if causal, fully
-// visible to the first row (bottom-right alignment). Always <= fwd_kv_limit.
-__host__ __device__ __forceinline__ int fwd_kv_nomask_limit(
-    bool causal, int q_row_start, int Bc, int seq_len_q, int seq_len_k
-) {
-    const int full = seq_len_k / Bc;
-    if (!causal) return full;
-    const int visible = q_row_start + 1 + (seq_len_k - seq_len_q);  // keys seen by the first row
-    const int lim = (visible <= 0) ? 0 : visible / Bc;
-    return lim < full ? lim : full;
-}
-
-// First Q block that can see any key of the K/V block starting at kv_start (backward).
-__host__ __device__ __forceinline__ int bwd_first_q_block(
-    bool causal, int kv_start, int Br, int seq_len_q, int seq_len_k
-) {
-    if (!causal) return 0;
-    const int first_q = kv_start - (seq_len_k - seq_len_q);
-    return first_q <= 0 ? 0 : first_q / Br;
-}
+    // First / last key row `row` sees (last < first: none).
+    __host__ __device__ __forceinline__ int first_key(int row) const {
+        return (left < 0 || row + offset - left < 0) ? 0 : row + offset - left;
+    }
+    __host__ __device__ __forceinline__ int last_key(int row) const {
+        return (right < 0 || row + offset + right > seq_len_k - 1) ? seq_len_k - 1 : row + offset + right;
+    }
+    __host__ __device__ __forceinline__ bool masked(int row, int key) const {
+        return key < first_key(row) || key > last_key(row);
+    }
+    // First / last query row that sees key `key` (last < first: none).
+    __host__ __device__ __forceinline__ int first_row(int key) const {
+        return (right < 0 || key - offset - right < 0) ? 0 : key - offset - right;
+    }
+    __host__ __device__ __forceinline__ int last_row(int key) const {
+        return (left < 0 || key - offset + left > seq_len_q - 1) ? seq_len_q - 1 : key - offset + left;
+    }
+};
 
 }  // namespace flash_attn_legacy

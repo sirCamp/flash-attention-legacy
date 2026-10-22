@@ -69,7 +69,21 @@ struct BwdBlockArgs {
     int heads_per_kv, kv_start, seq_len_q, seq_len_k;
     int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero, never written)
     float softmax_scale;
-    bool is_causal;
+    int window_left, window_right;  // KeyWindow of the sequence
+
+    __device__ __forceinline__ KeyWindow window() const {
+        return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
+    }
+    // Query blocks of Br rows [x, y) with some row that sees a key of the key
+    // block [kv_start, kv_start + Bc) (first / last row grow with the key)
+    template <int Br, int Bc>
+    __device__ __forceinline__ int2 q_blocks() const {
+        const KeyWindow w = window();
+        const int first_row = w.first_row(kv_start);
+        const int last_row = w.last_row(min(kv_start + Bc, seq_len_k) - 1);
+        if (last_row < first_row) return make_int2(0, 0);
+        return make_int2(first_row / Br, last_row / Br + 1);
+    }
 };
 
 // b: batch (0 for varlen); q_tok0 / k_tok0: first row of the sequence (0 for batched).
@@ -99,7 +113,8 @@ __device__ __forceinline__ BwdBlockArgs bwd_block_args(const FlashAttnBwdParams&
     a.seq_len_k = seq_len_k;
     a.head_dim = p.head_dim;  // kernels narrow it with tile_valid_cols
     a.softmax_scale = p.softmax_scale;
-    a.is_causal = p.is_causal;
+    a.window_left = p.window_left;
+    a.window_right = p.window_right;
     return a;
 }
 
@@ -175,7 +190,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     const int tid = threadIdx.x;
     const int kv_start = a.kv_start;
     const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-    const int causal_off = a.seq_len_k - a.seq_len_q;
+    const KeyWindow w = a.window();
 
     extern __shared__ __align__(128) char smem_raw[];  // aligned for 128-bit accesses
     half*  smem_K  = reinterpret_cast<half*>(smem_raw);
@@ -196,11 +211,10 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     #pragma unroll
     for (int c = 0; c < KV_COLS; c++) { acc_dK[c] = 0.0f; acc_dV[c] = 0.0f; }
 
-    const int num_q_blocks = cdiv(a.seq_len_q, Br);
-    const int q_start_blk = bwd_first_q_block(a.is_causal, kv_start, Br, a.seq_len_q, a.seq_len_k);
+    const int2 q_blks = a.template q_blocks<Br, Bc>();
 
     for (int qh = 0; qh < a.heads_per_kv; qh++) {
-        for (int q_blk = q_start_blk; q_blk < num_q_blocks; q_blk++) {
+        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
             const int q_start = q_blk * Br;
             const int valid_q = min(Br, a.seq_len_q - q_start);
 
@@ -222,8 +236,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             for (int e = tid; e < Br * Bc; e += NT) {
                 const int i = e / Bc, j = e % Bc;
                 float p = 0.0f, ds = 0.0f;
-                const bool valid = i < valid_q && j < valid_kv &&
-                    !(a.is_causal && (kv_start + j) > (q_start + i + causal_off));
+                const bool valid = i < valid_q && !w.masked(q_start + i, kv_start + j);
                 if (valid) {
                     const float s = half_dot<D>(smem_Q + i * LDH, smem_K + j * LDH) * a.softmax_scale;
                     p = expf(s - smem_L[i]);
@@ -347,7 +360,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
 
     const int kv_start = a.kv_start;
     const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-    const int causal_off = a.seq_len_k - a.seq_len_q;
+    const KeyWindow w = a.window();
     const float scale_log2 = a.softmax_scale * kLog2e;
 
     extern __shared__ __align__(128) char smem_raw[];  // WMMA needs 32-byte alignment
@@ -374,13 +387,12 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
     load_tile_g2s<Bc, D, NUM_THREADS, LDH>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
 
-    const int num_q_blocks = cdiv(a.seq_len_q, Br);
-    const int q_first_blk = bwd_first_q_block(a.is_causal, kv_start, Br, a.seq_len_q, a.seq_len_k);
+    const int2 q_blks = a.template q_blocks<Br, Bc>();
     const half* K_band = smem_K + band * T * LDH;
     const half* V_band = smem_V + band * T * LDH;
 
     for (int qh = 0; qh < a.heads_per_kv; qh++) {
-        for (int q_blk = q_first_blk; q_blk < num_q_blocks; q_blk++) {
+        for (int q_blk = q_blks.x; q_blk < q_blks.y; q_blk++) {
             const int q_start = q_blk * Br;
             const int valid_q = min(Br, a.seq_len_q - q_start);
             load_tile_g2s<Br, D, NUM_THREADS, LDH>(a.Q + qh * a.q_head_stride + q_start * a.q_stride, a.q_stride,
@@ -425,8 +437,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                 for (int i = 0; i < NE; i++) {
                     const int key = kv_start + band * T + e_row[i];
                     const int q = qt * T + e_col[i];  // row within the query block
-                    const bool masked = q >= valid_q || key >= a.seq_len_k ||
-                                        (a.is_causal && key > q_start + q + causal_off);
+                    const bool masked = q >= valid_q || w.masked(q_start + q, key);
                     const float p = masked ? 0.0f : exp2f(S[qt].x[i] * scale_log2 - smem_L[q]);
                     S[qt].x[i] = p;
                     dP[qt].x[i] = masked ? 0.0f : p * (dP[qt].x[i] - smem_D[q]) * a.softmax_scale;
