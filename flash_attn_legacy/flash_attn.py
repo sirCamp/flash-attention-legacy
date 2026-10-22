@@ -451,7 +451,7 @@ def _batch_int_tensor(t, name, device):
     return t.to(device=device, dtype=torch.int32)
 
 
-_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "block_table", "alibi_slopes")
+_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "alibi_slopes")
 
 
 def flash_attn_with_kvcache(
@@ -493,6 +493,14 @@ def flash_attn_with_kvcache(
             int outside that range raises
         cache_leftpad: int32 [B] or None: first valid key of each row (left
             padding); causal / window stay aligned to cache_seqlens
+        block_table: int32 [B, max_blocks] or None: paged KV cache (vLLM-style).
+            k_cache / v_cache are then [num_blocks, block_size, H_kv, d]
+            (block_size a multiple of 16; upstream FA2 needs 256) and key j of
+            row b lives in block block_table[b, j // block_size]; max_len =
+            max_blocks * block_size. The entries of the keys < cache_seqlens
+            must be valid block indices (not checked, as upstream); the others
+            are never read. Any integer dtype (converted to int32). Not with
+            cache_leftpad (as upstream)
         softmax_scale: default 1/sqrt(d)
         causal: bottom-right aligned (query i of q_len sees keys
             <= cache_seqlens - q_len + i); irrelevant for q_len == 1
@@ -505,8 +513,8 @@ def flash_attn_with_kvcache(
         return_softmax_lse: also return the logsumexp [B, H_q, q_len] (fp32;
             -inf for rows with no visible key nor sink)
         sinks: attention sinks [H_q] (keyword only, an extension)
-        k, v, rotary_cos, rotary_sin, cache_batch_idx, block_table, alibi_slopes:
-            not supported yet (NotImplementedError when given)
+        k, v, rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes: not
+            supported yet (NotImplementedError when given)
 
     Returns:
         out [B, q_len, H_q, d] in q's dtype, or (out, lse) with return_softmax_lse
@@ -523,7 +531,12 @@ def flash_attn_with_kvcache(
         raise RuntimeError("flash_attn_with_kvcache is inference only (no autograd): run under torch.no_grad()")
     if q.dim() != 4 or k_cache.dim() != 4:
         raise ValueError("q must be [B, q_len, H_q, d] and k_cache / v_cache [B, max_len, H_kv, d]")
-    B, max_len = q.shape[0], k_cache.shape[1]
+    B = q.shape[0]
+    if block_table is not None:
+        block_table = _batch_int_tensor(block_table, "block_table", q.device)
+        if block_table.dim() != 2:
+            raise ValueError(f"block_table must be [B, max_blocks], got {tuple(block_table.shape)}")
+    max_len = k_cache.shape[1] * (block_table.shape[1] if block_table is not None else 1)
     if cache_seqlens is None:
         cache_seqlens = max_len
     if isinstance(cache_seqlens, numbers.Integral) and not isinstance(cache_seqlens, bool):
@@ -541,5 +554,6 @@ def flash_attn_with_kvcache(
     if cache_leftpad is not None:
         cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
     out, lse = flash_attn_legacy_cuda.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal,
-                                                   *window_size, softcap, sinks, num_splits, cache_leftpad)
+                                                   *window_size, softcap, sinks, num_splits, cache_leftpad,
+                                                   block_table)
     return (out, lse) if return_softmax_lse else out

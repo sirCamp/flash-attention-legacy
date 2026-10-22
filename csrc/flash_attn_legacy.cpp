@@ -615,7 +615,11 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
 // copy: HF's [B, H_kv, N, d] cache passes as a transposed view), cache_seqlens
 // [B] int32 = end of the valid keys of each row (clamped to [0, max_len] in the
 // kernel: never read past the cache), cache_leftpad [B] int32 = first valid key
-// (left padding; clamped to [0, seqlen]). fp16 or bf16, read natively.
+// (left padding; clamped to [0, seqlen]). Paged: caches [num_blocks, block_size,
+// H_kv, d] and block_table [B, max_blocks] int32 (max_len = max_blocks *
+// block_size; not with cache_leftpad); the table entries of the keys
+// < cache_seqlens must be in [0, num_blocks): not validated (no sync), as
+// upstream. fp16 or bf16, read natively.
 // Returns out like q (BSHD) and lse [B, H_q, q_len] (natural log; -inf for rows
 // with no visible key nor sink).
 // ---------------------------------------------------------------------------
@@ -638,10 +642,12 @@ static void check_decode_layout(const torch::Tensor& t, const char* name) {
 std::vector<torch::Tensor> flash_attn_with_kvcache(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
     float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
-    c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad
+    c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad,
+    c10::optional<torch::Tensor> block_table
 ) {
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
-                "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d]");
+                "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d] "
+                "(paged: [num_blocks, block_size, H_kv, d])");
     TORCH_CHECK(q.is_cuda() && k_cache.device() == q.device() && v_cache.device() == q.device(),
                 "q, k_cache, v_cache must be on the same CUDA device");
     TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16, "q must be float16 or bfloat16");
@@ -650,9 +656,28 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
     TORCH_CHECK(q.size(0) <= INT32_MAX && q.size(1) <= INT32_MAX && k_cache.size(1) <= INT32_MAX,
                 "batch and sequence lengths must fit in int32");
     const int B = q.size(0), q_len = q.size(1), H_q = q.size(2), d = q.size(3);
-    const int max_len = k_cache.size(1), H_kv = k_cache.size(2);
+    const int H_kv = k_cache.size(2);
     check_head_dim(d);
-    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == d, "k_cache must be [B, max_len, H_kv, d]");
+    const bool paged = block_table.has_value() && block_table->defined();
+    torch::Tensor table;
+    int max_len = k_cache.size(1);
+    if (paged) {
+        // [num_blocks, block_size, H_kv, d] caches, block_table [B, max_blocks] int32
+        table = *block_table;
+        TORCH_CHECK(table.is_cuda() && table.device() == q.device() && table.dtype() == torch::kInt32 &&
+                    table.dim() == 2 && table.size(0) == B, "block_table must be int32 [B, max_blocks] on q's device");
+        TORCH_CHECK(k_cache.size(0) > 0, "paged KV cache: no blocks");
+        TORCH_CHECK(k_cache.size(1) > 0 && k_cache.size(1) % 16 == 0,
+                    "paged KV cache: block_size must be a positive multiple of 16, got ", k_cache.size(1));
+        TORCH_CHECK(!(cache_leftpad.has_value() && cache_leftpad->defined()),
+                    "cache_leftpad is not supported with a paged KV cache (block_table)");
+        TORCH_CHECK(int64_t(table.size(1)) * k_cache.size(1) <= INT32_MAX, "paged KV cache too long");
+        table = table.contiguous();
+        max_len = table.size(1) * k_cache.size(1);
+    } else {
+        TORCH_CHECK(k_cache.size(0) == B, "k_cache must be [B, max_len, H_kv, d]");
+    }
+    TORCH_CHECK(k_cache.size(3) == d, "k_cache head_dim must match q");
     TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
     TORCH_CHECK_NOT_IMPLEMENTED(H_q / H_kv * q_len <= flash_attn_decode_max_rows(),
                 "flash_attn_with_kvcache: (num_heads_q / num_heads_kv) * q_len = ", H_q / H_kv * q_len,
@@ -680,6 +705,14 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
     p.lse = lse.data_ptr<float>();
     p.cache_seqlens = cache_seqlens.data_ptr<int>();
     p.cache_leftpad = leftpad.defined() ? leftpad.data_ptr<int>() : nullptr;
+    p.block_table = paged ? table.data_ptr<int>() : nullptr;
+    p.max_blocks = paged ? table.size(1) : 0;
+    p.block_size = paged ? k_cache.size(1) : 0;
+    p.block_shift = -1;
+    if (paged && (p.block_size & (p.block_size - 1)) == 0) {
+        p.block_shift = 0;
+        while ((1 << p.block_shift) < p.block_size) p.block_shift++;
+    }
     p.sinks = data_or_null(sink);
     p.q_batch_stride = q.stride(0); p.q_seq_stride = q.stride(1); p.q_head_stride = q.stride(2);
     p.k_batch_stride = k_cache.stride(0); p.k_seq_stride = k_cache.stride(1); p.k_head_stride = k_cache.stride(2);
@@ -738,7 +771,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_seqlens"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
           py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
-          py::arg("sinks") = py::none(), py::arg("num_splits") = 0, py::arg("cache_leftpad") = py::none());
+          py::arg("sinks") = py::none(), py::arg("num_splits") = 0, py::arg("cache_leftpad") = py::none(),
+          py::arg("block_table") = py::none());
     m.def("decode_max_rows", &flash_attn_legacy::flash_attn_decode_max_rows,
           "Query rows per KV head ((H_q / H_kv) * q_len) flash_attn_with_kvcache handles");
     m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,

@@ -85,7 +85,7 @@ __device__ __forceinline__ void decode_merge(float& m, float& l, float (&o)[8], 
 
 constexpr int kDecodeWarps = 4;
 
-template <typename Elem, int D, int R>
+template <typename Elem, int D, int R, bool kPaged>
 __global__ void __launch_bounds__(kDecodeWarps * 32)
 decode_kernel(DecodeParams p) {
     constexpr int G = D / 8 <= 4 ? 4 : D / 8 <= 8 ? 8 : D / 8 <= 16 ? 16 : 32;  // lanes per key
@@ -143,8 +143,21 @@ decode_kernel(DecodeParams p) {
         l[r] = sink ? 1.0f : 0.0f;
     }
 
-    const typename Elem::T* K = static_cast<const typename Elem::T*>(p.k) + b * p.k_batch_stride + hk * p.k_head_stride;
-    const typename Elem::T* V = static_cast<const typename Elem::T*>(p.v) + b * p.v_batch_stride + hk * p.v_head_stride;
+    // Row j of the cache: contiguous (batch row b, kPaged = false: the address of
+    // the unpaged kernel) or paged (block table[j / block_size], slot j % block_size)
+    const typename Elem::T* K = static_cast<const typename Elem::T*>(p.k) + hk * p.k_head_stride +
+                                (kPaged ? 0 : b * p.k_batch_stride);
+    const typename Elem::T* V = static_cast<const typename Elem::T*>(p.v) + hk * p.v_head_stride +
+                                (kPaged ? 0 : b * p.v_batch_stride);
+    const int* table = kPaged ? p.block_table + index_t(b) * p.max_blocks : nullptr;
+    auto key_offset = [&](int j, index_t batch_stride, index_t seq_stride) -> index_t {
+        if constexpr (kPaged) {
+            const int blk = p.block_shift >= 0 ? j >> p.block_shift : j / p.block_size;
+            const int slot = p.block_shift >= 0 ? j & (p.block_size - 1) : j % p.block_size;
+            return index_t(table[blk]) * batch_stride + slot * seq_stride;
+        }
+        else return j * seq_stride;
+    };
     // The rows see keys [first_key(0), last_key(q_len - 1)] (causal / window
     // aligned to the end, seqlen), none before the left padding; this split takes
     // `chunk` of them (a multiple of the block's NG keys per step)
@@ -161,8 +174,8 @@ decode_kernel(DecodeParams p) {
         const bool in_range = j <= key_end;
         uint4 ku = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
         if (active && in_range) {
-            ku = *reinterpret_cast<const uint4*>(K + j * p.k_seq_stride + 8 * li);
-            vu = *reinterpret_cast<const uint4*>(V + j * p.v_seq_stride + 8 * li);
+            ku = *reinterpret_cast<const uint4*>(K + key_offset(j, p.k_batch_stride, p.k_seq_stride) + 8 * li);
+            vu = *reinterpret_cast<const uint4*>(V + key_offset(j, p.v_batch_stride, p.v_seq_stride) + 8 * li);
         }
         float kf[8], vf[8];
         Elem::to_float(ku, kf);
@@ -279,17 +292,17 @@ __global__ void decode_combine_kernel(DecodeParams p) {
     if (c == 0) p.lse[row] = l > 0.0f ? (m + log2f(l)) * kLn2 : -INFINITY;
 }
 
-template <typename Elem, int R>
+template <typename Elem, int R, bool kPaged>
 void launch_decode_d(DecodeParams& p, cudaStream_t stream) {
     const dim3 grid(p.batch_size * p.num_heads_k, p.num_splits);
     switch (p.head_dim) {
-        case 32:  decode_kernel<Elem, 32, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
-        case 64:  decode_kernel<Elem, 64, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
+        case 32:  decode_kernel<Elem, 32, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
+        case 64:  decode_kernel<Elem, 64, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
         case 72:
-        case 80:  decode_kernel<Elem, 80, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;  // 72: 9 lanes
-        case 96:  decode_kernel<Elem, 96, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
-        case 128: decode_kernel<Elem, 128, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
-        case 256: decode_kernel<Elem, 256, R><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
+        case 80:  decode_kernel<Elem, 80, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;  // 72: 9 lanes
+        case 96:  decode_kernel<Elem, 96, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
+        case 128: decode_kernel<Elem, 128, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
+        case 256: decode_kernel<Elem, 256, R, kPaged><<<grid, kDecodeWarps * 32, 0, stream>>>(p); break;
         default:  throw std::runtime_error("Unsupported head_dim for decode");
     }
 }
@@ -297,10 +310,15 @@ void launch_decode_d(DecodeParams& p, cudaStream_t stream) {
 template <typename Elem>
 void launch_decode_r(DecodeParams& p, cudaStream_t stream) {
     const int rows = p.num_heads / p.num_heads_k * p.q_len;
-    if (rows <= 1)      launch_decode_d<Elem, 1>(p, stream);
-    else if (rows <= 2) launch_decode_d<Elem, 2>(p, stream);
-    else if (rows <= 4) launch_decode_d<Elem, 4>(p, stream);
-    else                launch_decode_d<Elem, 8>(p, stream);  // rows <= 8 (host check)
+    auto launch = [&](auto paged) {
+        constexpr bool kPaged = decltype(paged)::value;
+        if (rows <= 1)      launch_decode_d<Elem, 1, kPaged>(p, stream);
+        else if (rows <= 2) launch_decode_d<Elem, 2, kPaged>(p, stream);
+        else if (rows <= 4) launch_decode_d<Elem, 4, kPaged>(p, stream);
+        else                launch_decode_d<Elem, 8, kPaged>(p, stream);  // rows <= 8 (host check)
+    };
+    if (p.block_table) launch(std::true_type{});
+    else               launch(std::false_type{});
     if (p.num_splits > 1) {
         const index_t threads = index_t(p.batch_size) * p.num_heads * p.q_len * (p.head_dim / 8);
         decode_combine_kernel<Elem><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(p);

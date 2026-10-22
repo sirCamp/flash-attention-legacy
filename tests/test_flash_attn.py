@@ -1367,11 +1367,93 @@ class TestKVCache:
                 with pytest.raises(ValueError, match="cache_leftpad"):
                     flash_attn_with_kvcache(q, k, v, cache_leftpad=bad)
 
+    @staticmethod
+    def _paged(k, v, block_size, layout="nhd", seed=0):
+        """Contiguous caches [B, max_len, H_kv, d] scattered into shuffled blocks:
+        (k_blocks, v_blocks [num_blocks, block_size, H_kv, d], block_table [B, nb]).
+        layout "hnd": blocks stored [num_blocks, H_kv, block_size, d], passed as a
+        transposed view; "vllm": k and v as slices of one [2, num_blocks, ...]."""
+        B, max_len, H_kv, d = k.shape
+        nb = max_len // block_size
+        n_blocks = B * nb + 3  # spare blocks (NaN): never read
+        perm = torch.randperm(n_blocks, generator=torch.Generator().manual_seed(seed))[:B * nb]
+        table = perm.view(B, nb).to(torch.int32).cuda()
+        if layout == "hnd":
+            kb, vb = (torch.full((n_blocks, H_kv, block_size, d), float("nan"), device="cuda",
+                                 dtype=k.dtype).transpose(1, 2) for _ in range(2))
+        elif layout == "vllm":
+            kv = torch.full((2, n_blocks, block_size, H_kv, d), float("nan"), device="cuda", dtype=k.dtype)
+            kb, vb = kv[0], kv[1]
+        else:
+            kb, vb = (torch.full((n_blocks, block_size, H_kv, d), float("nan"), device="cuda", dtype=k.dtype)
+                      for _ in range(2))
+        kb[table.flatten().long()] = k.reshape(B * nb, block_size, H_kv, d)
+        vb[table.flatten().long()] = v.reshape(B * nb, block_size, H_kv, d)
+        return kb, vb, table
+
+    @pytest.mark.parametrize("block_size", [16, 64, 256])
+    @pytest.mark.parametrize("num_splits", [1, 0, 3, 5])  # 3 at block 256: split edges inside blocks
+    @pytest.mark.parametrize("q_len,H_q", [(1, 4), (1, 8), (2, 8)], ids=["rows2", "rows4", "rows8"])
+    def test_paged(self, head_dim, block_size, num_splits, q_len, H_q):
+        """block_table (paged cache) gives the contiguous cache's results."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, q_len, H_q, 2, head_dim, 512, torch.float16, "bshd")
+        seqlens = [512, 200, 1]
+        cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        kb, vb, table = self._paged(k, v, block_size)
+        self._poison(k, v, seqlens)
+        sinks = torch.randn(H_q, device="cuda")
+        with torch.no_grad():
+            paged, lse_p = flash_attn_with_kvcache(q, kb, vb, cache_seqlens=cs, block_table=table, causal=True,
+                                                   window_size=(300, 0), num_splits=num_splits, sinks=sinks,
+                                                   return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), causal=True, window=(300, 0),
+                                     sinks=sinks)
+        self._check(paged, lse_p, ref_out, ref_lse, torch.float16)
+
+    @pytest.mark.parametrize("layout", ["hnd", "vllm"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_paged_layouts(self, layout, dtype):
+        """Paged caches as views (HND blocks, vLLM's [2, num_blocks, ...] slices),
+        an int64 table with padding entries (-1) past the valid blocks, and
+        cache_seqlens past the cache (clamped)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(2, 1, 8, 2, 128, 256, dtype, "bshd")
+        kb, vb, table = self._paged(k, v, 64, layout)
+        seqlens = [256, 70]
+        table = table.long()
+        table[1, 2:] = -1  # padding entries: never read (keys >= 128 of row 1)
+        cs = torch.tensor([10 ** 6, 70], dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, kb, vb, cache_seqlens=cs, block_table=table,
+                                               return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(128))
+        self._check(out, lse, ref_out, ref_lse, dtype)
+
+    def test_paged_rejects(self):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(2, 1, 4, 4, 64, 64, torch.float16, "bshd")
+        kb, vb, table = self._paged(k, v, 16)
+        with torch.no_grad():
+            with pytest.raises(RuntimeError, match="leftpad"):
+                flash_attn_with_kvcache(q, kb, vb, block_table=table,
+                                        cache_leftpad=torch.zeros(2, dtype=torch.int32, device="cuda"))
+            with pytest.raises(RuntimeError, match="multiple of 16"):
+                flash_attn_with_kvcache(q, kb[:, :8].contiguous(), vb[:, :8].contiguous(), block_table=table)
+            with pytest.raises(RuntimeError, match="no blocks"):
+                flash_attn_with_kvcache(q, kb[:0], vb[:0], block_table=table)
+            with pytest.raises(RuntimeError, match="block_table"):
+                flash_attn_with_kvcache(q, kb, vb, block_table=table[:1])
+            with pytest.raises(ValueError, match="block_table"):
+                flash_attn_with_kvcache(q, kb, vb, block_table=table[0])
+            with pytest.raises(ValueError, match="cache_seqlens"):
+                flash_attn_with_kvcache(q, kb, vb, block_table=table, cache_seqlens=10 ** 6)
+
     def test_rejects(self):
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(1, 1, 4, 4, 64, 32, torch.float16, "bshd")
         with torch.no_grad():
-            for kw in ({"k": k}, {"block_table": torch.zeros(1, 1, dtype=torch.int32, device="cuda")}):
+            for kw in ({"k": k}, {"cache_batch_idx": torch.zeros(1, dtype=torch.int32, device="cuda")}):
                 with pytest.raises(NotImplementedError):
                     flash_attn_with_kvcache(q, k, v, **kw)
             with pytest.raises(NotImplementedError):  # 16 query rows per KV head: not yet

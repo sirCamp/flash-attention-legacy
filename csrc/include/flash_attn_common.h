@@ -131,6 +131,11 @@ struct DecodeParams {
     float* __restrict__ lse;
     const int* __restrict__ cache_seqlens;  // [B]: end of the valid keys
     const int* __restrict__ cache_leftpad;  // [B]: first valid key (left padding), or nullptr
+    // Paged cache: caches [num_blocks, block_size, H_kv, d], key j of row b in block
+    // block_table[b * max_blocks + j / block_size], slot j % block_size; nullptr = contiguous
+    const int* __restrict__ block_table;
+    int max_blocks, block_size;
+    int block_shift;  // log2(block_size) when a power of 2, else -1 (division)
     const float* __restrict__ sinks;        // [H_q] or nullptr
     index_t q_batch_stride, q_seq_stride, q_head_stride;
     index_t k_batch_stride, k_seq_stride, k_head_stride;

@@ -92,7 +92,9 @@ a. Contiguous cache, num_splits = 1, R <= 4, fp16 / bf16, API with upstream orde
 b. Splits + combine (num_splits auto / forced), sinks once.
 c. R = 8 (q in shared memory).
 d. cache_leftpad.
-e. Paged (block_table), without leftpad.
+e. Done: paged (block_table), without leftpad; kPaged template (the contiguous path keeps its addressing), shift / mask for
+   power-of-2 block sizes. T4 GQA 32/8 d=128: B=1 16k 0.297 ms contiguous vs 0.310 paged; B=8 4k 0.606 vs 0.71-0.73 (the
+   table load precedes the K / V loads: prefetching the next block indices is the open item).
 f. HF routing of decode steps.
 g. Tuning, measured on T4 (decode kernel only, B=8, 16k context): R <= 4 runs at 200-236 GB/s (d=128: ~65-70% of the
    peak; near the bound). R = 8 (d=64, gpt-oss) at ~100 GB/s, issue bound: ablations (wrong results, timing only) put
