@@ -1192,9 +1192,9 @@ class TestKVCache:
         assert torch.equal(torch.isfinite(lse), finite)
         torch.testing.assert_close(lse[finite], ref_lse[finite], atol=2e-3, rtol=1e-3)
 
-    # query rows per KV head (H_q / H_kv * q_len): 1, 4, 4, 4, 2, 3, 3
+    # query rows per KV head (H_q / H_kv * q_len): 1, 4, 4, 4, 2, 3, 3, 8 (gpt-oss), 7 (Qwen2), 8, 6
     @pytest.mark.parametrize("q_len,H_q,H_kv", [(1, 4, 4), (1, 8, 2), (2, 4, 2), (4, 2, 2), (1, 2, 1), (3, 1, 1),
-                                                (1, 3, 1)])
+                                                (1, 3, 1), (1, 16, 2), (1, 7, 1), (2, 8, 2), (2, 3, 1), (1, 5, 1)])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
     @pytest.mark.parametrize("layout", ["bshd", "bhsd_view"])
     @pytest.mark.parametrize("num_splits", [1, 4], ids=["one_split", "splits4"])  # 4: empty splits for short rows
@@ -1216,9 +1216,10 @@ class TestKVCache:
     @pytest.mark.parametrize("feature", ["window", "window_right", "softcap", "sinks", "non_causal", "int_seqlens"])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
     @pytest.mark.parametrize("num_splits", [1, 3], ids=["one_split", "splits3"])  # sinks once across splits
-    def test_features(self, head_dim, feature, dtype, num_splits):
+    @pytest.mark.parametrize("H_q", [4, 8], ids=["rows4", "rows8"])  # rows8: q in shared memory (gpt-oss: 8)
+    def test_features(self, head_dim, feature, dtype, num_splits, H_q):
         from flash_attn_legacy import flash_attn_with_kvcache
-        q, k, v = self._case(3, 2, 4, 2, head_dim, 200, dtype, "bshd", seed=1)
+        q, k, v = self._case(3, 2, H_q, 2, head_dim, 200, dtype, "bshd", seed=1)
         seqlens = [200, 50, 1]
         kw, ref_kw = {}, {"causal": True}
         if feature == "window":
@@ -1229,7 +1230,7 @@ class TestKVCache:
             q = q * 4
             kw, ref_kw = {"softcap": 5.0}, {"causal": True, "softcap": 5.0}
         elif feature == "sinks":
-            sinks = torch.randn(4, device="cuda") + 1
+            sinks = torch.randn(H_q, device="cuda") + 1
             kw, ref_kw = {"sinks": sinks}, {"causal": True, "sinks": sinks}
         elif feature == "non_causal":
             ref_kw = {}
@@ -1329,8 +1330,8 @@ class TestKVCache:
                        {"cache_leftpad": torch.zeros(1, dtype=torch.int32, device="cuda")}):
                 with pytest.raises(NotImplementedError):
                     flash_attn_with_kvcache(q, k, v, **kw)
-            with pytest.raises(NotImplementedError):  # 8 query rows per KV head: not yet
-                flash_attn_with_kvcache(torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16),
+            with pytest.raises(NotImplementedError):  # 16 query rows per KV head: not yet
+                flash_attn_with_kvcache(torch.randn(1, 4, 4, 64, device="cuda", dtype=torch.float16),
                                         k[:, :, :1], v[:, :, :1])
             buf = torch.randn(32 * 260, device="cuda", dtype=torch.float16)
             k_odd = buf.as_strided((1, 32, 4, 64), (32 * 260, 260, 64, 1))  # key rows 260 elements apart

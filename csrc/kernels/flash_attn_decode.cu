@@ -11,7 +11,8 @@
 // R = rep x q_len query rows of that KV head (GQA: K / V read once for the group)
 // over its split of the rows' visible keys. With more than one split each block
 // writes its normalized O (fp32) and lse, and decode_combine_kernel merges them. Each
-// lane loads one 16-byte chunk of a key row: G = next_pow2(d / 8) lanes per key,
+// lane loads one 16-byte chunk of a key row (q in registers up to 4 rows, in
+// shared memory up to 8): G = next_pow2(d / 8) lanes per key,
 // 32 / G keys per warp step; the group that scores key j also reads V row j and
 // owns output columns [8 * lane_in_group, +8). Each group keeps an online
 // softmax state (m, l, O) per row over its keys; groups and warps are merged
@@ -104,17 +105,37 @@ decode_kernel(DecodeParams p) {
     const KeyWindow w(p.window_left, p.window_right, p.q_len, seqlen);
     const ScoreMap sm(p.softmax_scale, p.softcap);
 
-    // Row r = query qi * rep + head offset: head hk * rep + r % rep, query r / rep
-    float q[R][8], o[R][8], m[R], l[R];
+    // Row r = query qi * rep + head offset: head hk * rep + r % rep, query r / rep.
+    // q in fp32: registers for R <= 4, shared memory beyond, interleaved as
+    // [row][element i][chunk c] so the G lanes of a group read consecutive words
+    // (no bank conflicts) and the groups broadcast.
+    constexpr bool kQSmem = R > 4;
+    __shared__ float s_q[kQSmem ? R : 1][8][kQSmem ? D / 8 : 1];
+    float q[kQSmem ? 1 : R][8], o[R][8], m[R], l[R];
+    auto q_chunk = [&](int r, int c) {  // 8 elements of row r from column 8c (zeros past the rows)
+        uint4 u = make_uint4(0, 0, 0, 0);
+        if (r < nrows) {
+            u = *reinterpret_cast<const uint4*>(static_cast<const typename Elem::T*>(p.q) + b * p.q_batch_stride +
+                                                (r / rep) * p.q_seq_stride + (hk * rep + r % rep) * p.q_head_stride +
+                                                8 * c);
+        }
+        return u;
+    };
+    if constexpr (kQSmem) {
+        const int vecs = p.head_dim / 8;
+        for (int e = threadIdx.x; e < R * vecs; e += kDecodeWarps * 32) {
+            const int r = e / vecs, c = e % vecs;
+            float f[8];
+            Elem::to_float(q_chunk(r, c), f);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) s_q[r][i][c] = f[i];
+        }
+        __syncthreads();
+    }
     #pragma unroll
     for (int r = 0; r < R; r++) {
-        const int qi = r / rep, h = hk * rep + r % rep;
-        uint4 u = make_uint4(0, 0, 0, 0);
-        if (r < nrows && active) {
-            u = *reinterpret_cast<const uint4*>(static_cast<const typename Elem::T*>(p.q) + b * p.q_batch_stride +
-                                                qi * p.q_seq_stride + h * p.q_head_stride + 8 * li);
-        }
-        Elem::to_float(u, q[r]);
+        const int h = hk * rep + r % rep;
+        if constexpr (!kQSmem) Elem::to_float(active ? q_chunk(r, li) : make_uint4(0, 0, 0, 0), q[r]);
         #pragma unroll
         for (int i = 0; i < 8; i++) o[r][i] = 0.0f;
         const bool sink = p.sinks != nullptr && grp == 0 && split == 0 && r < nrows;
@@ -146,12 +167,19 @@ decode_kernel(DecodeParams p) {
         Elem::to_float(vu, vf);
         #pragma unroll
         for (int r = 0; r < R; r++) {
+            if (r >= nrows) break;  // uniform over the block: the shuffles are skipped together
             float s = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) s = fmaf(q[r][i], kf[i], s);
+            if constexpr (kQSmem) {
+                if (active) {  // lanes past head_dim / 8 (head_dim < 8 G) have no slot
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) s = fmaf(s_q[r][i][li], kf[i], s);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) s = fmaf(q[r][i], kf[i], s);
+            }
             #pragma unroll
             for (int off = 1; off < G; off <<= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
-            if (r >= nrows) continue;  // uniform over the block
             float unused, x;
             if (sm.softcapped()) x = sm.log2_logit<true>(s, unused);
             else                 x = sm.log2_logit<false>(s, unused);
@@ -269,7 +297,8 @@ void launch_decode_r(DecodeParams& p, cudaStream_t stream) {
     const int rows = p.num_heads / p.num_heads_k * p.q_len;
     if (rows <= 1)      launch_decode_d<Elem, 1>(p, stream);
     else if (rows <= 2) launch_decode_d<Elem, 2>(p, stream);
-    else                launch_decode_d<Elem, 4>(p, stream);  // rows <= 4 (host check)
+    else if (rows <= 4) launch_decode_d<Elem, 4>(p, stream);
+    else                launch_decode_d<Elem, 8>(p, stream);  // rows <= 8 (host check)
     if (p.num_splits > 1) {
         const index_t threads = index_t(p.batch_size) * p.num_heads * p.q_len * (p.head_dim / 8);
         decode_combine_kernel<Elem><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(p);
@@ -279,7 +308,7 @@ void launch_decode_r(DecodeParams& p, cudaStream_t stream) {
 }  // namespace
 
 // Query rows per KV head the decode kernel handles in one block.
-int flash_attn_decode_max_rows() { return 4; }
+int flash_attn_decode_max_rows() { return 8; }
 
 constexpr int kMaxDecodeSplits = 128;
 int flash_attn_decode_max_splits() { return kMaxDecodeSplits; }
