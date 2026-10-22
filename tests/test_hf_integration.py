@@ -82,13 +82,54 @@ def test_per_call_decision_and_registry(monkeypatch, head_dim, expect_kernel):
     assert_close_to_gold(out, gold, noise, f"d={head_dim}")
 
 
-def test_decode_reason():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_decode_on_kernel(monkeypatch, dtype):
+    """Decode steps run on the decode kernel (P6.1), bf16 caches read as they are."""
     base = tiny_llama()
-    model = load_impl(base, "flash_attn_legacy")
+    model = load_impl(base, "flash_attn_legacy", dtype)
     ids = torch.randint(0, base.config.vocab_size, (1, 32), device="cuda")
-    model.generate(ids, max_new_tokens=4, min_new_tokens=4, do_sample=False)
-    # 4 new tokens: the 1st comes from the prefill (kernel), 3 decode steps fall back.
-    assert fallback_stats() == {"decode": 3 * base.config.num_hidden_layers}
+    counter = KernelCounter(monkeypatch)
+    with torch.no_grad():
+        model.generate(ids, max_new_tokens=4, min_new_tokens=4, do_sample=False)
+    # 4 new tokens: the 1st comes from the prefill, 3 decode steps per layer
+    n_layers = base.config.num_hidden_layers
+    assert len(counter.decode_calls) == 3 * n_layers and fallback_stats() == {}
+
+
+@pytest.mark.parametrize("case", ["broadcast_batch", "all_true", "holes", "too_many_rows"])
+def test_decode_4d_mask(monkeypatch, case):
+    """q_len == 1 with a boolean [B or 1, 1, 1, kv] mask: a contiguous block of
+    keys per row runs on the decode kernel; holes or more query heads per KV head
+    than the kernel handles go to SDPA with the mask as it is; all within FP32."""
+    torch.manual_seed(0)
+    B, kv = 3, 40
+    rows = integrations._decode_max_rows() + 1 if case == "too_many_rows" else 4
+    q = torch.randn(B, rows, 1, 64, device="cuda", dtype=torch.float16)
+    k, v = (torch.randn(B, 1, kv, 64, device="cuda", dtype=torch.float16) for _ in range(2))
+    keep = torch.ones(B, kv, dtype=torch.bool, device="cuda")
+    if case != "all_true":
+        keep[:, :5] = False  # left padding
+        keep[:, 30:] = False  # empty slots of a static cache
+    if case == "holes":
+        keep[1, 12] = False
+    mask = keep[:1, None, None, :] if case == "broadcast_batch" else keep[:, None, None, :]
+    counter = KernelCounter(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, mask, scaling=0.125)
+    ref = _reference(q, k, v, 0.125, mask.expand(B, -1, -1, -1))
+    torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+    kernel = case in ("broadcast_batch", "all_true")
+    assert bool(counter.decode_calls) == kernel
+    expected = {} if kernel else {"attention_mask" if case == "holes" else "decode": 1}
+    assert fallback_stats() == expected
+
+
+def test_decode_fp32_falls_back():
+    base = tiny_llama()
+    model = load_impl(base, "flash_attn_legacy", torch.float32)
+    ids = torch.randint(0, base.config.vocab_size, (1, 16), device="cuda")
+    with torch.no_grad():
+        model.generate(ids, max_new_tokens=3, min_new_tokens=3, do_sample=False)
+    assert fallback_stats().get("decode") == 2 * base.config.num_hidden_layers
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
@@ -118,15 +159,17 @@ def test_padded_batch_runs_on_kernel(monkeypatch, arch, side):
     assert_close_to_gold(out[keep], gold[keep], noise[keep], f"{arch} {side} padding")
 
 
+@pytest.mark.parametrize("pad", [12, 26], ids=["pad12", "pad26"])  # 26: padding inside the window (8)
 @pytest.mark.parametrize("cache_implementation", ["dynamic", "static"])
 @pytest.mark.parametrize("arch", ["llama", "gemma3", "mistral", "gpt_oss"])
-def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation):
+def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation, pad):
     """Batched generation with left padding: the prefill runs unpadded on the
-    kernel; every step's logits of every row within the noise of FP32 eager."""
+    kernel, the decode steps on the decode kernel (cache_leftpad); every step's
+    logits of every row within the noise of FP32 eager."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (2, 30), device="cuda")
     mask = torch.ones_like(ids)
-    mask[0, :12] = 0
+    mask[0, :pad] = 0
     kw = dict(attention_mask=mask, max_new_tokens=8, min_new_tokens=8, do_sample=False,
               return_dict_in_generate=True, output_logits=True, pad_token_id=0,
               cache_implementation=cache_implementation, disable_compile=True)
@@ -138,6 +181,7 @@ def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation):
     counter = KernelCounter(monkeypatch)
     out = gen("flash_attn_legacy")
     assert counter.varlen_calls  # the padded prefill ran on the kernel
+    assert counter.decode_calls and "decode" not in fallback_stats() and "attention_mask" not in fallback_stats()
     assert_close_to_gold(out, gold, noise, f"{arch} left-padded generate ({cache_implementation})")
 
 
@@ -389,9 +433,9 @@ def test_warn_once_per_reason_and_not_for_expected(caplog):
     warnings = [r for r in caplog.records
                 if r.name == integrations.__name__ and r.levelno == logging.WARNING]
     assert len(warnings) == 1 and "head_dim=48" in warnings[0].getMessage()
-    # Reasons are checked in order: decode steps count as "decode", prefills as "head_dim".
+    # Every call (prefill and the 2 decode steps of each generate) has head_dim 48.
     n_layers = base.config.num_hidden_layers
-    assert fallback_stats() == {"head_dim": 2 * n_layers, "decode": 2 * 2 * n_layers}
+    assert fallback_stats() == {"head_dim": 2 * 3 * n_layers}
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +504,11 @@ def test_static_cache_stepwise(monkeypatch, arch, offloading):
     assert Counter(counter.calls) == +expected
     sliding_calls = sum(n > 1 for n in _STEPS) * types.count("sliding_attention")
     assert [w for w in counter.windows if w != (-1, -1)] == [(W - 1, W - 1)] * sliding_calls
+    # single-token steps on the decode kernel, sliding layers with the window
+    decode_steps = sum(n == 1 for n in _STEPS)
+    assert len(counter.decode_calls) == decode_steps * len(types) and fallback_stats() == {}
+    assert [w for w in counter.decode_windows if w != (-1, -1)] == \
+        [(W - 1, W - 1)] * decode_steps * types.count("sliding_attention")
 
 
 def _beam_rows_error(x, y, ignore_worst=0):
@@ -493,7 +542,7 @@ _GENERATE_CASES = [(c, m) for c in ("static", "offloaded_static", "dynamic")
 def test_generate_matches_gold(arch, cache_implementation, mode):
     """End-to-end generate vs FP32 eager (gold), with the noise floor of FP16
     eager and FP16 SDPA (the worse of the two: FP16 near-ties fork beams on one
-    backend and not on another; decode steps run on SDPA by design): every step's
+    backend and not on another): every step's
     logits (all beams) and the final sequences."""
     if cache_implementation == "offloaded_static" and _all_sliding(arch):
         pytest.skip(_ALL_SLIDING_OFFLOAD)
@@ -858,8 +907,8 @@ def test_eager_attention_gqa_does_not_copy_kv_per_query_head():
                                           ("position_bias", "position_bias")])
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
 def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
-    """softcap / sinks: kernel on prefill, eager (not SDPA, which would ignore
-    them) on decode; position_bias: SDPA. Softcap 2.0 with scale 0.5 saturates."""
+    """softcap / sinks: kernel on prefill and on decode (decode kernel);
+    position_bias: SDPA. Softcap 2.0 with scale 0.5 saturates."""
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=q_len, kv_len=16)
     value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda"),
@@ -870,8 +919,6 @@ def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
                      softcap=value if kwarg == "softcap" else None,
                      sinks=value if kwarg == "s_aux" else None,
                      bias=value if kwarg == "position_bias" else None)
-    if reason is None:  # softcap / sinks: the kernel on prefill, decode falls back
-        reason = "decode" if q_len == 1 else None
     assert fallback_stats() == ({reason: 1} if reason else {})
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
 

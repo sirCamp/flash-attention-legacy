@@ -739,6 +739,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("softmax_scale"), py::arg("is_causal") = false,
           py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
           py::arg("sinks") = py::none(), py::arg("num_splits") = 0, py::arg("cache_leftpad") = py::none());
+    m.def("decode_max_rows", &flash_attn_legacy::flash_attn_decode_max_rows,
+          "Query rows per KV head ((H_q / H_kv) * q_len) flash_attn_with_kvcache handles");
     m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,
           "Automatic key splits of flash_attn_with_kvcache for (B * H_kv, SMs, max_len)",
           py::arg("blocks"), py::arg("sms"), py::arg("max_len"));

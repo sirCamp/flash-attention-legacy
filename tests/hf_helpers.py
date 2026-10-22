@@ -10,13 +10,15 @@ import torch
 class KernelCounter:
     """Counts calls to our kernels made through the HF integration:
     `calls` gets (q_len, kv_len) per batched call, `varlen_calls` gets
-    (total_tokens, n_segments) per varlen call, `windows` the window_size of
-    every call (both kinds, in call order)."""
+    (total_tokens, n_segments) per varlen call, `decode_calls` (B, kv_len) per
+    decode call (flash_attn_with_kvcache), `windows` the window_size of the
+    batched and varlen calls and `decode_windows` of the decode calls (in call
+    order)."""
 
     def __init__(self, monkeypatch):
         import flash_attn_legacy.flash_attn as fa
-        self.calls, self.varlen_calls, self.windows = [], [], []
-        batched, varlen = fa.flash_attention, fa.flash_attn_varlen_func
+        self.calls, self.varlen_calls, self.decode_calls, self.windows, self.decode_windows = [], [], [], [], []
+        batched, varlen, decode = fa.flash_attention, fa.flash_attn_varlen_func, fa.flash_attn_with_kvcache
 
         def wrapped(q, k, v, *args, **kwargs):
             self.calls.append((q.shape[2], k.shape[2]))
@@ -28,12 +30,20 @@ class KernelCounter:
             self.windows.append(kwargs.get("window_size", (-1, -1)))
             return varlen(q, k, v, cu_q, *args, **kwargs)
 
+        def wrapped_decode(q, k_cache, v_cache, *args, **kwargs):
+            self.decode_calls.append((q.shape[0], k_cache.shape[1]))
+            self.decode_windows.append(kwargs.get("window_size", (-1, -1)))
+            return decode(q, k_cache, v_cache, *args, **kwargs)
+
         monkeypatch.setattr(fa, "flash_attention", wrapped)
         monkeypatch.setattr(fa, "flash_attn_varlen_func", wrapped_varlen)
+        monkeypatch.setattr(fa, "flash_attn_with_kvcache", wrapped_decode)
 
     def reset(self):
         self.calls.clear()
         self.varlen_calls.clear()
+        self.decode_calls.clear()
+        self.decode_windows.clear()
         self.windows.clear()
 
 

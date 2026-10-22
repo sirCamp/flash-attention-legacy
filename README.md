@@ -110,9 +110,10 @@ The integration decides **per attention call** whether our kernel can run, and n
 | Padded batches (left or right padding, training and generation prefill), encoders and cross-attention with padded inputs | kernel (varlen, unpadded; causal: padded query rows output 0, as FlashAttention-2) |
 | BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
 | Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
-| Decode (`q_len == 1`), padding with holes inside a row, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast | SDPA fallback |
-| Logit softcapping (Gemma 2) | kernel (`softcap`; decode steps on the FP32 eager fallback) |
-| Attention sinks (gpt-oss `s_aux`) | kernel (`sinks`, trainable; decode steps on the FP32 eager fallback) |
+| Decode (`q_len == 1`): dynamic / static caches, left padding, sliding window, softcap, sinks, FP16 or BF16 caches | decode kernel (`flash_attn_with_kvcache`, split-KV, the cache read in place) |
+| Padding with holes inside a row, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast, FP32 decode, more than 8 query heads per KV head in decode | SDPA fallback |
+| Logit softcapping (Gemma 2) | kernel (`softcap`) |
+| Attention sinks (gpt-oss `s_aux`) | kernel (`sinks`, trainable) |
 | Additive position bias (T5 family: T5, mT5, LongT5, UDOP, Switch Transformers, ...) | SDPA fallback (the bias in SDPA's mask, as HF's SDPA) |
 
 Check what happened in your run:

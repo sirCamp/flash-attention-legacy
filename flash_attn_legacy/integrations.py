@@ -15,6 +15,7 @@ Requires transformers >= 5.0 (uses ALL_ATTENTION_FUNCTIONS registry).
 For transformers < 5.0, use the monkey-patch approach in examples/hf_llama_patch.py.
 """
 
+import functools
 import logging
 import math
 from collections import Counter
@@ -57,7 +58,8 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
                       "strictly increasing from 0 to the sequence length"),
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
     "position_bias": FallbackReason("additive position_bias (T5 family)"),
-    "decode": FallbackReason("q_len == 1 (decode)", expected=True),
+    "decode": FallbackReason("decode step outside the decode kernel (fp32, more query heads per KV "
+                             "head than it handles, gradients, or an unaligned cache)"),
     "attention_mask": FallbackReason(
         "explicit attention mask (padding inside a sequence, bidirectional sliding window, "
         "custom masks, ...)",
@@ -137,8 +139,6 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
         return "position_bias", ""
 
     q_len, kv_len, d = query.shape[2], key.shape[2], query.shape[-1]
-    if q_len == 1:
-        return "decode", ""
     if q_len > kv_len:
         return "q_longer_than_kv", f" (q_len={q_len}, kv_len={kv_len})"
     if d not in SUPPORTED_HEAD_DIMS:
@@ -149,10 +149,56 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
         return "attention_mask", ""
     if dropout > 0.0 and module.training:
         return "dropout", ""
+    if q_len == 1:  # the decode kernel (flash_attn_with_kvcache) reads the cache in place
+        if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype:
+            return "decode", f" ({query.dtype})"
+        rows = query.shape[1] // key.shape[1]
+        if rows > _decode_max_rows():
+            return "decode", f" ({rows} query heads per KV head)"
+        if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
+            return "decode", " (gradients)"
+        if not (_decode_layout_ok(key) and _decode_layout_ok(value)):
+            return "decode", " (cache layout)"
+        return None, ""
     if query.dtype != torch.float16 and torch.is_grad_enabled() and (
             query.requires_grad or key.requires_grad or value.requires_grad) and not fp16_autocast_active():
         return "non_fp16_training", f" ({query.dtype})"
     return None, ""
+
+
+@functools.lru_cache(maxsize=1)
+def _decode_max_rows() -> int:
+    import flash_attn_legacy_cuda
+    return flash_attn_legacy_cuda.decode_max_rows()
+
+
+def _decode_layout_ok(t: torch.Tensor) -> bool:
+    """A [B, H_kv, N, d] cache the decode kernel reads in place: contiguous last
+    dimension, 16-byte aligned rows."""
+    return (t.stride(-1) == 1 and t.data_ptr() % 16 == 0
+            and all(size == 1 or stride % 8 == 0 for size, stride in zip(t.shape[:-1], t.stride()[:-1])))
+
+
+def _decode_padding(key_mask, device, source=None):
+    """(cache_leftpad, cache_seqlens) int32 [B] of a [B, kv_len] decode key mask
+    (True = keep): each row's valid keys [first, last + 1), or None when a row's
+    padding is not one contiguous block (fallback); a row with no key gets
+    (0, 0) (output 0; the SDPA fallback would attend every slot instead). One
+    host sync per mask: cached on `source` (default key_mask), the mask object the
+    layers of a step share, as _unpad_plan."""
+    def compute():
+        B, kv_len = key_mask.shape
+        kmask = key_mask.to(device=device, dtype=torch.bool)
+        pos = torch.arange(kv_len, device=device)
+        nk = kmask.sum(1)
+        first = torch.where(kmask, pos, kv_len).amin(1)
+        last = torch.where(kmask, pos, -1).amax(1)
+        if not bool(((nk == 0) | (last - first + 1 == nk)).all()):  # the host sync
+            return None  # padding inside a row
+        return (torch.where(nk > 0, first, 0).to(torch.int32), (last + 1).clamp_min(0).to(torch.int32))
+
+    return _cached_segments(key_mask if source is None else source, 1, device, compute, attr=_DECODE_ATTR,
+                            trusted=source is not None)
 
 
 def _causal_mask(q_len: int, kv_len: int, device, window: Optional[int] = None) -> torch.Tensor:
@@ -257,14 +303,18 @@ def _eager_attention(query, key, value, mask, scaling, dropout_p, softcap=None,
 # correctness.
 _SEGMENTS_ATTR = "_flash_attn_legacy_segments"
 _UNPAD_ATTR = "_flash_attn_legacy_unpad"
+_DECODE_ATTR = "_flash_attn_legacy_decode_padding"
 # Set by _flash_attn_legacy_mask on the 2D padding masks it returns (they do
 # contain padding: no per-layer check needed).
 _PADDING_ATTR = "_flash_attn_legacy_padding"
 
 
-def _cached_segments(source, q_len, device, compute, attr=_SEGMENTS_ATTR):
+def _cached_segments(source, q_len, device, compute, attr=_SEGMENTS_ATTR, trusted=False):
+    """compute() cached on `source` (keyed by q_len, version, device). Inference
+    tensors have no version counter: cached only when never modified — our own
+    padding masks, or `trusted` sources (the masks transformers builds per step)."""
     if source.is_inference():
-        if not getattr(source, _PADDING_ATTR, False):
+        if not (trusted or getattr(source, _PADDING_ATTR, False)):
             return compute()  # no version counter: no caching
         version = 0  # our own padding mask: never modified
     else:
@@ -433,21 +483,21 @@ def flash_attn_legacy_forward(
     Signature matches what ALL_ATTENTION_FUNCTIONS expects.
     Runs the flash_attn_legacy kernel when _kernel_fallback_reason allows it
     (no mask other than padding, packing or a static cache's valid prefix,
-    1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
-    Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
-    and the call runs on PyTorch SDPA (position_bias added to its mask), on
-    _eager_attention (softcap / sinks, which SDPA would ignore, e.g. on decode
-    steps) or raises NotImplementedError.
+    q_len <= kv_len, supported head_dim, no unsupported kwargs): the flash kernel
+    for q_len > 1, the decode kernel (flash_attn_with_kvcache, the cache read in
+    place) for q_len == 1. Otherwise the reason is recorded in FALLBACK_REASONS
+    (see fallback_stats()) and the call runs on PyTorch SDPA (position_bias added
+    to its mask), on _eager_attention (softcap / sinks, which SDPA would ignore)
+    or raises NotImplementedError.
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
-    if fp16_autocast_active() and query.dtype != torch.float16:
-        # fp16 autocast (e.g. q / k fp32 after HF's rotary, v fp16): attention
-        # computes in fp16, as SDPA does under autocast (no range check)
-        query, key, value = query.half(), key.half(), value.half()
-    elif not key.dtype == value.dtype == query.dtype:
-        # e.g. an fp32 static cache: compute in the query dtype
-        key, value = key.to(query.dtype), value.to(query.dtype)
+    # fp16 autocast (e.g. q / k fp32 after HF's rotary, v fp16): attention computes
+    # in fp16, as SDPA does under autocast (no range check). K / V are converted
+    # below, after the slicing to the valid slots of a pre-allocated cache.
+    autocast_fp16 = fp16_autocast_active() and query.dtype != torch.float16
+    if autocast_fp16:
+        query = query.half()
 
     # Causal sliding window (HF sliding_window = W: query i sees keys i - j < W):
     # from our mask builder (_WINDOW_ATTR), else from the layer's kwarg as in HF's
@@ -456,6 +506,15 @@ def flash_attn_legacy_forward(
     window = _mask_window(attention_mask)
     if window is None:
         window = kwargs.get("sliding_window")
+
+    # Decode with a boolean [B or 1, 1, 1, kv] mask (e.g. SDPA's builder for a static
+    # cache with padding): it lists the keys the single query sees; a contiguous
+    # block per row runs on the decode kernel (the fallbacks keep the 4D mask)
+    decode_mask_4d = None
+    if (query.shape[2] == 1 and attention_mask is not None and attention_mask.dim() == 4
+            and attention_mask.dtype == torch.bool and attention_mask.shape[1:3] == (1, 1)
+            and attention_mask.shape[-1] == key.shape[2]):
+        decode_mask_4d = attention_mask
 
     padding_2d = False
     key_mask_2d = None  # [B, kv] padding mask (True = keep) when padding_2d
@@ -475,6 +534,11 @@ def flash_attn_legacy_forward(
             key_mask_2d = attention_mask
             attention_mask = attention_mask[:, None, None, :].bool()
             padding_2d = True
+    if autocast_fp16:
+        key, value = key.half(), value.half()
+    elif not key.dtype == value.dtype == query.dtype:
+        # e.g. an fp32 static cache: compute in the query dtype (its valid slots only)
+        key, value = key.to(query.dtype), value.to(query.dtype)
 
     # query/key/value come in as [B, H, N, d] from the model's attention layer
     B, H_q, q_len, d = query.shape
@@ -503,27 +567,44 @@ def flash_attn_legacy_forward(
     # unpadding onto the varlen kernel. Everything else goes to SDPA, with the
     # reason recorded in the fallback registry.
     reason, detail = _kernel_fallback_reason(module, query, key, value,
-                                             None if padding_2d else attention_mask, dropout, kwargs)
+                                             None if padding_2d or decode_mask_4d is not None else attention_mask,
+                                             dropout, kwargs)
     if reason is None and window is not None and padding_2d and not is_causal:
         # unpadding shifts bidirectional rows against their keys
         reason, detail = "attention_mask", " (padding with a non-causal sliding window)"
     window_size = (-1, -1) if window is None else (window - 1, window - 1)
     softcap = float(kwargs.get("softcap") or 0.0)  # None or 0: no softcapping (Gemma 2: c > 0)
     sinks = kwargs.get("s_aux")  # [H_q] attention sinks (gpt-oss) or None
-    unpad = None
-    if reason is None and padding_2d:  # the plan's host sync only when the kernel can run
-        unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
-        if unpad is None:
+    unpad = decode_pad = None
+    if reason is None and (padding_2d or decode_mask_4d is not None):  # host syncs only for the kernel
+        if q_len == 1:
+            if padding_2d:
+                decode_pad = _decode_padding(key_mask_2d, query.device)
+            else:
+                decode_pad = _decode_padding(decode_mask_4d[:, 0, 0, :].expand(B, -1), query.device,
+                                             source=decode_mask_4d)
+            ok = decode_pad is not None
+        else:
+            unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
+            ok = unpad is not None
+        if not ok:
             reason, detail = "attention_mask", " (padding inside a sequence)"
 
     attn_output = None
     if reason is None:
         # Our flash kernel (O(N) memory), batched or varlen. bf16 / fp32 inputs are
         # converted to fp16 by the API, which raises FP16RangeError on overflow.
-        from .flash_attn import FP16RangeError, flash_attention, flash_attn_varlen_func
+        from .flash_attn import FP16RangeError, flash_attention, flash_attn_varlen_func, flash_attn_with_kvcache
 
         try:
-            if unpad is not None:
+            if q_len == 1:
+                # Decode: the cache [B, H_kv, N, d] read in place as a [B, N, H_kv, d] view
+                leftpad, seqlens = decode_pad if decode_pad is not None else (None, kv_len)
+                attn_output = flash_attn_with_kvcache(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+                    cache_seqlens=seqlens, cache_leftpad=leftpad, softmax_scale=scaling, causal=is_causal,
+                    window_size=window_size, softcap=softcap, sinks=sinks).transpose(1, 2)
+            elif unpad is not None:
                 # [B, H, n, d] -> rows [B * n, H, d] for the varlen kernel; query rows
                 # left out of the plan (causal padding) get 0 (index_copy keeps autograd)
                 q_idx, k_idx, cu_q, cu_k, max_q, max_k = unpad
@@ -557,7 +638,8 @@ def flash_attn_legacy_forward(
         action = _record_fallback(reason, detail)  # raises if no correct fallback exists
         if action == "sdpa" and (softcap or sinks is not None):
             action = "eager"  # SDPA would ignore the softcap / sinks
-        if reason == "non_fp16_training" and not module.training:
+        if (reason == "non_fp16_training" or (reason, detail) == ("decode", " (gradients)")) \
+                and not module.training:
             _warn_once("grad_in_eval", "flash_attn_legacy: %s inference with gradients enabled "
                        "runs on a fallback; wrap it in torch.inference_mode() to use the kernel",
                        query.dtype)
