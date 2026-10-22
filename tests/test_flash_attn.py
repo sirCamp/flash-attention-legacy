@@ -1251,12 +1251,16 @@ class TestValidation:
         with pytest.raises(NotImplementedError):
             flash_attention(q, k, v)
 
-    @pytest.mark.parametrize("arch", ["pascal", "volta"])
+    @pytest.mark.parametrize("arch", ["pascal", "volta", "native"])
     def test_large_qk_products_do_not_overflow(self, monkeypatch, arch):
         """q_i * k_i > 65504 for in-range fp16 inputs: products must not be formed in
-        fp16 (the Pascal path used __hmul2). FORCE_ARCH runs either path on any GPU."""
+        fp16 (the Pascal path used __hmul2). FORCE_ARCH runs either path on any GPU;
+        native = the GPU's own family (mma.sync on a T4)."""
         from flash_attn_legacy import flash_attention
-        monkeypatch.setenv("FLASH_ATTN_LEGACY_FORCE_ARCH", arch)
+        if arch == "native":
+            monkeypatch.delenv("FLASH_ATTN_LEGACY_FORCE_ARCH", raising=False)
+        else:
+            monkeypatch.setenv("FLASH_ATTN_LEGACY_FORCE_ARCH", arch)
         torch.manual_seed(0)
         q, k, v = self._qkv(n_q=32, n_k=32)
         q[..., 0], k[..., 0] = 300.0, 300.0  # one product of 9e4 per (q, k) pair
@@ -1355,8 +1359,9 @@ class TestForwardContract:
 
     @pytest.mark.parametrize("d", [128, 256])
     def test_64k_fallback_tile(self, monkeypatch, d):
-        """The 64 KB fallback tiles (what a T4 runs) also on GPUs with more shared
-        memory, so every tile of every list is exercised on every test box."""
+        """The 64 KB fallback tiles (what a 64 KB GPU runs) also on GPUs with more
+        shared memory, so every tile of every list is exercised (the WMMA ones on
+        a V100, or on a T4 with FORCE_ARCH=volta)."""
         monkeypatch.setenv("FLASH_ATTN_LEGACY_SMEM_LIMIT", "65536")
         self.test_output_and_lse(d, 130, 200, True)
         self.test_varlen_short_segments(d, True)

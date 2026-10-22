@@ -17,11 +17,14 @@
 namespace flash_attn_legacy {
 
 // Forward declarations — batched
+void flash_attn_fwd_turing(FlashAttnParams& params, cudaStream_t stream);
 void flash_attn_fwd_volta(FlashAttnParams& params, cudaStream_t stream);
 void flash_attn_fwd_pascal(FlashAttnParams& params, cudaStream_t stream);
 // Forward declarations — variable-length
+void flash_attn_fwd_turing_varlen(FlashAttnVarlenParams& params, int total_q_blocks, cudaStream_t stream);
 void flash_attn_fwd_volta_varlen(FlashAttnVarlenParams& params, int total_q_blocks, cudaStream_t stream);
 void flash_attn_fwd_pascal_varlen(FlashAttnVarlenParams& params, int total_q_blocks, cudaStream_t stream);
+int flash_attn_fwd_turing_block_rows(int head_dim);
 int flash_attn_fwd_volta_block_rows(int head_dim);
 int flash_attn_fwd_pascal_block_rows(int head_dim);
 void precompute_D(
@@ -103,7 +106,8 @@ static int get_sm_version(int device_id = -1) {
                         compiled_archs_str());
             return 70;
         }
-        TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta', got '", f, "'");
+        TORCH_CHECK(f.empty(), "FLASH_ATTN_LEGACY_FORCE_ARCH must be 'pascal' or 'volta' (unset: the GPU's own "
+                    "family, mma.sync on SM >= 7.5), got '", f, "'");
     }
     return code_sm;
 }
@@ -317,7 +321,9 @@ std::vector<torch::Tensor> flash_attn_forward(
     p.l_batch_stride = index_t(H_q) * N; p.l_head_stride = N;
 
     int sm = get_sm_version();
-    if (sm >= 70) {
+    if (sm >= 75) {
+        flash_attn_fwd_turing(p, stream);
+    } else if (sm >= 70) {
         flash_attn_fwd_volta(p, stream);
     } else if (sm >= 60) {
         flash_attn_fwd_pascal(p, stream);
@@ -466,7 +472,8 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
 
     int sm = get_sm_version();
     // Br of the tile the launcher will select (same dispatch: they cannot disagree)
-    const int Br = (sm >= 70) ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
+    const int Br = sm >= 75 ? flash_attn_fwd_turing_block_rows(d)
+                 : sm >= 70 ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
     const VarlenBlocks q_blocks = varlen_blocks(cu_seqlens_q, cu_host.first, Br, total_q);
     if (q_blocks.total == 0) return {O, L};  // only empty sequences: nothing to launch
     const int total_q_blocks = q_blocks.total;
@@ -497,7 +504,9 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     p.v_token_stride = V.stride(0); p.v_head_stride = V.stride(1);
     p.o_token_stride = O.stride(0); p.o_head_stride = O.stride(1);
 
-    if (sm >= 70) {
+    if (sm >= 75) {
+        flash_attn_fwd_turing_varlen(p, total_q_blocks, stream);
+    } else if (sm >= 70) {
         flash_attn_fwd_volta_varlen(p, total_q_blocks, stream);
     } else if (sm >= 60) {
         flash_attn_fwd_pascal_varlen(p, total_q_blocks, stream);

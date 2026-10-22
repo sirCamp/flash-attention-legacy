@@ -178,7 +178,7 @@ struct FlashAttnBwdParams {
 // runtime tile selection). Threads per block: 32 * kNumWarps of each tile.
 // ---------------------------------------------------------------------------
 
-// WMMA forward (Volta SM 7.0, Turing SM 7.5), FA2-style: each warp owns a band
+// WMMA forward (Volta SM 7.0; Turing with FORCE_ARCH=volta), FA2-style: each warp owns a band
 // of 16 query rows, O stays in WMMA accumulator fragments (registers).
 // Shared memory: Q[Br,kLdH], K[Bc,kLdH], V[Bc,kLdH] (half, rows padded by 8
 // halves: valid WMMA leading dimension, conflict-free fragment loads), then per
@@ -202,6 +202,24 @@ struct FwdTileWmma {
     // The staging tile also holds the one-time accumulator layout probe
     // (256 floats + a 256-byte table).
     static_assert(kStageFloats >= 256 + 64, "WMMA forward staging too small");
+};
+
+// mma.sync forward (Turing SM 7.5, docs/analysis/kernels/p2_8_design.md): each
+// warp owns a band of 16 query rows; S, O in m16n8 accumulators, P reused from S
+// as the A operand of P V (no staging). Shared memory: Q[Br,kLdH], K[Bc,kLdH],
+// V[Bc,kLdH] (half, rows padded by 8 halves: conflict-free ldmatrix). Q is read
+// into registers once per block when d <= 128 (kQInRegs).
+template <int Br_, int Bc_, int d_>
+struct FwdTileMma {
+    static constexpr int Br = Br_;
+    static constexpr int Bc = Bc_;
+    static constexpr int d  = d_;
+    static constexpr int kNumWarps = Br_ / 16;
+    static constexpr int kLdH = d_ + 8;
+    static constexpr bool kPrefetch = true;  // K/V register prefetch
+    static constexpr bool kQInRegs = d_ <= 128;
+    static constexpr int smem_bytes() { return (Br + 2 * Bc) * kLdH * 2; }
+    static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % 16 == 0, "invalid mma forward tile");
 };
 
 // CUDA-core forward (Pascal SM 6.x), same band scheme as the WMMA one: each
@@ -261,6 +279,18 @@ using TileVolta_d256_64k = FwdTileWmma<64, 16, 256>;   // 56 KB
 // kSplit 1 / 2 / 4 / 8 = 288 / 153 / 130 / 120 ms on P100, 99 with the
 // lane-major partial S (no bank conflicts); 1080 Ti 196 -> 121 (SDPA mem-efficient
 // 58 / 1049, eager 110 / 141). kSplit 2 at d=128: P100 -4%, 1080 Ti +5%, not taken.
+// mma.sync forward tiles (Turing, 64 KB). Measured on T4, forward causal B=2
+// H=16 N=4096, ms (WMMA before): d=32 1.19 (2.74; Bc=128 1.47), d=64 2.14 (3.64;
+// Bc=128 2.16), d=96 2.95 with Bc=64 (6.14; Bc=32 3.41), d=128 4.13 with Bc=48
+// (7.12; Bc=32 4.5), d=256 16.4 (18.4; <48,32> 24.5, <32,32> 44.8). d=256 spills
+// 68 B with the K/V prefetch and is still faster than without it (17.5, no spill).
+using TileTuring_d32  = FwdTileMma<128, 64, 32>;    // 40 KB
+using TileTuring_d64  = FwdTileMma<128, 64, 64>;    // 36 KB
+using TileTuring_d80  = FwdTileMma<128, 64, 80>;    // 44 KB, also d=72 (zero-padded columns)
+using TileTuring_d96  = FwdTileMma<128, 64, 96>;    // 52 KB
+using TileTuring_d128 = FwdTileMma<128, 48, 128>;   // 59.5 KB
+using TileTuring_d256 = FwdTileMma<64, 16, 256>;    // 49.5 KB
+
 using TilePascal_d32  = FwdTileSimt<64, 32, 32>;    // 28 KB
 using TilePascal_d64  = FwdTileSimt<64, 16, 64>;    // 31 KB
 using TilePascal_d96  = FwdTileSimt<64, 16, 96>;    // 43 KB

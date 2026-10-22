@@ -38,7 +38,7 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 |---|---|---|---|---|
 | **Volta** | V100, Titan V | 7.0 | 1st gen | WMMA 16x16x16 |
 | **Pascal** | P100, GTX 1080/Ti | 6.0/6.1 | None | CUDA cores (fp16 storage, fp32 math) |
-| **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | WMMA 16x16x16 (tiles sized for its 64 KB of shared memory per block) |
+| **Turing** | T4, RTX 20xx | 7.5 | 2nd gen | `mma.sync` m16n8k8 + `ldmatrix` (FA2 register layout; tiles sized for its 64 KB of shared memory per block) |
 
 Head dimensions: **d = 32, 64, 72, 80, 96, 128, 256** (72 and 80, as in SigLIP / Qwen2-VL vision towers, run on wider tiles with zero-padded columns).
 
@@ -380,19 +380,21 @@ Flash Attention v2 tiles Q into blocks of Br rows and iterates over K/V blocks o
 
 ### Forward pass
 
-Both families share one band forward (`csrc/include/flash_attn_fwd_band.h`): each warp owns 16 query rows of the block, the online softmax runs in the log2 domain with warp-shuffle reductions, K/V blocks are prefetched into registers while the current one is computed, masking is applied only to the blocks that need it (sequence tail, causal diagonal) and causal blocks a warp cannot see are skipped.
+All families share one band forward (`csrc/include/flash_attn_fwd_band.h`): each warp owns 16 query rows of the block, the online softmax runs in the log2 domain with warp-shuffle reductions, K/V blocks are prefetched into registers while the current one is computed, masking is applied only to the blocks that need it (sequence tail, causal diagonal) and causal blocks a warp cannot see are skipped.
 
-**Volta / Turing (SM 7.0 / 7.5):** S = Q @ K^T and O += P @ V with `wmma::mma_sync` (16x16x16 tensor cores); S goes through a small per-warp staging tile for the softmax, P is written back as half, O stays in accumulator fragments (registers). Tiles of 128 query rows (8 warps); d=128/256 use larger tiles where the GPU has 96 KB of shared memory per block (V100) and 64 KB ones otherwise (T4).
+**Turing (SM 7.5):** `mma.sync` m16n8k8 with `ldmatrix`, as FlashAttention-2: S and O stay in accumulator registers with a known layout, Q in registers (d <= 128), the online softmax runs on the S registers and P packed to half2 is the A operand of P @ V as it is (no shared-memory staging).
+
+**Volta (SM 7.0):** S = Q @ K^T and O += P @ V with `wmma::mma_sync` (16x16x16 tensor cores); S goes through a small per-warp staging tile for the softmax, P is written back as half, O stays in accumulator fragments (registers). Tiles of 128 query rows (8 warps); d=128/256 use larger tiles where the GPU has 96 KB of shared memory per block and 64 KB ones otherwise.
 
 **Pascal (SM 6.0 / 6.1):** fp32 register micro-tiles on CUDA cores: each lane holds 4 rows x Bc/8 keys and d/8 output columns; Q, K, V are converted to fp32 once, when stored to shared memory, so the inner products have no conversions and no fp16 products (no overflow; fp16 math runs at 1/64 rate on SM 6.1).
 
-Tiles per head_dim are chosen by measurement (comments next to `TileVolta_*` / `TilePascal_*` in `csrc/include/flash_attn_common.h`).
+Tiles per head_dim are chosen by measurement (comments next to `TileTuring_*` / `TileVolta_*` / `TilePascal_*` in `csrc/include/flash_attn_common.h`).
 
 ### Backward pass
 
 **D = rowsum(dO * O)** is precomputed in a separate kernel; each block owns Bc keys and loops over the query blocks (and the Q heads of its KV head, GQA).
 
-**Volta / Turing:** each warp owns a band of 16 keys (and a slice of d for d >= 96) and computes S^T, P^T, dP^T, dS^T as WMMA fragments, with the element-wise steps done on the fragments; dK, dV accumulate in registers; dS^T is shared through shared memory so that all warps compute dQ = dS @ K, added to an FP32 buffer with one coalesced `atomicAdd` per element and key block.
+**Turing / Volta:** each warp owns a band of 16 keys and a slice of the d columns of dK / dV; the warps of a band split the queries of S^T and dP^T (no work repeated) and share P^T and dS^T through shared memory; the element-wise steps run on the accumulators; dK, dV accumulate in registers; dS^T is shared so that all warps compute dQ = dS @ K, added to an FP32 buffer with `atomicAdd` (one per element and key block). Turing uses `mma.sync` m16n8k8 + `ldmatrix` (P^T / dS^T are register operands when a band has one warp), Volta WMMA fragments.
 
 **Pascal:** the [Br, Bc] tile of S / P / dP / dS is computed cooperatively in FP32 (128-bit loads), dK, dV accumulate in registers, dQ with one `atomicAdd` per element and key block.
 

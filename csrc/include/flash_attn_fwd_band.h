@@ -17,9 +17,9 @@
 //   - fwd_band_run: fwd_band_loop with the Q/K/V tile copies (half or fp32
 //     shared memory, optional K/V register prefetch); launch_fwd(_varlen)
 // A family provides a Body with `template <class Tile> static void run(const
-// FwdBlockArgs&)` that calls fwd_band_run with its own S / P / O code (WMMA:
-// flash_attn_fwd_volta.cu, CUDA cores: flash_attn_fwd_pascal.cu) and a tile
-// dispatcher per head_dim.
+// FwdBlockArgs&)` that calls fwd_band_run with its own S / P / O code (mma.sync:
+// flash_attn_fwd_turing.cu, WMMA: flash_attn_fwd_volta.cu, CUDA cores:
+// flash_attn_fwd_pascal.cu) and a tile dispatcher per head_dim.
 // ============================================================================
 
 #include "flash_attn_common.h"

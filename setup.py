@@ -44,6 +44,7 @@ csrc_dir = this_dir / "csrc"
 cuda_sources = [
     str(csrc_dir / "flash_attn_legacy.cpp"),
     str(csrc_dir / "kernels" / "flash_attn_fwd_volta.cu"),
+    str(csrc_dir / "kernels" / "flash_attn_fwd_turing.cu"),
     str(csrc_dir / "kernels" / "flash_attn_fwd_pascal.cu"),
     str(csrc_dir / "kernels" / "flash_attn_bwd.cu"),
 ]

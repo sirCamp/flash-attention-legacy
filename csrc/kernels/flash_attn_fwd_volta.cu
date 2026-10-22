@@ -1,5 +1,6 @@
 // ============================================================================
-// Flash Attention v2 — Forward Kernel for Volta (SM 7.0) and Turing (SM 7.5)
+// Flash Attention v2 — Forward Kernel for Volta (SM 7.0; Turing runs
+// flash_attn_fwd_turing.cu, this one with FLASH_ATTN_LEGACY_FORCE_ARCH=volta)
 // Uses WMMA tensor cores for both Q@K^T and P@V matmuls (16×16×16 FP16)
 //
 // Key design (FA2-style, docs/analysis/kernels/p2_8_design.md):
