@@ -49,8 +49,9 @@ q_len (that re-reads K/V).
   sectors in every layout). The group that scores key k also reads V row k; lane owns output dims [8 * lane_in_group, +8).
 - Per lane registers: q 8R fp32 (pre-multiplied by the ScoreMap factor), O 8R, (m, l) 2R, K/V buffers 8U (U loads in flight,
   2-4), ~20 addressing: R=1 ~60, R=2 ~80, R=4 ~110; R=8 keeps q in shared memory (broadcast reads) ~140. Buckets R = 1, 2, 4, 8.
-- Scores: G-lane xor reduction per row (later: reduce-scatter butterfly, ~2R shuffles per key step instead of R log2 G, and each
-  lane exps only its share). Softcap is a runtime branch (one tanh per score is free when memory bound).
+- Scores: G-lane xor reduction per row. The key step has no per-row branch (step h): all R rows (q = 0 past the real rows),
+  phase by phase (scores, shuffle reductions interleaved over the rows, merges), per-row visible keys precomputed in
+  registers, softcap through `ScoreMap::dispatch` outside the key loop, and the next step's mask byte / K / V prefetched.
 - Online softmax state (m, l, O) per group over its keys; one decode `merge(m, l, O)` combines groups (shuffles), warps (shared
   memory) and splits (combine kernel): one function, three call sites. The sink enters exactly once: the state of group 0 / warp 0
   / split 0 starts as (m = sink, l = 1), every other at (-inf, 0); split 0 never exits early when sinks are present.
@@ -58,9 +59,10 @@ q_len (that re-reads K/V).
   KeyWindow), chunk = ceil(range / splits) rounded to the warp key step, computed on the device; per-element masks only at the
   range edges. Paged: key j at block_table[b][j / block_size] * block_size + j % block_size (`kPaged`), else the strided address.
 - num_splits on the host without syncs (CUDA graph friendly): from B * H_kv, the SM count and the cache capacity (or a max_seqlen
-  hint): target ~2 waves, chunk >= 256 keys, cap 64-128; 1 for short contexts. num_splits == 1 writes O / lse directly; otherwise
+  hint): target ~2 waves, chunk >= 128 keys, cap 128; 1 for short contexts. num_splits == 1 writes O / lse directly; otherwise
   normalized fp32 O_s and lse_s go to a workspace and the combine computes lse = M + log sum exp(lse_s - M) (M == -inf: O = 0,
-  lse = -inf; empty splits always write lse = -inf, O = 0).
+  lse = -inf; empty splits always write lse = -inf, O = 0). Combine: L = next_pow2(num_splits) <= 32 lanes per (row, 8
+  columns), each merging every L-th split, then a shuffle merge of the L lanes.
 - Templates: d, R bucket, dtype, paged. Softcap, window, causal runtime.
 
 ## HF integration
@@ -104,3 +106,22 @@ g. Tuning, measured on T4 (decode kernel only, B=8, 16k context): R <= 4 runs at
    (R = 4 got slower), q in registers at R = 8, a one-key specialised update (one exp2 when the max holds). Still
    5-10x faster than SDPA. Open: a reduce-scatter of the scores (~2R shuffles instead of R log2 G, one exp2 per row
    per group), or the mma path for R > 4 on SM 7.x; num_splits sized by capacity (HF static caches).
+h. Done: latency of the key step. The rows of a step ran one after another (per-row branches: `r >= nrows`, the softcap
+   test, the `active` test on the shared q, `w.masked(r / rep, j)` with an integer division; SASS: the R = 8 loop ~1700
+   instructions with an SSY / SYNC region per row) -> branchless phased step (above); branchless `decode_merge`;
+   prefetch of the next key; splits of >= 128 keys (was 256); combine with L lanes per chunk (was one thread looping over
+   the splits on a single SM when B * H was small). Kernel + combine time (us, torch profiler, fp16, causal), before ->
+   after:
+
+   | case | V100 | T4 | P100 | 1080 Ti |
+   |---|---|---|---|---|
+   | B=1 d=128 GQA 8/4 2k | 38.8 -> 15.2 | 33.1 -> 15.5 | 52.9 -> 25.6 | 45.6 -> 22.6 |
+   | B=1 d=128 GQA 16/2 (R=8) 2k | 146 -> 28.5 | 112 -> 25.2 | 185 -> 37.1 | 152 -> 39.5 |
+   | B=1 d=128 GQA 32/8 16k | 218 -> 112 | 291 -> 270 | 325 -> 195 | 341 -> 231 |
+   | B=1 d=256 GQA 8/4 8k | 106 -> 52.7 | 142 -> 138 | 148 -> 77.6 | 125 -> 106 |
+   | B=8 d=128 GQA 32/8 4k | 270 -> 197 | 538 -> 523 | 522 -> 349 | 801 -> 434 |
+   | B=32 d=128 GQA 32/8 2k | 615 -> 404 | 1190 -> 1048 | 1282 -> 707 | 1561 -> 816 |
+   | B=1 d=64 GQA 32/4 (R=8) 1k | 77.0 -> 20.7 | 72.5 -> 20.8 | 98.0 -> 28.4 | 86.8 -> 33.9 |
+
+   V100 now reaches 600-680 GB/s on the large cases (~75% of the peak), T4 stays at its ~250 GB/s bound; small grids
+   (B = 1, few KV heads) remain latency bound (fixed cost per block). Open: prefetch of the paged block indices.

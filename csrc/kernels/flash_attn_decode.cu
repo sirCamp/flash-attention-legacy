@@ -75,11 +75,13 @@ struct Bf16Elem {  // bf16 -> fp32 is a shift: no conversion instruction needed 
 // (m, l, o) <- merge with (m2, l2, o2): online-softmax states in the log2 domain
 // (m: running max, l: sum of exp2(x - m), o: sum of exp2(x - m) v). The per-key
 // update is a merge with (x, 1, v); groups, warps and splits merge the same way.
+// Branchless: a non-finite logit or V row propagates whether or not the state is
+// still empty (only non-finite cache values are affected).
 __device__ __forceinline__ void decode_merge(float& m, float& l, float (&o)[8], float m2, float l2,
                                              const float (&o2)[8]) {
     const float mn = fmaxf(m, m2);
-    if (mn == -INFINITY) return;  // both empty (no (-inf) - (-inf))
-    const float a1 = exp2f(m - mn), a2 = exp2f(m2 - mn);
+    const float ms = mn == -INFINITY ? 0.0f : mn;  // both empty: a1 = a2 = 0, no (-inf) - (-inf); no branch
+    const float a1 = exp2f(m - ms), a2 = exp2f(m2 - ms);
     l = l * a1 + l2 * a2;
     #pragma unroll
     for (int i = 0; i < 8; i++) o[i] = o[i] * a1 + o2[i] * a2;
@@ -113,7 +115,7 @@ decode_kernel(DecodeParams p) {
     // [row][element i][chunk c] so the G lanes of a group read consecutive words
     // (no bank conflicts) and the groups broadcast.
     constexpr bool kQSmem = R > 4;
-    __shared__ float s_q[kQSmem ? R : 1][8][kQSmem ? D / 8 : 1];
+    __shared__ float s_q[kQSmem ? R : 1][8][kQSmem ? G : 1];  // zeros past head_dim: read by every lane
     float q[kQSmem ? 1 : R][8], o[R][8], m[R], l[R];
     auto q_chunk = [&](int r, int c) {  // 8 elements of row r from column 8c (zeros past the rows)
         uint4 u = make_uint4(0, 0, 0, 0);
@@ -126,10 +128,10 @@ decode_kernel(DecodeParams p) {
     };
     if constexpr (kQSmem) {
         const int vecs = p.head_dim / 8;
-        for (int e = threadIdx.x; e < R * vecs; e += kDecodeWarps * 32) {
-            const int r = e / vecs, c = e % vecs;
+        for (int e = threadIdx.x; e < R * G; e += kDecodeWarps * 32) {
+            const int r = e / G, c = e % G;
             float f[8];
-            Elem::to_float(q_chunk(r, c), f);
+            Elem::to_float(c < vecs ? q_chunk(r, c) : make_uint4(0, 0, 0, 0), f);
             #pragma unroll
             for (int i = 0; i < 8; i++) s_q[r][i][c] = f[i];
         }
@@ -189,41 +191,62 @@ decode_kernel(DecodeParams p) {
         key_begin = max(key_begin, min(lo, key_end + 1));  // no kept key: empty (no INT_MAX overflow)
         key_end = min(key_end, hi);
     }
+    // Keys each row sees (causal / window), read in the key loop as registers
+    int row_first[R], row_last[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        row_first[r] = w.first_key(r / rep);
+        row_last[r] = w.last_key(r / rep);
+    }
     // Same trip count for every lane of a warp (the shuffles below need all 32):
-    // the warp steps over GW keys at a time, keys past key_end are masked.
-    for (int j0 = key_begin + warp * GW; j0 <= key_end; j0 += NG) {
-        const int j = j0 + lane / G;
-        const bool in_range = j <= key_end && (mrow == nullptr || mrow[j]);
-        uint4 ku = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
-        if (active && in_range) {
-            ku = *reinterpret_cast<const uint4*>(K + key_offset(j, p.k_batch_stride, p.k_seq_stride) + 8 * li);
-            vu = *reinterpret_cast<const uint4*>(V + key_offset(j, p.v_batch_stride, p.v_seq_stride) + 8 * li);
-        }
-        float kf[8], vf[8];
-        Elem::to_float(ku, kf);
-        Elem::to_float(vu, vf);
-        #pragma unroll
-        for (int r = 0; r < R; r++) {
-            if (r >= nrows) break;  // uniform over the block: the shuffles are skipped together
-            float s = 0.0f;
-            if constexpr (kQSmem) {
-                if (active) {  // lanes past head_dim / 8 (head_dim < 8 G) have no slot
-                    #pragma unroll
-                    for (int i = 0; i < 8; i++) s = fmaf(s_q[r][i][li], kf[i], s);
-                }
-            } else {
+    // the warp steps over GW keys at a time, keys past key_end are masked. Every
+    // row is computed (q = 0 past nrows) without branches, phase by phase (the
+    // scores, their reductions, the merges), so the rows interleave.
+    sm.dispatch([&](auto softcapped) {
+        constexpr bool kSoftcap = decltype(softcapped)::value;
+        // the next step's key (mask byte, K and V rows) is loaded before this one is scored
+        auto load = [&](int j, bool& in_range, uint4& ku, uint4& vu) {
+            in_range = j <= key_end && (mrow == nullptr || mrow[j]);
+            ku = make_uint4(0, 0, 0, 0); vu = make_uint4(0, 0, 0, 0);
+            if (active && in_range) {
+                ku = *reinterpret_cast<const uint4*>(K + key_offset(j, p.k_batch_stride, p.k_seq_stride) + 8 * li);
+                vu = *reinterpret_cast<const uint4*>(V + key_offset(j, p.v_batch_stride, p.v_seq_stride) + 8 * li);
+            }
+        };
+        bool next_in_range;
+        uint4 next_ku, next_vu;
+        load(key_begin + warp * GW + lane / G, next_in_range, next_ku, next_vu);
+        for (int j0 = key_begin + warp * GW; j0 <= key_end; j0 += NG) {
+            const int j = j0 + lane / G;
+            const bool in_range = next_in_range;
+            float kf[8], vf[8];
+            Elem::to_float(next_ku, kf);
+            Elem::to_float(next_vu, vf);
+            load(j + NG, next_in_range, next_ku, next_vu);
+            float s[R];
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                s[r] = 0.0f;
                 #pragma unroll
-                for (int i = 0; i < 8; i++) s = fmaf(q[r][i], kf[i], s);
+                for (int i = 0; i < 8; i++) {
+                    if constexpr (kQSmem) s[r] = fmaf(s_q[r][i][li], kf[i], s[r]);
+                    else                  s[r] = fmaf(q[r][i], kf[i], s[r]);
+                }
             }
             #pragma unroll
-            for (int off = 1; off < G; off <<= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
-            float unused, x;
-            if (sm.softcapped()) x = sm.log2_logit<true>(s, unused);
-            else                 x = sm.log2_logit<false>(s, unused);
-            if (!in_range || w.masked(r / rep, j)) x = -INFINITY;
-            decode_merge(m[r], l[r], o[r], x, 1.0f, vf);
+            for (int off = 1; off < G; off <<= 1) {
+                #pragma unroll
+                for (int r = 0; r < R; r++) s[r] += __shfl_xor_sync(0xffffffffu, s[r], off);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                float unused;
+                float x = sm.log2_logit<kSoftcap>(s[r], unused);
+                if (!in_range || j < row_first[r] || j > row_last[r]) x = -INFINITY;
+                decode_merge(m[r], l[r], o[r], x, 1.0f, vf);
+            }
         }
-    }
+    });
 
     // Merge the groups of a warp (lanes with the same li own the same columns),
     // then the warps through shared memory
@@ -285,24 +308,37 @@ decode_kernel(DecodeParams p) {
     }
 }
 
-// Merge of the splits: one thread per 8 columns of a (row, head, query); each
-// split's normalized (O_s, lse_s in log2) is the state (m = lse_s, l = 1, O_s).
+// Merge of the splits: L lanes (num_splits rounded up to a power of 2, at most
+// 32) per 8 columns of a (row, head, query), lane s merging splits s, s + L, ...
+// (their loads in flight together), then the L lanes by shuffles; each split's
+// normalized (O_s, lse_s in log2) is the state (m = lse_s, l = 1, O_s).
 template <typename Elem>
-__global__ void decode_combine_kernel(DecodeParams p) {
+__global__ void decode_combine_kernel(DecodeParams p, int L) {
     const int vecs = p.head_dim / 8;
     const index_t rows = index_t(p.batch_size) * p.num_heads * p.q_len;
-    const index_t idx = index_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= rows * vecs) return;
+    const index_t t = index_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const index_t idx = t / L;  // uniform over the L lanes (aligned groups of a warp)
+    const int lane = static_cast<int>(t % L);
+    const bool valid = idx < rows * vecs;  // the others still take part in the shuffles (whole warps)
     const index_t row = idx / vecs;
     const int c = static_cast<int>(idx % vecs);
     float m = -INFINITY, l = 0.0f, o[8] = {};
-    for (int s = 0; s < p.num_splits; s++) {
+    for (int s = lane; valid && s < p.num_splits; s += L) {
         const index_t prow = index_t(s) * rows + row;
         const float4* src = reinterpret_cast<const float4*>(p.o_part + prow * p.head_dim + 8 * c);
         const float4 lo = src[0], hi = src[1];
         const float o2[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
         decode_merge(m, l, o, p.lse_part[prow], 1.0f, o2);
     }
+    for (int off = L / 2; off > 0; off >>= 1) {
+        const float m2 = __shfl_xor_sync(0xffffffffu, m, off);
+        const float l2 = __shfl_xor_sync(0xffffffffu, l, off);
+        float o2[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) o2[i] = __shfl_xor_sync(0xffffffffu, o[i], off);
+        decode_merge(m, l, o, m2, l2, o2);
+    }
+    if (!valid || lane != 0) return;
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     #pragma unroll
     for (int i = 0; i < 8; i++) o[i] *= inv;
@@ -342,8 +378,10 @@ void launch_decode_r(DecodeParams& p, cudaStream_t stream) {
     if (p.block_table) launch(std::true_type{});
     else               launch(std::false_type{});
     if (p.num_splits > 1) {
-        const index_t threads = index_t(p.batch_size) * p.num_heads * p.q_len * (p.head_dim / 8);
-        decode_combine_kernel<Elem><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(p);
+        int L = 1;
+        while (L < p.num_splits && L < 32) L *= 2;
+        const index_t threads = index_t(p.batch_size) * p.num_heads * p.q_len * (p.head_dim / 8) * L;
+        decode_combine_kernel<Elem><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(p, L);
     }
 }
 
@@ -357,12 +395,12 @@ int flash_attn_decode_max_splits() { return kMaxDecodeSplits; }
 
 // Key splits for a grid of `blocks` (B * H_kv) on `sms` SMs and a cache of
 // max_len keys (no device read: CUDA-graph friendly): ~2 waves of blocks, at
-// least 256 keys per split, at most kMaxDecodeSplits. Sized by the capacity:
+// least 128 keys per split, at most kMaxDecodeSplits. Sized by the capacity:
 // a large preallocated cache holding few keys gets more (empty) splits than
 // it needs.
 int flash_attn_decode_num_splits(int blocks, int sms, int max_len) {
     const int want = cdiv(2 * sms * 4, blocks);  // ~4 resident blocks of 4 warps per SM, 2 waves
-    const int by_len = max(max_len / 256, 1);
+    const int by_len = max(max_len / 128, 1);
     return max(1, min(min(want, by_len), kMaxDecodeSplits));
 }
 
