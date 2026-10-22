@@ -617,8 +617,10 @@ static void dispatch_bwd_simt_tile(int head_dim, F&& f) {
         case 72:
         case 80:  // zero-padded to the d=96 tile (CUDA-core tiles need d % 32 == 0)
         case 96:  ok = with_first_fitting_tile<BwdTileSimt<32, 16, 96>>(limit, f); break;
-        case 128: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 128>>(limit, f); break;
-        case 256: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 256>>(limit, f); break;
+        case 128: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 128>>(limit, f); break;  // 8 warps: same
+        // d=256: 36 KB, one block per SM on P100: 8 warps instead of 4. fwd+bwd causal
+        // N=4096: P100 517 -> 398 ms (16 warps 439; SDPA mem-efficient 443), 1080 Ti 581 -> 566
+        case 256: ok = with_first_fitting_tile<BwdTileSimt<16, 16, 256, 8>>(limit, f); break;
         default:  throw std::runtime_error("Unsupported head_dim for the backward");
     }
     if (!ok) throw_no_tile("CUDA-core backward", head_dim, limit);
