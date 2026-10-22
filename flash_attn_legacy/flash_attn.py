@@ -14,13 +14,60 @@ from typing import Optional, Tuple
 from .utils import check_head_dim, fp16_autocast_active
 
 try:
-    import flash_attn_legacy_cuda
+    import flash_attn_legacy_cuda  # registers the torch.ops.flash_attn_legacy kernels
 except ImportError as e:
     raise ImportError(
         "flash_attn_legacy CUDA extension not found. "
         "Install with: pip install -e .\n"
         f"Original error: {e}"
     )
+
+_ops = torch.ops.flash_attn_legacy
+
+# Query rows per KV head ((H_q / H_kv) * q_len) the decode kernel handles: read once
+# (a pybind call would break torch.compile graphs).
+DECODE_MAX_ROWS = flash_attn_legacy_cuda.decode_max_rows()
+
+
+# Fake implementations of the kernels (shapes and dtypes only): torch.compile traces
+# the ops as opaque nodes (docs/analysis/compile_design.md). They mirror the
+# allocations of csrc/flash_attn_legacy.cpp (contiguous outputs, fp32 lse).
+def _register_fakes():
+    register = getattr(torch.library, "register_fake", None)
+    if register is None:  # torch < 2.4: eager only
+        return
+
+    def dsinks(q, sinks):
+        return q.new_empty((0,) if sinks is None else sinks.shape, dtype=torch.float32)
+
+    @register("flash_attn_legacy::forward")
+    def _(Q, K, V, softmax_scale, is_causal=False, window_left=-1, window_right=-1, softcap=0.0, sinks=None,
+          score_scale=None):
+        return Q.new_empty(Q.shape), Q.new_empty(Q.shape[:3], dtype=torch.float32)
+
+    @register("flash_attn_legacy::backward")
+    def _(dO, Q, K, V, O, L, softmax_scale, is_causal=False, window_left=-1, window_right=-1, softcap=0.0,
+          sinks=None):
+        return Q.new_empty(Q.shape), K.new_empty(K.shape), V.new_empty(V.shape), dsinks(Q, sinks)
+
+    @register("flash_attn_legacy::forward_varlen")
+    def _(Q, K, V, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal=False,
+          window_left=-1, window_right=-1, softcap=0.0, sinks=None, score_scale=None, validate=True):
+        return Q.new_empty(Q.shape), Q.new_empty(Q.shape[:2], dtype=torch.float32)
+
+    @register("flash_attn_legacy::backward_varlen")
+    def _(dO, Q, K, V, O, L, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale,
+          is_causal=False, window_left=-1, window_right=-1, softcap=0.0, sinks=None, validate=True):
+        return Q.new_empty(Q.shape), K.new_empty(K.shape), V.new_empty(V.shape), dsinks(Q, sinks)
+
+    @register("flash_attn_legacy::with_kvcache")
+    def _(q, k_cache, v_cache, cache_seqlens, softmax_scale, is_causal=False, window_left=-1, window_right=-1,
+          softcap=0.0, sinks=None, num_splits=0, cache_leftpad=None, block_table=None):
+        B, q_len, H_q, _ = q.shape
+        return q.new_empty(q.shape), q.new_empty((B, H_q, q_len), dtype=torch.float32)
+
+
+_register_fakes()
 
 
 # The kernels compute in fp16. bf16 / fp32 inputs are scaled by powers of 2 into
@@ -171,8 +218,7 @@ class FlashAttentionFunc(Function):
         if H_q % H_kv != 0:
             raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap, sinks,
-                                                score_scale)
+        o, lse = _ops.forward(q, k, v, softmax_scale, causal, *window_size, softcap, sinks, score_scale)
 
         ctx.save_for_backward(q, k, v, o, lse, sinks)
         ctx.softmax_scale = softmax_scale
@@ -185,18 +231,19 @@ class FlashAttentionFunc(Function):
         q, k, v, o, lse, sinks = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        dq, dk, dv, dsinks = flash_attn_legacy_cuda.backward(
+        sinks_grad = ctx.needs_input_grad[7]
+        dq, dk, dv, dsinks = _ops.backward(
             grad_output, q, k, v, o, lse,
             ctx.softmax_scale, ctx.causal, *ctx.window_size, ctx.softcap,
-            sinks if ctx.needs_input_grad[7] else None,  # None: no sink gradient computed
+            sinks if sinks_grad else None,  # None: no sink gradient computed
         )
-        return dq, dk, dv, None, None, None, None, _sinks_grad(dsinks, sinks), None
+        return dq, dk, dv, None, None, None, None, _sinks_grad(dsinks, sinks, sinks_grad), None
 
 
-def _sinks_grad(dsinks, sinks):
+def _sinks_grad(dsinks, sinks, computed):
     """fp32 gradient of the sinks from the kernel -> dtype of the sinks (None when
     not computed)."""
-    return None if dsinks is None else dsinks.to(sinks.dtype)
+    return dsinks.to(sinks.dtype) if computed else None
 
 
 def _resolve_causal(causal: bool, is_causal: Optional[bool]) -> bool:
@@ -286,7 +333,7 @@ class FlashAttnVarlenFunc(Function):
         cu_seqlens_q = cu_seqlens_q.contiguous().to(torch.int32)
         cu_seqlens_k = cu_seqlens_k.contiguous().to(torch.int32)
 
-        o, lse = flash_attn_legacy_cuda.forward_varlen(
+        o, lse = _ops.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, sinks, score_scale, validate,
         )
@@ -304,12 +351,14 @@ class FlashAttnVarlenFunc(Function):
         q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k, sinks = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        dq, dk, dv, dsinks = flash_attn_legacy_cuda.backward_varlen(
+        sinks_grad = ctx.needs_input_grad[11]
+        dq, dk, dv, dsinks = _ops.backward_varlen(
             grad_output, q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal, *ctx.window_size,
-            ctx.softcap, sinks if ctx.needs_input_grad[11] else None, ctx.validate,
+            ctx.softcap, sinks if sinks_grad else None, ctx.validate,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, _sinks_grad(dsinks, sinks), None, None
+        return (dq, dk, dv, None, None, None, None, None, None, None, None, _sinks_grad(dsinks, sinks, sinks_grad),
+                None, None)
 
 
 def flash_attn_varlen_func(
@@ -494,9 +543,6 @@ def _batch_int_tensor(t, name, device):
     return t.to(device=device, dtype=torch.int32)
 
 
-_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "alibi_slopes")
-
-
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -566,8 +612,9 @@ def flash_attn_with_kvcache(
     a tensor without grad_fn); rows with no visible key give lse = -inf; tensor
     cache_seqlens / cache_leftpad are clamped to the cache (upstream: undefined).
     """
-    given = locals()
-    unsupported = [name for name in _KVCACHE_UNSUPPORTED if given[name] is not None]
+    given = dict(k=k, v=v, rotary_cos=rotary_cos, rotary_sin=rotary_sin, cache_batch_idx=cache_batch_idx,
+                 alibi_slopes=alibi_slopes)  # not supported yet
+    unsupported = [name for name, value in given.items() if value is not None]
     if unsupported:
         raise NotImplementedError(f"flash_attn_with_kvcache: {', '.join(unsupported)} not supported yet")
     if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k_cache, v_cache)):
@@ -596,7 +643,6 @@ def flash_attn_with_kvcache(
     sinks = _check_sinks(sinks, q.shape[2], q.device)
     if cache_leftpad is not None:
         cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
-    out, lse = flash_attn_legacy_cuda.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal,
-                                                   *window_size, softcap, sinks, num_splits, cache_leftpad,
-                                                   block_table)
+    out, lse = _ops.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal, *window_size, softcap,
+                                 sinks, num_splits, cache_leftpad, block_table)
     return (out, lse) if return_softmax_lse else out

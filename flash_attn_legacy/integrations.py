@@ -15,7 +15,6 @@ Requires transformers >= 5.0 (uses ALL_ATTENTION_FUNCTIONS registry).
 For transformers < 5.0, use the monkey-patch approach in examples/hf_llama_patch.py.
 """
 
-import functools
 import logging
 import math
 from collections import Counter
@@ -24,7 +23,8 @@ from typing import Dict, NamedTuple, Optional
 import torch
 import torch.nn as nn
 
-from .utils import SUPPORTED_HEAD_DIMS, fp16_autocast_active
+from .flash_attn import DECODE_MAX_ROWS
+from .utils import SUPPORTED_HEAD_DIMS, fp16_autocast_active, is_compiling
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
         if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype:
             return "decode", f" ({query.dtype})"
         rows = query.shape[1] // key.shape[1]
-        if rows > _decode_max_rows():
+        if rows > DECODE_MAX_ROWS:
             return "decode", f" ({rows} query heads per KV head)"
         if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
             return "decode", " (gradients)"
@@ -164,16 +164,12 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
     return None, ""
 
 
-@functools.lru_cache(maxsize=1)
-def _decode_max_rows() -> int:
-    import flash_attn_legacy_cuda
-    return flash_attn_legacy_cuda.decode_max_rows()
-
-
 def _decode_layout_ok(t: torch.Tensor) -> bool:
     """A [B, H_kv, N, d] cache the decode kernel reads in place: contiguous last
-    dimension, 16-byte aligned rows."""
-    return (t.stride(-1) == 1 and t.data_ptr() % 16 == 0
+    dimension, 16-byte aligned rows. The address is not traceable: under
+    torch.compile only the op checks it (it raises; caches are allocations or
+    prefix slices of them, aligned)."""
+    return (t.stride(-1) == 1 and (is_compiling() or t.data_ptr() % 16 == 0)
             and all(size == 1 or stride % 8 == 0 for size, stride in zip(t.shape[:-1], t.stride()[:-1])))
 
 

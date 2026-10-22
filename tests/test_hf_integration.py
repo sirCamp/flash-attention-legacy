@@ -103,7 +103,7 @@ def test_decode_4d_mask(monkeypatch, case):
     than the kernel handles go to SDPA with the mask as it is; all within FP32."""
     torch.manual_seed(0)
     B, kv = 3, 40
-    rows = integrations._decode_max_rows() + 1 if case == "too_many_rows" else 4
+    rows = integrations.DECODE_MAX_ROWS + 1 if case == "too_many_rows" else 4
     q = torch.randn(B, rows, 1, 64, device="cuda", dtype=torch.float16)
     k, v = (torch.randn(B, 1, kv, 64, device="cuda", dtype=torch.float16) for _ in range(2))
     keep = torch.ones(B, kv, dtype=torch.bool, device="cuda")

@@ -5,6 +5,7 @@
 // ============================================================================
 
 #include <torch/extension.h>
+#include <torch/library.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -171,7 +172,15 @@ static torch::Tensor sink_logits(const c10::optional<torch::Tensor>& sinks, cons
     return sinks->to(torch::kFloat32).contiguous();
 }
 
-static float* data_or_null(const torch::Tensor& t) { return t.defined() ? t.data_ptr<float>() : nullptr; }
+// fp32 gradient of the sinks, zeroed for the kernels' atomics (cast by the caller);
+// [0] without sinks: the ops never return undefined tensors.
+static torch::Tensor sink_grad(const torch::Tensor& sink, const torch::Tensor& Q) {
+    return sink.defined() ? torch::zeros_like(sink) : torch::empty({0}, Q.options().dtype(torch::kFloat32));
+}
+
+static float* data_or_null(const torch::Tensor& t) {
+    return t.defined() && t.numel() > 0 ? t.data_ptr<float>() : nullptr;
+}
 
 // Input checks shared by the varlen entry points: Q [total_q, H_q, d],
 // K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
@@ -272,9 +281,9 @@ static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, con
 // window_left / window_right restrict each row further (KeyWindow, -1 = unbounded).
 // sinks: optional logit per Q head in every row's softmax, without value (gpt-oss).
 // ---------------------------------------------------------------------------
-std::vector<torch::Tensor> flash_attn_forward(
+std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, c10::optional<torch::Tensor> score_scale
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -356,13 +365,13 @@ std::vector<torch::Tensor> flash_attn_forward(
 // Backward — GQA aware
 // dQ has same shape as Q [B, H_q, N, d]
 // dK, dV have same shape as K, V [B, H_kv, N, d]
-// dsinks: fp32 [H_q] with sinks (undefined -> None without)
+// dsinks: fp32 [H_q] with sinks ([0] without)
 // ---------------------------------------------------------------------------
-std::vector<torch::Tensor> flash_attn_backward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
     torch::Tensor dO,
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor O, torch::Tensor L,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks
 ) {
     dO = contiguous_aligned(dO);
@@ -394,8 +403,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     TORCH_CHECK(L.dim() == 3 && L.size(0) == B && L.size(1) == H_q && L.size(2) == N,
                 "L must be [B, H_q, N]");
     const torch::Tensor sink = sink_logits(sinks, Q, H_q);
-    // fp32 gradient of the sinks (undefined without sinks), cast by the caller
-    torch::Tensor dsink = sink.defined() ? torch::zeros_like(sink) : torch::Tensor();
+    torch::Tensor dsink = sink_grad(sink, Q);
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -460,11 +468,11 @@ std::vector<torch::Tensor> flash_attn_backward(
 // Q [total_q, H_q, d], K [total_k, H_kv, d], V [total_k, H_kv, d]
 // cu_seqlens_q [num_seqs+1], cu_seqlens_k [num_seqs+1]
 // ---------------------------------------------------------------------------
-std::vector<torch::Tensor> flash_attn_forward_varlen(
+std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
-    int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, c10::optional<torch::Tensor> score_scale, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -541,13 +549,13 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
 // Backward — variable-length packed sequences, one launch (GQA aware).
 // Q, O, dO are [total_q, H_q, d], K, V [total_k, H_kv, d], L [total_q, H_q].
 // ---------------------------------------------------------------------------
-std::vector<torch::Tensor> flash_attn_backward_varlen(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor dO,
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor O, torch::Tensor L,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
-    int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, bool validate
 ) {
     dO = contiguous_aligned(dO);
@@ -566,7 +574,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     L = L.contiguous();
     TORCH_CHECK(L.dim() == 2 && L.size(0) == total_q && L.size(1) == H_q, "L must be [total_q, H_q]");
     const torch::Tensor sink = sink_logits(sinks, Q, H_q);
-    torch::Tensor dsink = sink.defined() ? torch::zeros_like(sink) : torch::Tensor();
+    torch::Tensor dsink = sink_grad(sink, Q);
     const auto cu_host = validate ? validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k)
                                   : std::pair<torch::Tensor, torch::Tensor>();
 
@@ -652,9 +660,9 @@ static void check_decode_layout(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, name, ": data must be 16-byte aligned");
 }
 
-std::vector<torch::Tensor> flash_attn_with_kvcache(
+std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    double softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
     c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad,
     c10::optional<torch::Tensor> block_table
 ) {
@@ -756,47 +764,42 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
 
 }  // namespace flash_attn_legacy
 
+// The kernels are dispatcher operators (torch.ops.flash_attn_legacy.*): torch.compile
+// and CUDA graphs see them as opaque ops (fake implementations in flash_attn.py), at
+// the cost of one dispatcher call. Default arguments as in the Python wrappers.
+TORCH_LIBRARY(flash_attn_legacy, m) {
+    m.def("forward(Tensor Q, Tensor K, Tensor V, float softmax_scale, bool is_causal=False, int window_left=-1, "
+          "int window_right=-1, float softcap=0., Tensor? sinks=None, Tensor? score_scale=None) -> (Tensor, Tensor)");
+    m.def("backward(Tensor dO, Tensor Q, Tensor K, Tensor V, Tensor O, Tensor L, float softmax_scale, "
+          "bool is_causal=False, int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None) "
+          "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("forward_varlen(Tensor Q, Tensor K, Tensor V, Tensor cu_seqlens_q, Tensor cu_seqlens_k, int max_seqlen_q, "
+          "int max_seqlen_k, float softmax_scale, bool is_causal=False, int window_left=-1, int window_right=-1, "
+          "float softcap=0., Tensor? sinks=None, Tensor? score_scale=None, bool validate=True) -> (Tensor, Tensor)");
+    m.def("backward_varlen(Tensor dO, Tensor Q, Tensor K, Tensor V, Tensor O, Tensor L, Tensor cu_seqlens_q, "
+          "Tensor cu_seqlens_k, int max_seqlen_q, int max_seqlen_k, float softmax_scale, bool is_causal=False, "
+          "int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None, bool validate=True) "
+          "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("with_kvcache(Tensor q, Tensor k_cache, Tensor v_cache, Tensor cache_seqlens, float softmax_scale, "
+          "bool is_causal=False, int window_left=-1, int window_right=-1, float softcap=0., Tensor? sinks=None, "
+          "int num_splits=0, Tensor? cache_leftpad=None, Tensor? block_table=None) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
+    m.impl("forward", &flash_attn_legacy::flash_attn_forward);
+    m.impl("backward", &flash_attn_legacy::flash_attn_backward);
+    m.impl("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen);
+    m.impl("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen);
+    m.impl("with_kvcache", &flash_attn_legacy::flash_attn_with_kvcache);
+}
+
+// Helpers (host-side queries, not traced)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compiled_archs", &flash_attn_legacy::compiled_archs,
           "CUDA architectures this build contains, e.g. ['6.0', '7.0', '7.5+PTX']");
-    m.def("forward", &flash_attn_legacy::flash_attn_forward,
-          "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
-          py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(),
-          py::arg("score_scale") = py::none());
-    m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
-          "Flash Attention v2 forward — variable-length packed sequences",
-          py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
-          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(),
-          py::arg("score_scale") = py::none(), py::arg("validate") = true);
-    m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
-          "Flash Attention v2 backward — variable-length packed sequences, one launch",
-          py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("O"), py::arg("L"),
-          py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
-          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(), py::arg("validate") = true);
-    m.def("with_kvcache", &flash_attn_legacy::flash_attn_with_kvcache,
-          "Decode with a KV cache (flash_attn_with_kvcache subset)",
-          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_seqlens"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
-          py::arg("sinks") = py::none(), py::arg("num_splits") = 0, py::arg("cache_leftpad") = py::none(),
-          py::arg("block_table") = py::none());
     m.def("decode_max_rows", &flash_attn_legacy::flash_attn_decode_max_rows,
           "Query rows per KV head ((H_q / H_kv) * q_len) flash_attn_with_kvcache handles");
     m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,
           "Automatic key splits of flash_attn_with_kvcache for (B * H_kv, SMs, max_len)",
           py::arg("blocks"), py::arg("sms"), py::arg("max_len"));
-    m.def("backward", &flash_attn_legacy::flash_attn_backward,
-          "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
-          py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
-          py::arg("O"), py::arg("L"),
-          py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none());
 }

@@ -19,6 +19,12 @@ def fp16_autocast_active() -> bool:
     return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
 
 
+def is_compiling() -> bool:
+    """Code being traced by torch.compile (dynamo)."""
+    compiler = getattr(torch, "compiler", None)
+    return compiler is not None and hasattr(compiler, "is_compiling") and compiler.is_compiling()
+
+
 def check_head_dim(d: int) -> None:
     """Raise ValueError if `d` is not a supported head dimension."""
     if d not in SUPPORTED_HEAD_DIMS:

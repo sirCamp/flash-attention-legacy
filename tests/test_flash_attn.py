@@ -30,6 +30,12 @@ def no_host_sync():
             torch.cuda.set_sync_debug_mode("default")
 
 
+def kernel_ops():
+    """The kernels as dispatcher ops (importing the package registers them)."""
+    import flash_attn_legacy  # noqa: F401
+    return torch.ops.flash_attn_legacy
+
+
 # ---------------------------------------------------------------------------
 # Reference implementations
 # ---------------------------------------------------------------------------
@@ -1030,10 +1036,9 @@ class TestSinks:
     def test_lse_includes_the_sink(self, head_dim, n_q, n_k):
         """L = logsumexp(logits, sink); (200, 5) causal: rows with no visible key
         give O = 0 and L = sink (the backward rebuilds P from L)."""
-        import flash_attn_legacy_cuda
         scale = 1.0 / math.sqrt(head_dim)
         q, k, v, sinks = (t.detach() for t in self._inputs((2, 4, n_q, head_dim), (2, 2, n_k, head_dim), 4))
-        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, True, -1, -1, 0.0, sinks)
+        out, lse = kernel_ops().forward(q, k, v, scale, True, -1, -1, 0.0, sinks)
         torch.testing.assert_close(out, ref_attention(q, k, v, scale, True, sinks=sinks), atol=2e-2, rtol=2e-2)
         s = ref_logits(q.float(), k.float().repeat_interleave(2, dim=1), scale, True, (-1, -1), 0.0)
         ref = torch.logsumexp(torch.cat([s, sinks.view(1, -1, 1, 1).expand(*s.shape[:-1], 1)], -1), -1)
@@ -1041,11 +1046,10 @@ class TestSinks:
 
     def test_no_keys(self):
         """N_k = 0: O = 0, L = sink; zero gradients."""
-        import flash_attn_legacy_cuda
         from flash_attn_legacy import flash_attention
         q, k, v, sinks = self._inputs((1, 4, 8, 64), (1, 4, 0, 64), 4)
-        out, lse = flash_attn_legacy_cuda.forward(q.detach(), k.detach(), v.detach(), 0.125, False,
-                                                  -1, -1, 0.0, sinks.detach())
+        out, lse = kernel_ops().forward(q.detach(), k.detach(), v.detach(), 0.125, False, -1, -1, 0.0,
+                                        sinks.detach())
         assert (out == 0).all() and torch.equal(lse, sinks.detach().view(1, 4, 1).expand_as(lse))
         flash_attention(q, k, v, sinks=sinks).sum().backward()
         assert (q.grad == 0).all() and (sinks.grad == 0).all()
@@ -1739,26 +1743,24 @@ class TestForwardContract:
     def test_output_and_lse(self, head_dim, n_q, n_k, causal):
         """Output and raw logsumexp vs FP32 at ragged lengths; (200, 5) causal
         leaves whole tiles of rows with no visible key (O = 0, lse = -inf)."""
-        import flash_attn_legacy_cuda
         torch.manual_seed(0)
         scale = 1.0 / math.sqrt(head_dim)
         q = torch.randn(2, 4, n_q, head_dim, device="cuda", dtype=torch.float16)
         k = torch.randn(2, 2, n_k, head_dim, device="cuda", dtype=torch.float16)
         v = torch.randn(2, 2, n_k, head_dim, device="cuda", dtype=torch.float16)
-        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, causal)
+        out, lse = kernel_ops().forward(q, k, v, scale, causal)
         torch.testing.assert_close(out, ref_attention(q, k, v, scale, causal), atol=2e-2, rtol=2e-2)
         assert_lse_close(lse, ref_lse(q, k, scale, causal))
 
     @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
     def test_varlen_short_segments(self, head_dim, causal):
         """Segments shorter than, equal to and just above a tile, mixed in one pack."""
-        import flash_attn_legacy_cuda
         torch.manual_seed(0)
         scale = 1.0 / math.sqrt(head_dim)
         lens = [1, 15, 17, 65, 16, 64, 2]
         cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device="cuda")
         q, k, v = (torch.randn(sum(lens), 4, head_dim, device="cuda", dtype=torch.float16) for _ in range(3))
-        out, lse = flash_attn_legacy_cuda.forward_varlen(q, k, v, cu, cu, max(lens), max(lens), scale, causal)
+        out, lse = kernel_ops().forward_varlen(q, k, v, cu, cu, max(lens), max(lens), scale, causal)
         for s, e in zip(cu[:-1].tolist(), cu[1:].tolist()):
             qi, ki, vi = (t[s:e].transpose(0, 1).unsqueeze(0) for t in (q, k, v))
             ref = ref_attention(qi, ki, vi, scale, causal)[0].transpose(0, 1)
@@ -1975,10 +1977,132 @@ class TestForwardContract:
 
     def test_long_d256(self):
         """d=256 at 4096 tokens: the largest register / smem footprint."""
-        import flash_attn_legacy_cuda
         torch.manual_seed(0)
         q, k, v = (torch.randn(1, 2, 4096, 256, device="cuda", dtype=torch.float16) for _ in range(3))
         scale = 1.0 / 16
-        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, True)
+        out, lse = kernel_ops().forward(q, k, v, scale, True)
         torch.testing.assert_close(out, ref_attention(q, k, v, scale, True), atol=2e-2, rtol=2e-2)
         assert_lse_close(lse, ref_lse(q, k, scale, True))
+
+
+compile_ready = pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="torch >= 2.4 required")
+
+
+@compile_ready
+class TestCompile:
+    """torch.compile (docs/analysis/compile_design.md): the kernels are dispatcher
+    ops with fake implementations, traced as opaque nodes. Backend aot_eager: it
+    traces through the fakes and AOT autograd on every GPU (inductor's Triton needs
+    SM >= 7.0); fullgraph=True fails on any graph break."""
+
+    @staticmethod
+    def _compiled(fn):
+        torch._dynamo.reset()
+        return torch.compile(fn, backend="aot_eager", fullgraph=True)
+
+    @staticmethod
+    def _qkv(shape_q, shape_kv, dtype=torch.float16, grad=False):
+        torch.manual_seed(0)
+        return tuple(torch.randn(s, device="cuda", dtype=dtype, requires_grad=grad)
+                     for s in (shape_q, shape_kv, shape_kv))
+
+    def _op_samples(self):
+        ops = kernel_ops()
+        q, k, v = self._qkv((2, 4, 70, 64), (2, 2, 70, 64))
+        sinks = torch.randn(4, device="cuda")
+        o, lse = ops.forward(q, k, v, 0.125, True, -1, -1, 0.0, sinks)
+        lens = [5, 64, 1]
+        cu = torch.tensor([0, 5, 69, 70], dtype=torch.int32, device="cuda")
+        qp, kp, vp = (t[0].transpose(0, 1).contiguous() for t in (q, k, v))
+        op, lsep = ops.forward_varlen(qp, kp, vp, cu, cu, max(lens), max(lens), 0.125, True)
+        qd = torch.randn(2, 1, 4, 64, device="cuda", dtype=torch.float16)
+        cu0 = torch.zeros(2, dtype=torch.int32, device="cuda")  # one empty sequence
+        seqlens = torch.tensor([70, 3], dtype=torch.int32, device="cuda")
+        return [
+            (ops.forward.default, (q, k, v, 0.125, True, -1, -1, 0.0, sinks, None)),
+            (ops.backward.default, (torch.randn_like(o), q, k, v, o, lse, 0.125, True, -1, -1, 0.0, sinks)),
+            (ops.backward.default, (torch.randn_like(o), q, k, v, o, lse, 0.125, True, 31, 0, 0.0, None)),
+            (ops.forward_varlen.default, (qp, kp, vp, cu, cu, 64, 64, 0.125, True, -1, -1, 0.0, None, None, False)),
+            (ops.backward_varlen.default, (torch.randn_like(op), qp, kp, vp, op, lsep, cu, cu, 64, 64, 0.125, True,
+                                           -1, -1, 0.0, None, False)),
+            (ops.with_kvcache.default, (qd, k.transpose(1, 2), v.transpose(1, 2), seqlens, 0.125, True, -1, -1,
+                                        0.0, sinks, 0, None, None)),
+            # early returns: no keys (dsinks [H_q]), no batch rows, an empty pack
+            (ops.forward.default, (q, k[:, :, :0], v[:, :, :0], 0.125, False, -1, -1, 0.0, sinks, None)),
+            (ops.backward.default, (torch.randn_like(o), q, k[:, :, :0].contiguous(), v[:, :, :0].contiguous(), o,
+                                    lse, 0.125, False, -1, -1, 0.0, sinks)),
+            (ops.forward.default, (q[:0], k[:0], v[:0], 0.125, True, -1, -1, 0.0, None, None)),
+            (ops.forward_varlen.default, (qp[:0], kp[:0], vp[:0], cu0, cu0, 0, 0, 0.125, True, -1, -1, 0.0,
+                                          None, None, False)),
+            (ops.with_kvcache.default, (qd[:0], k[:0].transpose(1, 2), v[:0].transpose(1, 2), seqlens[:0], 0.125,
+                                        True, -1, -1, 0.0, None, 0, None, None)),
+        ]
+
+    def test_opcheck(self):
+        """Schema (no input mutated, no aliasing) and fake implementations match
+        the kernels' outputs (shapes, strides, dtypes)."""
+        for op, args in self._op_samples():
+            torch.library.opcheck(op, args, test_utils=("test_schema", "test_faketensor"))
+
+    @pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
+    def test_flash_attention_fwd_bwd(self, sinks):
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv((2, 4, 100, 64), (2, 2, 100, 64), grad=True)
+        s = torch.randn(4, device="cuda", requires_grad=True) if sinks else None
+
+        def step(q, k, v, s):
+            out = flash_attention(q, k, v, causal=True, window_size=(40, 0), softcap=30.0, sinks=s)
+            return out.float().square().sum()
+
+        results = []
+        for fn in (step, self._compiled(step)):
+            params = [t for t in (q, k, v, s) if t is not None]
+            loss = fn(q, k, v, s)
+            results.append((loss, *torch.autograd.grad(loss, params)))
+        for a, b in zip(*results):
+            torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
+
+    def test_varlen_fwd_bwd(self):
+        from flash_attn_legacy import flash_attn_varlen_func
+        q, k, v = self._qkv((120, 4, 64), (120, 2, 64), grad=True)
+        cu = torch.tensor([0, 7, 100, 120], dtype=torch.int32, device="cuda")
+
+        def step(q, k, v):
+            out = flash_attn_varlen_func(q, k, v, cu, cu, 93, 93, causal=True, validate=False)
+            return out.float().square().sum()
+
+        results = []
+        for fn in (step, self._compiled(step)):
+            loss = fn(q, k, v)
+            results.append((loss, *torch.autograd.grad(loss, (q, k, v))))
+        for a, b in zip(*results):
+            torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_kvcache(self, dtype):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q = torch.randn(3, 1, 8, 64, device="cuda", dtype=dtype)
+        k, v = (torch.randn(3, 2, 200, 64, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(2))
+        seqlens = torch.tensor([200, 17, 0], dtype=torch.int32, device="cuda")
+        leftpad = torch.tensor([3, 0, 0], dtype=torch.int32, device="cuda")
+
+        def decode(q, k, v, seqlens, leftpad):
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=seqlens, cache_leftpad=leftpad, causal=True,
+                                               return_softmax_lse=True)
+            plain = flash_attn_with_kvcache(q, k, v, cache_seqlens=150)
+            return out, lse, plain
+
+        with torch.inference_mode():
+            expected = decode(q, k, v, seqlens, leftpad)
+            got = self._compiled(decode)(q, k, v, seqlens, leftpad)
+        for a, b in zip(expected, got):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def test_bf16_inference(self):
+        """bf16 inputs scaled into fp16 on the device: traceable (no host read)."""
+        from flash_attn_legacy import flash_attention
+        q, k, v = self._qkv((1, 4, 80, 128), (1, 4, 80, 128), dtype=torch.bfloat16)
+        with torch.inference_mode():
+            expected = flash_attention(q, k, v, causal=True)
+            got = self._compiled(lambda q, k, v: flash_attention(q, k, v, causal=True))(q, k, v)
+        torch.testing.assert_close(expected, got, atol=0, rtol=0)
