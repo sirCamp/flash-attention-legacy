@@ -103,6 +103,20 @@ def _check_softcap(softcap):
     return float(softcap)
 
 
+def _check_sinks(sinks, q):
+    """Attention sinks: None, or one logit per query head ([H_q], floating point,
+    on the device of q)."""
+    if sinks is None:
+        return None
+    if not isinstance(sinks, torch.Tensor) or not sinks.is_floating_point() or sinks.shape != (q.shape[1],) \
+            or sinks.device != q.device:
+        got = (f"{sinks.dtype} {tuple(sinks.shape)} on {sinks.device}" if isinstance(sinks, torch.Tensor)
+               else type(sinks).__name__)
+        raise ValueError(f"sinks must be a floating-point tensor of shape [num_heads_q] = [{q.shape[1]}] "
+                         f"on {q.device}, got {got}")
+    return sinks
+
+
 class FlashAttentionFunc(Function):
     """
     Autograd function for Flash Attention v2.
@@ -110,7 +124,7 @@ class FlashAttentionFunc(Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal, window_size, softcap):
+    def forward(ctx, q, k, v, softmax_scale, causal, window_size, softcap, sinks):
         _check_inputs(q, k, v, ndim=4)
         d = q.shape[-1]
         check_head_dim(d)
@@ -119,9 +133,9 @@ class FlashAttentionFunc(Function):
         if H_q % H_kv != 0:
             raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap)
+        o, lse = flash_attn_legacy_cuda.forward(q, k, v, softmax_scale, causal, *window_size, softcap, sinks)
 
-        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.save_for_backward(q, k, v, o, lse, sinks)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size, ctx.softcap = window_size, softcap
@@ -129,14 +143,21 @@ class FlashAttentionFunc(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, o, lse = ctx.saved_tensors
+        q, k, v, o, lse, sinks = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        dq, dk, dv = flash_attn_legacy_cuda.backward(
+        dq, dk, dv, dsinks = flash_attn_legacy_cuda.backward(
             grad_output, q, k, v, o, lse,
             ctx.softmax_scale, ctx.causal, *ctx.window_size, ctx.softcap,
+            sinks if ctx.needs_input_grad[7] else None,  # None: no sink gradient computed
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, _sinks_grad(dsinks, sinks)
+
+
+def _sinks_grad(dsinks, sinks):
+    """fp32 gradient of the sinks from the kernel -> dtype of the sinks (None when
+    not computed)."""
+    return None if dsinks is None else dsinks.to(sinks.dtype)
 
 
 def _resolve_causal(causal: bool, is_causal: Optional[bool]) -> bool:
@@ -161,6 +182,7 @@ def flash_attention(
     *,
     window_size: Tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
+    sinks: Optional[torch.Tensor] = None,
     is_causal: Optional[bool] = None,
 ) -> torch.Tensor:
     """
@@ -187,6 +209,10 @@ def flash_attention(
             skipped, forward and backward.
         softcap: logit softcapping c > 0, as upstream flash-attn and Gemma 2: the
             scaled scores x become c * tanh(x / c) before the softmax; 0 = none
+        sinks: attention sinks [H_q] (gpt-oss, HF kwarg s_aux): one logit per
+            query head added to every row's softmax, with no value (it takes
+            probability away from the keys); differentiable. Finite values, or
+            -inf for a head without sink.
         is_causal: deprecated alias of `causal`
 
     Returns:
@@ -197,7 +223,8 @@ def flash_attention(
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     _check_inputs(q, k, v, ndim=4)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
-    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size, softcap)
+    sinks = _check_sinks(sinks, q)
+    out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size, softcap, sinks)
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 
 
@@ -209,7 +236,7 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, validate):
+                max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate):
         _check_inputs(q, k, v, ndim=3)
         check_head_dim(q.shape[-1])
 
@@ -219,10 +246,10 @@ class FlashAttnVarlenFunc(Function):
 
         o, lse = flash_attn_legacy_cuda.forward_varlen(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, validate,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal, *window_size, softcap, sinks, validate,
         )
 
-        ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k, sinks)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size, ctx.softcap = window_size, softcap
@@ -232,15 +259,15 @@ class FlashAttnVarlenFunc(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k, sinks = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        dq, dk, dv = flash_attn_legacy_cuda.backward_varlen(
+        dq, dk, dv, dsinks = flash_attn_legacy_cuda.backward_varlen(
             grad_output, q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k, ctx.softmax_scale, ctx.causal, *ctx.window_size,
-            ctx.softcap, ctx.validate,
+            ctx.softcap, sinks if ctx.needs_input_grad[11] else None, ctx.validate,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, _sinks_grad(dsinks, sinks), None
 
 
 def flash_attn_varlen_func(
@@ -256,6 +283,7 @@ def flash_attn_varlen_func(
     validate: bool = True,
     window_size: Tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Variable-length Flash Attention for packed sequences.
@@ -280,6 +308,7 @@ def flash_attn_varlen_func(
         window_size: (left, right) local attention within each sequence, as in
             flash_attention
         softcap: logit softcapping, as in flash_attention
+        sinks: attention sinks [num_heads], as in flash_attention
         validate: check cu_seqlens (start at 0, non-decreasing, end at the totals)
             on a host copy, one CPU-GPU sync per call. Pass False only for
             cu_seqlens known to be valid (no sync; e.g. the HuggingFace
@@ -305,9 +334,10 @@ def flash_attn_varlen_func(
 
     _check_inputs(q, k, v, ndim=3)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
+    sinks = _check_sinks(sinks, q)
     out = FlashAttnVarlenFunc.apply(
         *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, validate,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate,
     )
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 

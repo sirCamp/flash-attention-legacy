@@ -42,7 +42,17 @@ def ref_logits(q, k, scale, is_causal, window, softcap):
     return s.masked_fill(ref_hidden(q.shape[-2], k.shape[-2], is_causal, window, q.device), float('-inf'))
 
 
-def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1), softcap=0.0):
+def ref_probs(s, sinks=None):
+    """Softmax of logits [B, H, N_q, N_k]. With sinks [H]: one more logit per row,
+    without value (gpt-oss), dropped after the softmax. Without: rows that see no
+    key -> 0, like the kernel."""
+    if sinks is None:
+        return torch.nan_to_num(torch.softmax(s, dim=-1))
+    col = sinks.float().view(1, -1, 1, 1).expand(*s.shape[:-1], 1)
+    return torch.softmax(torch.cat([s, col], dim=-1), dim=-1)[..., :-1]
+
+
+def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1), softcap=0.0, sinks=None):
     """Standard attention in FP32. Handles GQA by repeating K/V heads."""
     H_q, H_kv = q.shape[1], k.shape[1]
     if H_kv < H_q:
@@ -50,13 +60,12 @@ def ref_attention(q, k, v, scale, is_causal=False, window=(-1, -1), softcap=0.0)
         k = k.repeat_interleave(reps, dim=1)
         v = v.repeat_interleave(reps, dim=1)
     s = ref_logits(q.float(), k.float(), scale, is_causal, window, softcap)
-    p = torch.softmax(s, dim=-1)
-    p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
-    return torch.matmul(p, v.float()).half()
+    return torch.matmul(ref_probs(s, sinks), v.float()).half()
 
 
-def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1), softcap=0.0):
-    """Reference backward in FP32. Returns dQ [H_q], dK [H_kv], dV [H_kv]."""
+def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1), softcap=0.0, sinks=None):
+    """Reference backward in FP32. Returns dQ [H_q], dK [H_kv], dV [H_kv], and
+    d sinks (fp32 [H_q]) when sinks are given."""
     H_q, H_kv = q.shape[1], k.shape[1]
     reps = H_q // H_kv
 
@@ -65,17 +74,16 @@ def ref_backward(q, k, v, grad_out, scale, is_causal=False, window=(-1, -1), sof
     k_f = k.float().detach().repeat_interleave(reps, dim=1).requires_grad_(True)
     v_f = v.float().detach().repeat_interleave(reps, dim=1).requires_grad_(True)
 
+    sinks_f = None if sinks is None else sinks.float().detach().requires_grad_(True)
     s = ref_logits(q_f, k_f, scale, is_causal, window, softcap)
-    p = torch.softmax(s, dim=-1)
-    p = torch.nan_to_num(p)  # fully-masked rows (Nk < Nq) -> 0, like the kernel
-    o = torch.matmul(p, v_f)
+    o = torch.matmul(ref_probs(s, sinks_f), v_f)
     o.backward(grad_out.float())
 
     dq = q_f.grad.half()
     # Sum expanded dK/dV back to H_kv heads
     dk = k_f.grad.view(k.shape[0], H_kv, reps, k.shape[2], k.shape[3]).sum(dim=2).half()
     dv = v_f.grad.view(v.shape[0], H_kv, reps, v.shape[2], v.shape[3]).sum(dim=2).half()
-    return dq, dk, dv
+    return (dq, dk, dv) if sinks is None else (dq, dk, dv, sinks_f.grad)
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +971,178 @@ class TestSoftcap:
         q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
         with pytest.raises(ValueError, match="softcap"):
             flash_attention(q, q, q, softcap=softcap)
+
+
+class TestSinks:
+    """Attention sinks (gpt-oss s_aux, docs/PLAN.md P4.3): one logit per Q head in
+    every row's softmax, without value. Forward, logsumexp and the gradients of
+    Q / K / V / sinks vs the FP32 reference, batched and varlen."""
+
+    @staticmethod
+    def _inputs(shape_q, shape_kv, n_heads, seed=0):
+        torch.manual_seed(seed)
+        mk = lambda shape: torch.randn(*shape, device="cuda", dtype=torch.float16).requires_grad_(True)
+        # sinks around the logits' range: they take a visible share of each row
+        sinks = (torch.randn(n_heads, device="cuda") * 2 + 1).requires_grad_(True)
+        return mk(shape_q), mk(shape_kv), mk(shape_kv), sinks
+
+    @staticmethod
+    def _assert_grads(got, ref):
+        for g, r in zip(got, ref):
+            r = r.float()
+            scale = r.abs().max().item() if r.numel() else 0.0
+            torch.testing.assert_close(g.float(), r, atol=2e-2 * scale + 1e-3, rtol=2e-2)
+
+    @pytest.mark.parametrize("n_q,n_k", [(256, 256), (100, 300), (300, 100)])  # 300/100 causal: rows see no key
+    @pytest.mark.parametrize("causal,window", [(False, (-1, -1)), (True, (-1, -1)), (True, (16, 0))],
+                             ids=["full", "causal", "causal_window16"])
+    def test_forward_backward(self, head_dim, n_q, n_k, causal, window):
+        from flash_attn_legacy import flash_attention
+        scale = 1.0 / math.sqrt(head_dim)
+        q, k, v, sinks = self._inputs((2, 4, n_q, head_dim), (2, 2, n_k, head_dim), 4)
+        go = torch.randn(2, 4, n_q, head_dim, device="cuda", dtype=torch.float16)
+        out = flash_attention(q, k, v, softmax_scale=scale, causal=causal, window_size=window, sinks=sinks)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        kw = dict(is_causal=causal, window=window, sinks=sinks.detach())
+        torch.testing.assert_close(out, ref_attention(*args, scale, **kw), atol=2e-2, rtol=2e-2)
+        self._assert_grads((q.grad, k.grad, v.grad, sinks.grad), ref_backward(*args, go, scale, **kw))
+
+    @pytest.mark.parametrize("n_q,n_k", [(65, 65), (200, 5), (5, 200)])
+    def test_lse_includes_the_sink(self, head_dim, n_q, n_k):
+        """L = logsumexp(logits, sink); (200, 5) causal: rows with no visible key
+        give O = 0 and L = sink (the backward rebuilds P from L)."""
+        import flash_attn_legacy_cuda
+        scale = 1.0 / math.sqrt(head_dim)
+        q, k, v, sinks = (t.detach() for t in self._inputs((2, 4, n_q, head_dim), (2, 2, n_k, head_dim), 4))
+        out, lse = flash_attn_legacy_cuda.forward(q, k, v, scale, True, -1, -1, 0.0, sinks)
+        torch.testing.assert_close(out, ref_attention(q, k, v, scale, True, sinks=sinks), atol=2e-2, rtol=2e-2)
+        s = ref_logits(q.float(), k.float().repeat_interleave(2, dim=1), scale, True, (-1, -1), 0.0)
+        ref = torch.logsumexp(torch.cat([s, sinks.view(1, -1, 1, 1).expand(*s.shape[:-1], 1)], -1), -1)
+        torch.testing.assert_close(lse, ref, atol=2e-3, rtol=1e-3)
+
+    def test_no_keys(self):
+        """N_k = 0: O = 0, L = sink; zero gradients."""
+        import flash_attn_legacy_cuda
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((1, 4, 8, 64), (1, 4, 0, 64), 4)
+        out, lse = flash_attn_legacy_cuda.forward(q.detach(), k.detach(), v.detach(), 0.125, False,
+                                                  -1, -1, 0.0, sinks.detach())
+        assert (out == 0).all() and torch.equal(lse, sinks.detach().view(1, 4, 1).expand_as(lse))
+        flash_attention(q, k, v, sinks=sinks).sum().backward()
+        assert (q.grad == 0).all() and (sinks.grad == 0).all()
+
+    def test_sinks_are_applied_with_their_values(self):
+        """Mutation check: each head uses its own sink (not none, not another
+        head's) and the sink gradient is not zero."""
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((1, 4, 128, 64), (1, 4, 128, 64), 4, seed=1)
+        out = flash_attention(q, k, v, causal=True, sinks=sinks)
+        out.sum().backward()
+        args = (q.detach(), k.detach(), v.detach())
+        torch.testing.assert_close(out, ref_attention(*args, 0.125, True, sinks=sinks.detach()),
+                                   atol=2e-2, rtol=2e-2)
+        for other in (None, sinks.detach().flip(0)):
+            assert (out - ref_attention(*args, 0.125, True, sinks=other)).abs().max() > 0.05
+        assert (sinks.grad.abs() > 1e-3).all()
+
+    def test_minus_inf_sink_is_no_sink(self):
+        """sink = -inf on some heads: those heads match attention without sink,
+        with a zero sink gradient; the others keep theirs."""
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((2, 4, 100, 64), (2, 4, 100, 64), 4)
+        with torch.no_grad():
+            sinks[::2] = float("-inf")
+        go = torch.randn_like(q)
+        out = flash_attention(q, k, v, causal=True, sinks=sinks)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        torch.testing.assert_close(out[:, ::2], ref_attention(*args, 0.125, True)[:, ::2], atol=2e-2, rtol=2e-2)
+        ref = ref_backward(*args, go, 0.125, True, sinks=sinks.detach())
+        self._assert_grads((q.grad, k.grad, v.grad), ref[:3])
+        assert (sinks.grad[::2] == 0).all()
+        torch.testing.assert_close(sinks.grad[1::2], ref[3][1::2], atol=1e-2, rtol=2e-2)
+
+    def test_with_softcap_and_window(self):
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((2, 4, 150, 64), (2, 2, 150, 64), 4)
+        go = torch.randn_like(q)
+        out = flash_attention(q, k, v, causal=True, window_size=(31, 0), softcap=8.0, sinks=sinks)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        kw = dict(is_causal=True, window=(31, 0), softcap=8.0, sinks=sinks.detach())
+        torch.testing.assert_close(out, ref_attention(*args, 0.125, **kw), atol=2e-2, rtol=2e-2)
+        self._assert_grads((q.grad, k.grad, v.grad, sinks.grad), ref_backward(*args, go, 0.125, **kw))
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_sink_dtype(self, dtype):
+        """Any float dtype; the gradient comes back in it, with the reference value."""
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((1, 2, 64, 64), (1, 2, 64, 64), 2)
+        sinks = sinks.detach().to(dtype).requires_grad_(True)
+        go = torch.randn_like(q)
+        flash_attention(q, k, v, sinks=sinks).backward(go)
+        ref = ref_backward(q.detach(), k.detach(), v.detach(), go, 0.125, sinks=sinks.detach())[3]
+        assert sinks.grad.dtype == dtype
+        torch.testing.assert_close(sinks.grad.float(), ref, atol=3e-2 * ref.abs().max().item(), rtol=3e-2)
+
+    def test_frozen_sinks(self):
+        """Sinks without requires_grad: applied in the forward, no gradient."""
+        from flash_attn_legacy import flash_attention
+        q, k, v, sinks = self._inputs((1, 2, 64, 64), (1, 2, 64, 64), 2)
+        sinks = sinks.detach()
+        go = torch.randn_like(q)
+        out = flash_attention(q, k, v, sinks=sinks)
+        out.backward(go)
+        args = (q.detach(), k.detach(), v.detach())
+        torch.testing.assert_close(out, ref_attention(*args, 0.125, sinks=sinks), atol=2e-2, rtol=2e-2)
+        self._assert_grads((q.grad, k.grad, v.grad), ref_backward(*args, go, 0.125, sinks=sinks)[:3])
+        assert sinks.grad is None
+
+    @pytest.mark.parametrize("lens_q,lens_k", [
+        ([1, 70, 200, 33], [1, 70, 200, 33]),
+        ([5, 0, 35, 1, 20], [0, 7, 33, 20, 1]),  # no keys, no queries, rows that see no key
+    ], ids=["same", "uneven"])
+    @pytest.mark.parametrize("causal", [False, True], ids=["non_causal", "causal"])
+    def test_varlen(self, lens_q, lens_k, causal):
+        """Packed sequences of 0 to 200 tokens; d sinks sums over all of them."""
+        from flash_attn_legacy import flash_attn_varlen_func
+        H_q, H_kv, d = 4, 2, 64
+        cu = lambda lens: torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32,  # noqa: E731
+                                       device="cuda")
+        q, k, v, sinks = self._inputs((sum(lens_q), H_q, d), (sum(lens_k), H_kv, d), H_q)
+        go = torch.randn_like(q)
+        out = flash_attn_varlen_func(q, k, v, cu(lens_q), cu(lens_k), max(lens_q), max(lens_k),
+                                     causal=causal, sinks=sinks)
+        out.backward(go)
+        dsinks = torch.zeros(H_q, device="cuda")
+        q0 = k0 = 0
+        for n_q, n_k in zip(lens_q, lens_k):
+            def seq(t, s0, n):
+                return t[s0:s0 + n].detach().permute(1, 0, 2).unsqueeze(0)
+
+            def tok(t):
+                return t.squeeze(0).permute(1, 0, 2)
+            args = (seq(q, q0, n_q), seq(k, k0, n_k), seq(v, k0, n_k))
+            kw = dict(is_causal=causal, sinks=sinks.detach())
+            torch.testing.assert_close(out[q0:q0 + n_q], tok(ref_attention(*args, 0.125, **kw)),
+                                       atol=2e-2, rtol=2e-2)
+            *refs, ds = ref_backward(*args, seq(go, q0, n_q), 0.125, **kw)
+            self._assert_grads([q.grad[q0:q0 + n_q], k.grad[k0:k0 + n_k], v.grad[k0:k0 + n_k]],
+                               [tok(r) for r in refs])
+            dsinks += ds
+            q0, k0 = q0 + n_q, k0 + n_k
+        assert torch.isfinite(sinks.grad).all()
+        self._assert_grads([sinks.grad], [dsinks])
+
+    @pytest.mark.parametrize("sinks", ["list", "str", "shape", "int", "cpu"])
+    def test_invalid_sinks_raise(self, sinks):
+        from flash_attn_legacy import flash_attention
+        q = torch.randn(1, 4, 8, 64, device="cuda", dtype=torch.float16)
+        sinks = {"list": [0.0] * 4, "str": "x", "shape": torch.zeros(3, device="cuda"),
+                 "int": torch.zeros(4, dtype=torch.int32, device="cuda"), "cpu": torch.zeros(4)}[sinks]
+        with pytest.raises(ValueError, match="sinks"):
+            flash_attention(q, q, q, sinks=sinks)
 
 
 class TestValidation:

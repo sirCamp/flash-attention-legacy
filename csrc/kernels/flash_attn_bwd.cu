@@ -3,7 +3,7 @@
 //   - BwdSimt: CUDA cores (Pascal; FORCE_ARCH=pascal elsewhere)
 //   - BwdWmma: WMMA tensor cores (Volta / Turing)
 //   - bwd_batched_kernel / bwd_varlen_kernel: locate the key block, run a Body
-//   - precompute_D_kernel: D = rowsum(dO * O)
+//   - precompute_D_kernel: D = rowsum(dO * O), and the gradient of the sinks
 // Both backward kernels use the KV-outer loop of FlashAttention-2: one block
 // per KV block (of one sequence, for varlen), dK/dV accumulated in registers for the whole block, dQ
 // accumulated in an FP32 buffer with one atomicAdd per element and KV block.
@@ -19,38 +19,59 @@ namespace flash_attn_legacy {
 
 // ---------------------------------------------------------------------------
 // Precompute D = rowsum(dO * O) — launched as a separate kernel
-// D has the layout of L: [B, H, N] (batched) or [total, H] (varlen, B = 1)
+// D has the layout of L: [B, H, N] (batched) or [total, H] (varlen, B = 1).
+// With sinks (one logit per head, probability p_sink = exp(sink - L) in every
+// row): dsinks[h] += -p_sink * D over the rows of head h, as only the sink's
+// share of the normalization depends on it (dO . dO/dsink = -p_sink * D).
 // ---------------------------------------------------------------------------
 __global__ void precompute_D_kernel(
     const half* __restrict__ dO,   // [B, H, N, d]
     const half* __restrict__ O,    // [B, H, N, d]
     float* __restrict__ D,         // [B, H, N]
+    const float* __restrict__ L,   // layout of D; read with sinks only
+    const float* __restrict__ sinks,  // [H] or nullptr
+    float* __restrict__ dsinks,       // [H] fp32, zeroed; with sinks only
     int batch_size, int num_heads, int seq_len, int head_dim,
     index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride
 ) {
     const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= int64_t(batch_size) * num_heads * seq_len) return;
+    const bool valid = idx < int64_t(batch_size) * num_heads * seq_len;
 
-    const int n = static_cast<int>(idx % seq_len);
-    const int h = static_cast<int>((idx / seq_len) % num_heads);
-    const int b = static_cast<int>(idx / (int64_t(num_heads) * seq_len));
-
-    const half* dO_row = dO + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
-    const half* O_row  = O  + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
+    // n fastest: the lanes of a warp are consecutive rows, mostly of one head
+    const int n = valid ? static_cast<int>(idx % seq_len) : 0;
+    const int h = valid ? static_cast<int>((idx / seq_len) % num_heads) : 0;
+    const int b = valid ? static_cast<int>(idx / (int64_t(num_heads) * seq_len)) : 0;
+    const index_t l_idx = b * l_batch_stride + h * l_head_stride + n * l_seq_stride;
 
     float sum = 0.0f;
-    const half2* dO2 = reinterpret_cast<const half2*>(dO_row);
-    const half2* O2  = reinterpret_cast<const half2*>(O_row);
-    const int d2 = head_dim / 2;
-    for (int j = 0; j < d2; j++) {
-        half2 a = dO2[j];
-        half2 b_val = O2[j];
-        sum += __half2float(a.x) * __half2float(b_val.x)
-             + __half2float(a.y) * __half2float(b_val.y);
+    if (valid) {
+        const half* dO_row = dO + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
+        const half* O_row  = O  + b * o_batch_stride + h * o_head_stride + n * o_seq_stride;
+        const half2* dO2 = reinterpret_cast<const half2*>(dO_row);
+        const half2* O2  = reinterpret_cast<const half2*>(O_row);
+        const int d2 = head_dim / 2;
+        for (int j = 0; j < d2; j++) {
+            half2 a = dO2[j];
+            half2 b_val = O2[j];
+            sum += __half2float(a.x) * __half2float(b_val.x)
+                 + __half2float(a.y) * __half2float(b_val.y);
+        }
+        D[l_idx] = sum;
     }
 
-    D[b * l_batch_stride + h * l_head_stride + n * l_seq_stride] = sum;
+    if (sinks == nullptr) return;  // uniform over the grid
+    float g = 0.0f;
+    if (valid && sinks[h] > -INFINITY) g = -expf(sinks[h] - L[l_idx]) * sum;  // -inf: no sink
+    // One atomic per warp when its rows share a head, else one per row.
+    const int h0 = __shfl_sync(0xffffffffu, h, 0);
+    if (__all_sync(0xffffffffu, !valid || h == h0)) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) g += __shfl_xor_sync(0xffffffffu, g, o);
+        if ((threadIdx.x & 31) == 0 && valid) atomicAdd(&dsinks[h0], g);
+    } else if (valid) {
+        atomicAdd(&dsinks[h], g);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +587,7 @@ struct BwdWmma {
 
 void precompute_D(
     const half* dO, const half* O, float* D,
+    const float* L, const float* sinks, float* dsinks,
     int B, int H, int N, int d,
     index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
@@ -576,7 +598,7 @@ void precompute_D(
     const int64_t grid_size = (total + block_size - 1) / block_size;
     if (grid_size > INT32_MAX) throw std::runtime_error("flash_attn_legacy: too many rows for precompute_D");
     precompute_D_kernel<<<grid_size, block_size, 0, stream>>>(
-        dO, O, D, B, H, N, d,
+        dO, O, D, L, sinks, dsinks, B, H, N, d,
         o_batch_stride, o_head_stride, o_seq_stride,
         l_batch_stride, l_head_stride, l_seq_stride
     );

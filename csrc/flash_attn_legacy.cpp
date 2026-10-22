@@ -26,6 +26,7 @@ int flash_attn_fwd_volta_block_rows(int head_dim);
 int flash_attn_fwd_pascal_block_rows(int head_dim);
 void precompute_D(
     const half* dO, const half* O, float* D,
+    const float* L, const float* sinks, float* dsinks,
     int B, int H, int N, int d,
     index_t o_batch_stride, index_t o_head_stride, index_t o_seq_stride,
     index_t l_batch_stride, index_t l_head_stride, index_t l_seq_stride,
@@ -135,6 +136,20 @@ static float logit_softcap(double softcap) {
     return c;
 }
 
+// Attention sinks (gpt-oss s_aux): one logit per Q head, any float dtype on Q's
+// device -> fp32 [H_q] contiguous; undefined = none. Values are not checked
+// (no host sync): a finite logit, or -inf for a head without sink.
+static torch::Tensor sink_logits(const c10::optional<torch::Tensor>& sinks, const torch::Tensor& Q, int H_q) {
+    if (!sinks.has_value() || !sinks->defined()) return {};
+    TORCH_CHECK(sinks->is_floating_point() && sinks->device() == Q.device(),
+                "sinks must be a floating-point tensor on the device of Q");
+    TORCH_CHECK(sinks->dim() == 1 && sinks->size(0) == H_q,
+                "sinks must be [num_heads_q] = [", H_q, "], got ", sinks->sizes());
+    return sinks->to(torch::kFloat32).contiguous();
+}
+
+static float* data_or_null(const torch::Tensor& t) { return t.defined() ? t.data_ptr<float>() : nullptr; }
+
 // Input checks shared by the varlen entry points: Q [total_q, H_q, d],
 // K / V [total_k, H_kv, d] fp16 CUDA, cu_seqlens_q / k int32 on the same device.
 static void check_varlen_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
@@ -232,10 +247,12 @@ static void set_bwd_pointers(FlashAttnBwdParams& b, const torch::Tensor& dO, con
 //   Q is [B, H_q, N_q, d], K/V are [B, H_kv, N_kv, d]; H_q % H_kv == 0.
 // Causal masking is bottom-right aligned (query i sees keys j <= i + N_kv - N_q);
 // window_left / window_right restrict each row further (KeyWindow, -1 = unbounded).
+// sinks: optional logit per Q head in every row's softmax, without value (gpt-oss).
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    c10::optional<torch::Tensor> sinks
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
 
@@ -258,15 +275,17 @@ std::vector<torch::Tensor> flash_attn_forward(
     TORCH_CHECK(V.sizes() == K.sizes(), "V shape must match K");
     TORCH_CHECK(H_kv > 0, "num_heads_kv must be > 0");
     TORCH_CHECK(H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
+    const torch::Tensor sink = sink_logits(sinks, Q, H_q);
 
     auto opts_half = Q.options();
     auto opts_float = Q.options().dtype(torch::kFloat32);
     torch::Tensor O = torch::empty({B, H_q, N, d}, opts_half);
     torch::Tensor L = torch::empty({B, H_q, N}, opts_float);
     if (O.numel() == 0) return {O, L};  // nothing to compute (a 0-sized grid is invalid)
-    if (Nk == 0) {                       // no keys: output 0, logsumexp -inf (as masked rows)
+    if (Nk == 0) {                       // no keys: output 0, logsumexp -inf or the sink (as masked rows)
         O.zero_();
-        L.fill_(-INFINITY);
+        if (sink.defined()) L.copy_(sink.view({1, H_q, 1}).expand_as(L));
+        else                L.fill_(-INFINITY);
         return {O, L};
     }
 
@@ -285,6 +304,7 @@ std::vector<torch::Tensor> flash_attn_forward(
     p.softmax_scale = softmax_scale;
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, N, Nk);
     p.softcap = logit_softcap(softcap);
+    p.sinks = data_or_null(sink);
 
     p.q_batch_stride = Q.stride(0); p.q_head_stride = Q.stride(1); p.q_seq_stride = Q.stride(2);
     p.k_batch_stride = K.stride(0); p.k_head_stride = K.stride(1); p.k_seq_stride = K.stride(2);
@@ -309,12 +329,14 @@ std::vector<torch::Tensor> flash_attn_forward(
 // Backward — GQA aware
 // dQ has same shape as Q [B, H_q, N, d]
 // dK, dV have same shape as K, V [B, H_kv, N, d]
+// dsinks: fp32 [H_q] with sinks (undefined -> None without)
 // ---------------------------------------------------------------------------
 std::vector<torch::Tensor> flash_attn_backward(
     torch::Tensor dO,
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor O, torch::Tensor L,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    c10::optional<torch::Tensor> sinks
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -344,6 +366,9 @@ std::vector<torch::Tensor> flash_attn_backward(
     L = L.contiguous();
     TORCH_CHECK(L.dim() == 3 && L.size(0) == B && L.size(1) == H_q && L.size(2) == N,
                 "L must be [B, H_q, N]");
+    const torch::Tensor sink = sink_logits(sinks, Q, H_q);
+    // fp32 gradient of the sinks (undefined without sinks), cast by the caller
+    torch::Tensor dsink = sink.defined() ? torch::zeros_like(sink) : torch::Tensor();
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -351,7 +376,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     // dQ in FP32 (atomicAdd accumulator) → convert to FP16 at end
     if (Q.numel() == 0 || Nk == 0) {
         // nothing to propagate: dQ is 0 without keys, dK/dV are 0 without queries
-        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V)};
+        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V), dsink};  // O = 0: dsink = 0
     }
     torch::Tensor dQ_fp32 = torch::zeros({B, H_q, N, d}, Q.options().dtype(torch::kFloat32));
     // dK, dV have KV head shape — each element written exactly once (no atomics)
@@ -366,7 +391,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     precompute_D(
         reinterpret_cast<const half*>(dO.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(O.data_ptr<at::Half>()),
-        D_tensor.data_ptr<float>(),
+        D_tensor.data_ptr<float>(), L.data_ptr<float>(), data_or_null(sink), data_or_null(dsink),
         B, H_q, N, d,
         O.stride(0), O.stride(1), O.stride(2),
         l_batch_stride, l_head_stride, 1,
@@ -399,7 +424,7 @@ std::vector<torch::Tensor> flash_attn_backward(
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
 
     torch::Tensor dQ = dQ_fp32.to(torch::kFloat16);
-    return {dQ, dK, dV};
+    return {dQ, dK, dV, dsink};
 }
 
 // ---------------------------------------------------------------------------
@@ -411,11 +436,13 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    c10::optional<torch::Tensor> sinks, bool validate
 ) {
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
     check_varlen_inputs(Q, K, V, cu_seqlens_q, cu_seqlens_k);
     const int total_q = Q.size(0), H_q = Q.size(1), d = Q.size(2);
+    const torch::Tensor sink = sink_logits(sinks, Q, H_q);
     const int total_k = K.size(0), H_kv = K.size(1);
     const int num_seqs = cu_seqlens_q.size(0) - 1;
 
@@ -458,6 +485,7 @@ std::vector<torch::Tensor> flash_attn_forward_varlen(
     p.softmax_scale = softmax_scale;
     std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, total_q, total_k);
     p.softcap = logit_softcap(softcap);
+    p.sinks = data_or_null(sink);
 
     p.q_token_stride = Q.stride(0); p.q_head_stride = Q.stride(1);
     p.k_token_stride = K.stride(0); p.k_head_stride = K.stride(1);
@@ -486,7 +514,8 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     torch::Tensor O, torch::Tensor L,
     torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k,
     int max_seqlen_q, int max_seqlen_k,
-    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap, bool validate
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    c10::optional<torch::Tensor> sinks, bool validate
 ) {
     dO = contiguous_aligned(dO);
     Q = contiguous_aligned(Q); K = contiguous_aligned(K); V = contiguous_aligned(V);
@@ -503,13 +532,15 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
                 "L must be CUDA float32 on the same device as Q");
     L = L.contiguous();
     TORCH_CHECK(L.dim() == 2 && L.size(0) == total_q && L.size(1) == H_q, "L must be [total_q, H_q]");
+    const torch::Tensor sink = sink_logits(sinks, Q, H_q);
+    torch::Tensor dsink = sink.defined() ? torch::zeros_like(sink) : torch::Tensor();
     const auto cu_host = validate ? validated_cu_seqlens(cu_seqlens_q, cu_seqlens_k, total_q, total_k)
                                   : std::pair<torch::Tensor, torch::Tensor>();
 
     const at::cuda::CUDAGuard device_guard(Q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (total_q == 0 || total_k == 0 || H_q == 0) {
-        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V)};
+    if (total_q == 0 || total_k == 0 || H_q == 0) {  // O = 0: dsink = 0
+        return {torch::zeros_like(Q), torch::zeros_like(K), torch::zeros_like(V), dsink};
     }
 
     const bool wmma = get_sm_version() >= 70;
@@ -524,7 +555,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     precompute_D(
         reinterpret_cast<const half*>(dO.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(O.data_ptr<at::Half>()),
-        D_tensor.data_ptr<float>(),
+        D_tensor.data_ptr<float>(), L.data_ptr<float>(), data_or_null(sink), data_or_null(dsink),
         1, H_q, total_q, d,
         0, O.stride(1), O.stride(0),
         0, 1, H_q,
@@ -554,7 +585,7 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
 
     if (k_blocks.total > 0) flash_attn_bwd_launch(bwd, wmma, k_blocks.total, stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
-    return {dQ_fp32.to(torch::kFloat16), dK, dV};
+    return {dQ_fp32.to(torch::kFloat16), dK, dV, dsink};
 }
 
 }  // namespace flash_attn_legacy
@@ -566,14 +597,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Flash Attention v2 forward (Pascal/Volta, GQA/MQA)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none());
     m.def("forward_varlen", &flash_attn_legacy::flash_attn_forward_varlen,
           "Flash Attention v2 forward — variable-length packed sequences",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("validate") = true);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(), py::arg("validate") = true);
     m.def("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen,
           "Flash Attention v2 backward — variable-length packed sequences, one launch",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
@@ -581,11 +612,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("validate") = true);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(), py::arg("validate") = true);
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("O"), py::arg("L"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
-          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0);
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none());
 }

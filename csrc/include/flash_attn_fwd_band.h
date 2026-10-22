@@ -10,7 +10,7 @@
 //   - fwd_key_masked: the KeyWindow of the sequence (causal, sliding window,
 //     tail of the keys); score_map(): scale and softcap (ScoreMap)
 //   - BandSoftmax: online softmax in the log2 domain for the rows a thread holds,
-//     reduced over the lanes that share a row
+//     reduced over the lanes that share a row, started from the head's sink
 //   - fwd_band_loop: the K/V loop (the blocks the Q block can see, blocks
 //     without masking, blocks a band cannot see, K/V prefetch, the two
 //     block-wide barriers)
@@ -41,6 +41,7 @@ struct FwdBlockArgs {
     int q_row_start, valid_q, seq_len_q, seq_len_k;
     int head_dim;  // real head_dim (<= Tile::d: extra tile columns are zero)
     float softmax_scale, softcap;
+    float sink_log2;                // sink logit of the head * log2(e), -inf = none
     int window_left, window_right;  // KeyWindow of the sequence
 
     __device__ __forceinline__ KeyWindow window() const {
@@ -74,16 +75,19 @@ __device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][
 
 // Online softmax state of the ROWS rows a thread holds; each row is spread over
 // ROW_LANES lanes (lane ids differing only in the low log2(ROW_LANES) bits).
-// Rows that see no key keep m = -inf and end with O = 0, L = -inf.
+// A sink (logit without value) is the state of a row that has seen one key of
+// logit sink and value 0: m = sink, sum = 1 (1 / ROW_LANES per lane). Rows that
+// see no key end with O = 0 and L = sink, or m = -inf, L = -inf without sink.
 template <int ROWS, int ROW_LANES>
 struct BandSoftmax {
     static_assert((ROW_LANES & (ROW_LANES - 1)) == 0 && ROW_LANES <= 32, "ROW_LANES must be a power of 2");
     float m[ROWS];    // running max, log2 domain (scores * scale * log2e)
     float sum[ROWS];  // partial sum of this lane's columns
 
-    __device__ __forceinline__ void init() {
+    __device__ __forceinline__ void init(float sink_log2) {
+        const float share = sink_log2 > -INFINITY ? 1.0f / ROW_LANES : 0.0f;  // exact: power of 2
         #pragma unroll
-        for (int r = 0; r < ROWS; r++) { m[r] = -INFINITY; sum[r] = 0.0f; }
+        for (int r = 0; r < ROWS; r++) { m[r] = sink_log2; sum[r] = share; }
     }
 
     // s: this lane's scores of the block, already scaled to the log2 domain and
@@ -114,8 +118,9 @@ struct BandSoftmax {
         }
     }
 
-    // inv[r]: factor for the final O row (0 for rows that saw no key);
-    // lse[r]: natural-log logsumexp of the scaled scores (-inf for those rows).
+    // inv[r]: factor for the final O row (0 for rows that saw no key nor sink);
+    // lse[r]: natural-log logsumexp of the logits and the sink (-inf for those rows
+    // without sink).
     __device__ __forceinline__ void finalize(float (&inv)[ROWS], float (&lse)[ROWS]) {
         #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -243,6 +248,7 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
     a.softcap = p.softcap;
+    a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
     Body::template run<Tile>(a);
@@ -280,6 +286,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.softmax_scale;
     a.softcap = p.softcap;
+    a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
     Body::template run<Tile>(a);

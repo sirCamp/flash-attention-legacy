@@ -18,6 +18,7 @@ Usage:
     python benchmarks/benchmark.py --seq-lens 1024 4096 --head-dim 64 --no-causal
     python benchmarks/benchmark.py --window 1024           # causal sliding window (P4.1)
     python benchmarks/benchmark.py --softcap 50            # logit softcapping (P4.2)
+    python benchmarks/benchmark.py --sinks                 # attention sinks (P4.3)
 
 With --window W every query sees its last W keys (HF sliding_window = W): the
 kernel gets window_size=(W - 1, -1) (right side 0 when causal), SDPA and eager
@@ -25,7 +26,9 @@ a boolean mask built once per shape, during the warmup (it stays cached, so it
 is neither timed nor counted in the peak memory).
 With --softcap C the logits x become C * tanh(x / C) (Gemma 2). SDPA cannot
 do that (reported as unsupported): the reference is eager, which is what the
-HF integration falls back to for softcapping layers.
+HF integration falls back to for softcapping layers. Likewise --sinks (one
+logit per head in every row's softmax, without value, as gpt-oss; trainable,
+so fwd_bwd includes their gradient).
 """
 
 import argparse
@@ -62,10 +65,18 @@ def keep_mask(n, causal, window, device):
 
 @dataclasses.dataclass(frozen=True)
 class Variant:
-    """The attention computed: causal, sliding window W (None: none), softcap C (0: none)."""
+    """The attention computed: causal, sliding window W (None: none), softcap C
+    (0: none), attention sinks."""
     causal: bool
     window: int = None
     softcap: float = 0.0
+    sinks: bool = False
+
+
+@functools.lru_cache(maxsize=4)
+def sink_logits(n_heads, device):
+    """Fixed sinks of --sinks, one per head, trainable (gradients accumulate, unread)."""
+    return torch.linspace(-1.0, 2.0, n_heads, device=device).requires_grad_(True)
 
 
 class Unsupported(Exception):
@@ -81,12 +92,16 @@ def eager_attention(q, k, v, var):
         s = var.softcap * torch.tanh(s / var.softcap)
     if var.causal or var.window is not None:
         s = s.masked_fill(~keep_mask(q.shape[-2], var.causal, var.window, q.device), float("-inf"))
-    return torch.softmax(s.float(), dim=-1).to(q.dtype) @ v
+    s = s.float()
+    if var.sinks:
+        col = sink_logits(q.shape[1], q.device).view(1, -1, 1, 1).expand(*s.shape[:-1], 1)
+        return torch.softmax(torch.cat([s, col], dim=-1), dim=-1)[..., :-1].to(q.dtype) @ v
+    return torch.softmax(s, dim=-1).to(q.dtype) @ v
 
 
 def sdpa_attention(q, k, v, var):
-    if var.softcap:
-        raise Unsupported("SDPA has no logit softcapping")
+    if var.softcap or var.sinks:
+        raise Unsupported("SDPA has no logit softcapping / attention sinks")
     if var.window is None:
         return F.scaled_dot_product_attention(q, k, v, is_causal=var.causal)
     return F.scaled_dot_product_attention(q, k, v, attn_mask=keep_mask(q.shape[-2], var.causal, var.window, q.device))
@@ -94,7 +109,8 @@ def sdpa_attention(q, k, v, var):
 
 def legacy_attention(q, k, v, var):
     window = (-1, -1) if var.window is None else (var.window - 1, -1)
-    return flash_attention(q, k, v, causal=var.causal, window_size=window, softcap=var.softcap)
+    sinks = sink_logits(q.shape[1], q.device) if var.sinks else None
+    return flash_attention(q, k, v, causal=var.causal, window_size=window, softcap=var.softcap, sinks=sinks)
 
 
 # name -> (function, SDPA backend to select around it or None)
@@ -221,6 +237,7 @@ def main():
                    help="sliding window: each query sees its last W keys (default: none)")
     p.add_argument("--softcap", type=float, default=0.0,
                    help="logit softcapping C * tanh(x / C) (default: 0, none)")
+    p.add_argument("--sinks", action="store_true", help="attention sinks, one per head (gpt-oss)")
     p.add_argument("--modes", nargs="+", default=["fwd", "fwd_bwd"], choices=["fwd", "fwd_bwd"])
     p.add_argument("--impls", nargs="+", default=list(IMPLS), choices=list(IMPLS))
     p.add_argument("--warmup", type=int, default=5)
@@ -238,11 +255,11 @@ def main():
 
     env = environment()
     causal = not args.no_causal
-    var = Variant(causal, args.window, args.softcap)
-    # what the kernel replaces: SDPA mem-efficient, or eager for softcapping (HF fallback)
-    ref_impl = "eager" if args.softcap else "sdpa_mem_efficient"
+    var = Variant(causal, args.window, args.softcap, args.sinks)
+    # what the kernel replaces: SDPA mem-efficient, or eager for softcap / sinks (HF fallback)
+    ref_impl = "eager" if args.softcap or args.sinks else "sdpa_mem_efficient"
     print(f"{env['gpu']} (sm_{env['sm'].replace('.', '')}), torch {env['torch']}, "
-          f"B={args.batch} H={args.heads} causal={causal} window={args.window} softcap={args.softcap}, "
+          f"B={args.batch} H={args.heads} causal={causal} window={args.window} softcap={args.softcap} sinks={args.sinks}, "
           f"{args.reps} reps")
     hdr = (f"{'mode':>7} {'d':>4} {'N':>6} | " + " | ".join(f"{i:>22}" for i in args.impls)
            + f" | legacy/{ref_impl}")
@@ -263,7 +280,7 @@ def main():
                 for impl in args.impls:
                     results.append({"impl": impl, "mode": mode, "batch": args.batch, "heads": args.heads,
                                     "seq_len": N, "head_dim": d, "causal": causal, "window": args.window,
-                                    "softcap": args.softcap, "max_abs_error": errors.get(impl), **row[impl]})
+                                    "softcap": args.softcap, "sinks": args.sinks, "max_abs_error": errors.get(impl), **row[impl]})
                 bad = [i for i, e in errors.items() if e > 1e-2]
                 if bad:
                     print(f"WARNING d={d} N={N}: max abs error > 1e-2 vs FP32 math for {bad}: "
@@ -282,7 +299,7 @@ def main():
     print("note: the flash_attn_legacy forward always writes the logsumexp (B*H*N floats), SDPA skips it without grad")
     if args.save:
         suffix = ("" if args.window is None else f"_window{args.window}") + \
-                 (f"_softcap{args.softcap:g}" if args.softcap else "")
+                 (f"_softcap{args.softcap:g}" if args.softcap else "") + ("_sinks" if args.sinks else "")
         out = ROOT / "docs" / "bench" / (env["gpu"].replace(" ", "_") + suffix + ".json")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"environment": env, "args": vars(args), "results": results}, indent=1) + "\n")

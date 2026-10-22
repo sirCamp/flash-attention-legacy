@@ -73,6 +73,9 @@ struct FlashAttnParams {
     // Softmax scale  (typically 1/sqrt(d)); logit softcap (ScoreMap, 0 = none)
     float softmax_scale;
     float softcap;
+    // Attention sinks: one logit per Q head that joins every row's softmax with
+    // no value (gpt-oss s_aux), fp32 [num_heads]; nullptr = none
+    const float* sinks;
 
     // Visible keys of each query row: KeyWindow (-1 = unbounded; causal is right = 0)
     int window_left, window_right;
@@ -111,6 +114,7 @@ struct FlashAttnVarlenParams {
 
     float softmax_scale;
     float softcap;                  // ScoreMap (0 = none)
+    const float* sinks;             // per Q head, nullptr = none (FlashAttnParams)
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 };
 
