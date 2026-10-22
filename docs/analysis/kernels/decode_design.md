@@ -94,4 +94,10 @@ c. R = 8 (q in shared memory).
 d. cache_leftpad.
 e. Paged (block_table), without leftpad.
 f. HF routing of decode steps.
-g. Tuning: reduce-scatter scores, loads in flight, splits heuristics per arch.
+g. Tuning, measured on T4 (decode kernel only, B=8, 16k context): R <= 4 runs at 200-236 GB/s (d=128: ~65-70% of the
+   peak; near the bound). R = 8 (d=64, gpt-oss) at ~100 GB/s, issue bound: ablations (wrong results, timing only) put
+   the per-key update (exp2, P V FMAs, V conversion) at ~33% and the score shuffles at ~14%; 135 registers -> 3 blocks
+   of 4 warps per SM. Tried, no measurable gain, not kept: U = 2 / 4 keys per group and step with one block merge
+   (R = 4 got slower), q in registers at R = 8, a one-key specialised update (one exp2 when the max holds). Still
+   5-10x faster than SDPA. Open: a reduce-scatter of the scores (~2R shuffles instead of R log2 G, one exp2 per row
+   per group), or the mma path for R > 4 on SM 7.x; num_splits sized by capacity (HF static caches).
