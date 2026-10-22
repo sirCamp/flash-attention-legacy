@@ -47,6 +47,7 @@ cuda_sources = [
     str(csrc_dir / "kernels" / "flash_attn_fwd_turing.cu"),
     str(csrc_dir / "kernels" / "flash_attn_fwd_pascal.cu"),
     str(csrc_dir / "kernels" / "flash_attn_bwd.cu"),
+    str(csrc_dir / "kernels" / "flash_attn_decode.cu"),
 ]
 
 include_dirs = [

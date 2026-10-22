@@ -1145,6 +1145,157 @@ class TestSinks:
             flash_attention(q, q, q, sinks=sinks)
 
 
+class TestKVCache:
+    """flash_attn_with_kvcache (decode, docs/analysis/kernels/decode_design.md) vs
+    the FP32 reference row by row: ragged cache_seqlens (0, 1, block edges, full),
+    GQA, q_len > 1 with causal, window, softcap, sinks, fp16 / bf16, contiguous
+    BSHD caches and HuggingFace's BHSD layout as a transposed view (no copy)."""
+
+    @staticmethod
+    def _case(B, q_len, H_q, H_kv, d, max_len, dtype, layout, seed=0):
+        torch.manual_seed(seed)
+        q = torch.randn(B, q_len, H_q, d, device="cuda", dtype=dtype)
+        if layout == "bshd":
+            k, v = (torch.randn(B, max_len, H_kv, d, device="cuda", dtype=dtype) for _ in range(2))
+        else:  # HF cache [B, H_kv, N, d], passed as a view
+            k, v = (torch.randn(B, H_kv, max_len, d, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(2))
+        return q, k, v
+
+    @staticmethod
+    def _poison(k, v, seqlens):
+        """NaN past each row's valid keys, as an uninitialised cache: never read."""
+        for b, n in enumerate(seqlens):
+            k[b, n:] = float("nan")
+            v[b, n:] = float("nan")
+
+    @staticmethod
+    def _ref(q, k, v, seqlens, scale, causal=False, window=(-1, -1), softcap=0.0, sinks=None):
+        """Per row b: reference over the keys [0, seqlens[b]); out BSHD, lse [B, H_q, q_len]."""
+        outs, lses = [], []
+        for b, n in enumerate(seqlens):
+            qb = q[b:b + 1].transpose(1, 2).float()        # [1, H_q, q_len, d]
+            kb = k[b:b + 1, :n].transpose(1, 2).float()    # [1, H_kv, n, d]
+            vb = v[b:b + 1, :n].transpose(1, 2).float()
+            rep = qb.shape[1] // kb.shape[1]
+            kb, vb = kb.repeat_interleave(rep, dim=1), vb.repeat_interleave(rep, dim=1)
+            logits = ref_logits(qb, kb, scale, causal, window, softcap)
+            outs.append((ref_probs(logits, sinks) @ vb).transpose(1, 2))
+            if sinks is not None:
+                logits = torch.cat([logits, sinks.float().view(1, -1, 1, 1).expand(*logits.shape[:-1], 1)], -1)
+            lses.append(torch.logsumexp(logits, -1))
+        return torch.cat(outs), torch.cat(lses)
+
+    def _check(self, out, lse, ref_out, ref_lse, dtype):
+        tol = 2e-2 if dtype == torch.float16 else 4e-2
+        torch.testing.assert_close(out.float(), ref_out, atol=tol, rtol=tol)
+        finite = torch.isfinite(ref_lse)
+        assert torch.equal(torch.isfinite(lse), finite)
+        torch.testing.assert_close(lse[finite], ref_lse[finite], atol=2e-3, rtol=1e-3)
+
+    # query rows per KV head (H_q / H_kv * q_len): 1, 4, 4, 4, 2, 3, 3
+    @pytest.mark.parametrize("q_len,H_q,H_kv", [(1, 4, 4), (1, 8, 2), (2, 4, 2), (4, 2, 2), (1, 2, 1), (3, 1, 1),
+                                                (1, 3, 1)])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    @pytest.mark.parametrize("layout", ["bshd", "bhsd_view"])
+    def test_decode(self, head_dim, q_len, H_q, H_kv, dtype, layout):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        max_len = 300
+        q, k, v = self._case(5, q_len, H_q, H_kv, head_dim, max_len, dtype, layout)
+        seqlens = [300, 1, 0, 128, 77]
+        self._poison(k, v, seqlens)
+        scale = 1.0 / math.sqrt(head_dim)
+        cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=True, return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, scale, causal=True)
+        self._check(out, lse, ref_out, ref_lse, dtype)
+        assert (out[2] == 0).all()  # no key: O = 0, lse = -inf
+
+    @pytest.mark.parametrize("feature", ["window", "window_right", "softcap", "sinks", "non_causal", "int_seqlens"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_features(self, head_dim, feature, dtype):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 2, 4, 2, head_dim, 200, dtype, "bshd", seed=1)
+        seqlens = [200, 50, 1]
+        kw, ref_kw = {}, {"causal": True}
+        if feature == "window":
+            kw, ref_kw = {"window_size": (16, 0)}, {"causal": True, "window": (16, 0)}
+        elif feature == "window_right":  # non-causal window around each query's position
+            kw, ref_kw = {"window_size": (8, 1)}, {"window": (8, 1)}
+        elif feature == "softcap":
+            q = q * 4
+            kw, ref_kw = {"softcap": 5.0}, {"causal": True, "softcap": 5.0}
+        elif feature == "sinks":
+            sinks = torch.randn(4, device="cuda") + 1
+            kw, ref_kw = {"sinks": sinks}, {"causal": True, "sinks": sinks}
+        elif feature == "non_causal":
+            ref_kw = {}
+        causal = feature not in ("non_causal", "window_right")
+        if feature == "int_seqlens":
+            seqlens, cs = [120, 120, 120], 120
+        else:
+            cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        self._poison(k, v, seqlens)
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, causal=causal, return_softmax_lse=True, **kw)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), **ref_kw)
+        self._check(out, lse, ref_out, ref_lse, dtype)
+
+    def test_seqlens_beyond_the_cache(self):
+        """Tensor cache_seqlens are clamped to [0, max_len] on the GPU (never read
+        past the cache); an int outside the range raises."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(2, 1, 4, 4, 64, 64, torch.float16, "bshd")
+        with torch.no_grad():
+            out = flash_attn_with_kvcache(q, k, v, cache_seqlens=torch.tensor([500, -3], dtype=torch.int32,
+                                                                              device="cuda"))
+            ref_out, _ = self._ref(q, k, v, [64, 0], 0.125)
+            torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
+            for bad in (65, -1):
+                with pytest.raises(ValueError, match="cache_seqlens"):
+                    flash_attn_with_kvcache(q, k, v, cache_seqlens=bad)
+
+    def test_sinks_without_keys(self):
+        """A row whose window is empty keeps the sink only: O = 0, lse = sink."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(1, 1, 2, 2, 64, 32, torch.float16, "bshd")
+        sinks = torch.tensor([0.5, -1.0], device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=0, sinks=sinks, return_softmax_lse=True)
+        assert (out == 0).all()
+        torch.testing.assert_close(lse.view(-1), sinks)
+
+    def test_bf16_beyond_fp16_range(self):
+        """bf16 caches are read as they are: values beyond the fp16 range are fine."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(2, 1, 4, 4, 64, 64, torch.bfloat16, "bshd")
+        v = v * 1e6
+        with torch.no_grad():
+            out = flash_attn_with_kvcache(q, k, v, cache_seqlens=64)
+        ref_out, _ = self._ref(q, k, v, [64, 64], 0.125)
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), ref_out, atol=4e-2 * 1e6, rtol=4e-2)
+
+    def test_rejects(self):
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(1, 1, 4, 4, 64, 32, torch.float16, "bshd")
+        with torch.no_grad():
+            for kw in ({"k": k}, {"block_table": torch.zeros(1, 1, dtype=torch.int32, device="cuda")},
+                       {"cache_leftpad": torch.zeros(1, dtype=torch.int32, device="cuda")}):
+                with pytest.raises(NotImplementedError):
+                    flash_attn_with_kvcache(q, k, v, **kw)
+            with pytest.raises(NotImplementedError):  # 8 query rows per KV head: not yet
+                flash_attn_with_kvcache(torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16),
+                                        k[:, :, :1], v[:, :, :1])
+            buf = torch.randn(32 * 260, device="cuda", dtype=torch.float16)
+            k_odd = buf.as_strided((1, 32, 4, 64), (32 * 260, 260, 64, 1))  # key rows 260 elements apart
+            with pytest.raises(RuntimeError, match="multiples of 8"):
+                flash_attn_with_kvcache(q, k_odd, v)
+        q.requires_grad_(True)
+        with pytest.raises(RuntimeError, match="inference only"):
+            flash_attn_with_kvcache(q, k, v)
+
+
 class TestValidation:
     """Unsupported inputs must raise (not assert, not read out of bounds)."""
 

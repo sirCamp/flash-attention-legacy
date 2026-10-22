@@ -31,6 +31,7 @@ __version__ = "0.5.0"
 from .flash_attn import (
     flash_attention,
     flash_attn_varlen_func,
+    flash_attn_with_kvcache,
     FlashAttention,
     FlashMultiHeadAttention,
 )
@@ -45,6 +46,7 @@ from .integrations import register, fallback_stats, reset_fallback_stats
 __all__ = [
     "flash_attention",
     "flash_attn_varlen_func",
+    "flash_attn_with_kvcache",
     "FlashAttention",
     "FlashMultiHeadAttention",
     "check_gpu_compatibility",

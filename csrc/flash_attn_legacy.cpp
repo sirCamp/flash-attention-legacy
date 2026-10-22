@@ -36,6 +36,8 @@ void precompute_D(
     cudaStream_t stream);
 void flash_attn_bwd_launch(FlashAttnBwdParams& params, int sm, int total_k_blocks, cudaStream_t stream);
 int flash_attn_bwd_block_cols(int head_dim, int sm);
+void flash_attn_decode(DecodeParams& params, bool bf16, cudaStream_t stream);
+int flash_attn_decode_max_rows();
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -603,6 +605,83 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
     return {dQ_fp32.to(torch::kFloat16), dK, dV, dsink};
 }
 
+// ---------------------------------------------------------------------------
+// Decode with a KV cache (upstream flash_attn_with_kvcache subset): q [B, q_len,
+// H_q, d], caches [B, max_len, H_kv, d] with any 16-byte aligned strides (no
+// copy: HF's [B, H_kv, N, d] cache passes as a transposed view), cache_seqlens
+// [B] int32 = end of the valid keys of each row (clamped to [0, max_len] in the
+// kernel: never read past the cache). fp16 or bf16, read natively.
+// Returns out like q (BSHD) and lse [B, H_q, q_len] (natural log; -inf for rows
+// with no visible key nor sink).
+// ---------------------------------------------------------------------------
+static void check_decode_layout(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.stride(-1) == 1, name, ": the last dimension must be contiguous");
+    for (int i = 0; i < t.dim() - 1; i++) {
+        TORCH_CHECK(t.size(i) == 1 || t.stride(i) % 8 == 0, name,
+                    ": strides must be multiples of 8 elements (16-byte rows)");
+    }
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, name, ": data must be 16-byte aligned");
+}
+
+std::vector<torch::Tensor> flash_attn_with_kvcache(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
+    float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
+    c10::optional<torch::Tensor> sinks
+) {
+    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
+                "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d]");
+    TORCH_CHECK(q.is_cuda() && k_cache.device() == q.device() && v_cache.device() == q.device(),
+                "q, k_cache, v_cache must be on the same CUDA device");
+    TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16, "q must be float16 or bfloat16");
+    TORCH_CHECK(k_cache.dtype() == q.dtype() && v_cache.dtype() == q.dtype(), "k_cache / v_cache must have q's dtype");
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "v_cache shape must match k_cache");
+    TORCH_CHECK(q.size(0) <= INT32_MAX && q.size(1) <= INT32_MAX && k_cache.size(1) <= INT32_MAX,
+                "batch and sequence lengths must fit in int32");
+    const int B = q.size(0), q_len = q.size(1), H_q = q.size(2), d = q.size(3);
+    const int max_len = k_cache.size(1), H_kv = k_cache.size(2);
+    check_head_dim(d);
+    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == d, "k_cache must be [B, max_len, H_kv, d]");
+    TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
+    TORCH_CHECK_NOT_IMPLEMENTED(H_q / H_kv * q_len <= flash_attn_decode_max_rows(),
+                "flash_attn_with_kvcache: (num_heads_q / num_heads_kv) * q_len = ", H_q / H_kv * q_len,
+                " query rows per KV head; at most ", flash_attn_decode_max_rows(), " for now");
+    TORCH_CHECK(cache_seqlens.is_cuda() && cache_seqlens.device() == q.device() &&
+                cache_seqlens.dtype() == torch::kInt32 && cache_seqlens.dim() == 1 && cache_seqlens.size(0) == B,
+                "cache_seqlens must be int32 [B] on q's device");
+    q = contiguous_aligned(q);
+    check_decode_layout(k_cache, "k_cache");
+    check_decode_layout(v_cache, "v_cache");
+    cache_seqlens = cache_seqlens.contiguous();
+    const torch::Tensor sink = sink_logits(sinks, q, H_q);
+
+    torch::Tensor out = torch::empty_like(q);
+    torch::Tensor lse = torch::empty({B, H_q, q_len}, q.options().dtype(torch::kFloat32));
+    if (out.numel() == 0) return {out, lse};
+
+    const at::cuda::CUDAGuard device_guard(q.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    get_sm_version();  // a kernel image for this GPU
+
+    DecodeParams p = {};
+    p.q = q.data_ptr(); p.k = k_cache.data_ptr(); p.v = v_cache.data_ptr(); p.out = out.data_ptr();
+    p.lse = lse.data_ptr<float>();
+    p.cache_seqlens = cache_seqlens.data_ptr<int>();
+    p.sinks = data_or_null(sink);
+    p.q_batch_stride = q.stride(0); p.q_seq_stride = q.stride(1); p.q_head_stride = q.stride(2);
+    p.k_batch_stride = k_cache.stride(0); p.k_seq_stride = k_cache.stride(1); p.k_head_stride = k_cache.stride(2);
+    p.v_batch_stride = v_cache.stride(0); p.v_seq_stride = v_cache.stride(1); p.v_head_stride = v_cache.stride(2);
+    p.o_batch_stride = out.stride(0); p.o_seq_stride = out.stride(1); p.o_head_stride = out.stride(2);
+    p.batch_size = B; p.q_len = q_len; p.num_heads = H_q; p.num_heads_k = H_kv; p.head_dim = d;
+    p.max_len = max_len;
+    p.softmax_scale = softmax_scale;
+    p.softcap = logit_softcap(softcap);
+    std::tie(p.window_left, p.window_right) = key_window(is_causal, window_left, window_right, q_len, max_len);
+
+    flash_attn_decode(p, q.dtype() == torch::kBFloat16, stream);
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return {out, lse};
+}
+
 }  // namespace flash_attn_legacy
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -628,6 +707,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("max_seqlen_q"), py::arg("max_seqlen_k"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
           py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0, py::arg("sinks") = py::none(), py::arg("validate") = true);
+    m.def("with_kvcache", &flash_attn_legacy::flash_attn_with_kvcache,
+          "Decode with a KV cache (flash_attn_with_kvcache subset)",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_seqlens"),
+          py::arg("softmax_scale"), py::arg("is_causal") = false,
+          py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
+          py::arg("sinks") = py::none());
     m.def("backward", &flash_attn_legacy::flash_attn_backward,
           "Flash Attention v2 backward (Pascal/Volta, GQA/MQA)",
           py::arg("dO"), py::arg("Q"), py::arg("K"), py::arg("V"),

@@ -103,17 +103,17 @@ def _check_softcap(softcap):
     return float(softcap)
 
 
-def _check_sinks(sinks, q):
-    """Attention sinks: None, or one logit per query head ([H_q], floating point,
-    on the device of q)."""
+def _check_sinks(sinks, num_heads, device):
+    """Attention sinks: None, or one logit per query head ([num_heads], floating
+    point, on `device`)."""
     if sinks is None:
         return None
-    if not isinstance(sinks, torch.Tensor) or not sinks.is_floating_point() or sinks.shape != (q.shape[1],) \
-            or sinks.device != q.device:
+    if not isinstance(sinks, torch.Tensor) or not sinks.is_floating_point() or sinks.shape != (num_heads,) \
+            or sinks.device != device:
         got = (f"{sinks.dtype} {tuple(sinks.shape)} on {sinks.device}" if isinstance(sinks, torch.Tensor)
                else type(sinks).__name__)
-        raise ValueError(f"sinks must be a floating-point tensor of shape [num_heads_q] = [{q.shape[1]}] "
-                         f"on {q.device}, got {got}")
+        raise ValueError(f"sinks must be a floating-point tensor of shape [num_heads_q] = [{num_heads}] "
+                         f"on {device}, got {got}")
     return sinks
 
 
@@ -223,7 +223,7 @@ def flash_attention(
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     _check_inputs(q, k, v, ndim=4)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
-    sinks = _check_sinks(sinks, q)
+    sinks = _check_sinks(sinks, q.shape[1], q.device)
     out = FlashAttentionFunc.apply(*_to_fp16(q, k, v), softmax_scale, causal, window_size, softcap, sinks)
     return out if q.dtype == torch.float16 else out.to(q.dtype)
 
@@ -334,7 +334,7 @@ def flash_attn_varlen_func(
 
     _check_inputs(q, k, v, ndim=3)
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
-    sinks = _check_sinks(sinks, q)
+    sinks = _check_sinks(sinks, q.shape[1], q.device)
     out = FlashAttnVarlenFunc.apply(
         *_to_fp16(q, k, v), cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size, softcap, sinks, validate,
@@ -441,3 +441,88 @@ class FlashMultiHeadAttention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(B, N, self.embed_dim)
         return self.dropout(self.out_proj(out))
+
+
+_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "cache_leftpad", "block_table",
+                        "alibi_slopes")
+
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    cache_seqlens=None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
+    return_softmax_lse: bool = False,
+    *,
+    sinks: Optional[torch.Tensor] = None,
+):
+    """
+    Attention of a few new queries against a KV cache (decode), the upstream
+    flash-attn ``flash_attn_with_kvcache`` with the same positional order.
+    Inference only. Split-KV decode kernel on CUDA cores (every supported GPU).
+
+    Args:
+        q: [B, q_len, H_q, d] float16 or bfloat16 (q_len small: decode, speculation)
+        k_cache, v_cache: [B, max_len, H_kv, d], q's dtype, read in place: any
+            strides with a contiguous last dimension and 16-byte aligned rows
+            (e.g. a HuggingFace cache [B, H_kv, N, d] passed as ``.transpose(1, 2)``)
+        cache_seqlens: int or int32 [B]: end of the valid keys of each row
+            (default max_len); keys [0, cache_seqlens) are attended. Tensor
+            values are clamped to [0, max_len] on the GPU (no sync); an int
+            outside that range raises
+        softmax_scale: default 1/sqrt(d)
+        causal: bottom-right aligned (query i of q_len sees keys
+            <= cache_seqlens - q_len + i); irrelevant for q_len == 1
+        window_size, softcap: as flash_attention
+        num_splits: accepted for compatibility (ignored: this version does not
+            split the keys)
+        return_softmax_lse: also return the logsumexp [B, H_q, q_len] (fp32;
+            -inf for rows with no visible key nor sink)
+        sinks: attention sinks [H_q] (keyword only, an extension)
+        k, v, rotary_cos, rotary_sin, cache_batch_idx, cache_leftpad, block_table,
+        alibi_slopes: not supported yet (NotImplementedError when given)
+
+    Returns:
+        out [B, q_len, H_q, d] in q's dtype, or (out, lse) with return_softmax_lse
+
+    Differences from upstream: raises if autograd would need it (upstream returns
+    a tensor without grad_fn); rows with no visible key give lse = -inf.
+    """
+    given = locals()
+    unsupported = [name for name in _KVCACHE_UNSUPPORTED if given[name] is not None]
+    if unsupported:
+        raise NotImplementedError(f"flash_attn_with_kvcache: {', '.join(unsupported)} not supported yet")
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k_cache, v_cache)):
+        raise RuntimeError("flash_attn_with_kvcache is inference only (no autograd): run under torch.no_grad()")
+    if q.dim() != 4 or k_cache.dim() != 4:
+        raise ValueError("q must be [B, q_len, H_q, d] and k_cache / v_cache [B, max_len, H_kv, d]")
+    B, max_len = q.shape[0], k_cache.shape[1]
+    if cache_seqlens is None:
+        cache_seqlens = max_len
+    if isinstance(cache_seqlens, numbers.Integral) and not isinstance(cache_seqlens, bool):
+        if not 0 <= cache_seqlens <= max_len:
+            raise ValueError(f"cache_seqlens={cache_seqlens} outside [0, max_len={max_len}]")
+        cache_seqlens = torch.full((B,), int(cache_seqlens), dtype=torch.int32, device=q.device)
+    else:
+        cache_seqlens = cache_seqlens.to(device=q.device, dtype=torch.int32)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    window_size, softcap = _check_window(window_size), _check_softcap(softcap)
+    sinks = _check_sinks(sinks, q.shape[2], q.device)
+    out, lse = flash_attn_legacy_cuda.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal,
+                                                   *window_size, softcap, sinks)
+    return (out, lse) if return_softmax_lse else out

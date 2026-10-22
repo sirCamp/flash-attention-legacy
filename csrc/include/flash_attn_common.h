@@ -119,6 +119,29 @@ struct FlashAttnVarlenParams {
 };
 
 // ---------------------------------------------------------------------------
+// Decode with a KV cache (flash_attn_with_kvcache, docs/analysis/kernels/
+// decode_design.md): q [B, q_len, H_q, d], caches [B, max_len, H_kv, d] with
+// any 16-byte aligned strides (stride of d = 1), out like q, lse [B, H_q, q_len].
+// ---------------------------------------------------------------------------
+struct DecodeParams {
+    const void* __restrict__ q;      // fp16 or bf16 (as the caches)
+    const void* __restrict__ k;
+    const void* __restrict__ v;
+    void* __restrict__ out;
+    float* __restrict__ lse;
+    const int* __restrict__ cache_seqlens;  // [B]: end of the valid keys
+    const float* __restrict__ sinks;        // [H_q] or nullptr
+    index_t q_batch_stride, q_seq_stride, q_head_stride;
+    index_t k_batch_stride, k_seq_stride, k_head_stride;
+    index_t v_batch_stride, v_seq_stride, v_head_stride;
+    index_t o_batch_stride, o_seq_stride, o_head_stride;
+    int batch_size, q_len, num_heads, num_heads_k, head_dim;
+    int max_len;                    // cache capacity: cache_seqlens are clamped to [0, max_len]
+    float softmax_scale, softcap;
+    int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
+};
+
+// ---------------------------------------------------------------------------
 // Backward kernel launch parameters — shared between all kernels
 // ---------------------------------------------------------------------------
 struct FlashAttnBwdParams {
