@@ -443,8 +443,15 @@ class FlashMultiHeadAttention(nn.Module):
         return self.dropout(self.out_proj(out))
 
 
-_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "cache_leftpad", "block_table",
-                        "alibi_slopes")
+def _batch_int_tensor(t, name, device):
+    """An integer tensor of per-row values -> int32 on `device` (shape checked in C++)."""
+    if not isinstance(t, torch.Tensor) or t.is_floating_point() or t.is_complex() or t.dtype == torch.bool:
+        raise ValueError(f"{name} must be an integer tensor, got "
+                         f"{t.dtype if isinstance(t, torch.Tensor) else type(t).__name__}")
+    return t.to(device=device, dtype=torch.int32)
+
+
+_KVCACHE_UNSUPPORTED = ("k", "v", "rotary_cos", "rotary_sin", "cache_batch_idx", "block_table", "alibi_slopes")
 
 
 def flash_attn_with_kvcache(
@@ -481,9 +488,11 @@ def flash_attn_with_kvcache(
             strides with a contiguous last dimension and 16-byte aligned rows
             (e.g. a HuggingFace cache [B, H_kv, N, d] passed as ``.transpose(1, 2)``)
         cache_seqlens: int or int32 [B]: end of the valid keys of each row
-            (default max_len); keys [0, cache_seqlens) are attended. Tensor
-            values are clamped to [0, max_len] on the GPU (no sync); an int
-            outside that range raises
+            (default max_len); keys [cache_leftpad, cache_seqlens) are attended.
+            Tensor values are clamped to [0, max_len] on the GPU (no sync); an
+            int outside that range raises
+        cache_leftpad: int32 [B] or None: first valid key of each row (left
+            padding); causal / window stay aligned to cache_seqlens
         softmax_scale: default 1/sqrt(d)
         causal: bottom-right aligned (query i of q_len sees keys
             <= cache_seqlens - q_len + i); irrelevant for q_len == 1
@@ -496,14 +505,15 @@ def flash_attn_with_kvcache(
         return_softmax_lse: also return the logsumexp [B, H_q, q_len] (fp32;
             -inf for rows with no visible key nor sink)
         sinks: attention sinks [H_q] (keyword only, an extension)
-        k, v, rotary_cos, rotary_sin, cache_batch_idx, cache_leftpad, block_table,
-        alibi_slopes: not supported yet (NotImplementedError when given)
+        k, v, rotary_cos, rotary_sin, cache_batch_idx, block_table, alibi_slopes:
+            not supported yet (NotImplementedError when given)
 
     Returns:
         out [B, q_len, H_q, d] in q's dtype, or (out, lse) with return_softmax_lse
 
     Differences from upstream: raises if autograd would need it (upstream returns
-    a tensor without grad_fn); rows with no visible key give lse = -inf.
+    a tensor without grad_fn); rows with no visible key give lse = -inf; tensor
+    cache_seqlens / cache_leftpad are clamped to the cache (upstream: undefined).
     """
     given = locals()
     unsupported = [name for name in _KVCACHE_UNSUPPORTED if given[name] is not None]
@@ -521,13 +531,15 @@ def flash_attn_with_kvcache(
             raise ValueError(f"cache_seqlens={cache_seqlens} outside [0, max_len={max_len}]")
         cache_seqlens = torch.full((B,), int(cache_seqlens), dtype=torch.int32, device=q.device)
     else:
-        cache_seqlens = cache_seqlens.to(device=q.device, dtype=torch.int32)
+        cache_seqlens = _batch_int_tensor(cache_seqlens, "cache_seqlens", q.device)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if not isinstance(num_splits, numbers.Integral) or isinstance(num_splits, bool) or num_splits < 0:
         raise ValueError(f"num_splits must be an int >= 0 (0 = automatic), got {num_splits!r}")
     window_size, softcap = _check_window(window_size), _check_softcap(softcap)
     sinks = _check_sinks(sinks, q.shape[2], q.device)
+    if cache_leftpad is not None:
+        cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
     out, lse = flash_attn_legacy_cuda.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal,
-                                                   *window_size, softcap, sinks, num_splits)
+                                                   *window_size, softcap, sinks, num_splits, cache_leftpad)
     return (out, lse) if return_softmax_lse else out

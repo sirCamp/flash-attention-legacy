@@ -1169,8 +1169,9 @@ class TestKVCache:
             v[b, n:] = float("nan")
 
     @staticmethod
-    def _ref(q, k, v, seqlens, scale, causal=False, window=(-1, -1), softcap=0.0, sinks=None):
-        """Per row b: reference over the keys [0, seqlens[b]); out BSHD, lse [B, H_q, q_len]."""
+    def _ref(q, k, v, seqlens, scale, causal=False, window=(-1, -1), softcap=0.0, sinks=None, leftpad=None):
+        """Per row b: reference over the keys [leftpad[b], seqlens[b]) (causal /
+        window aligned to seqlens[b]); out BSHD, lse [B, H_q, q_len]."""
         outs, lses = [], []
         for b, n in enumerate(seqlens):
             qb = q[b:b + 1].transpose(1, 2).float()        # [1, H_q, q_len, d]
@@ -1179,6 +1180,8 @@ class TestKVCache:
             rep = qb.shape[1] // kb.shape[1]
             kb, vb = kb.repeat_interleave(rep, dim=1), vb.repeat_interleave(rep, dim=1)
             logits = ref_logits(qb, kb, scale, causal, window, softcap)
+            if leftpad is not None:
+                logits[..., :leftpad[b]] = float("-inf")
             outs.append((ref_probs(logits, sinks) @ vb).transpose(1, 2))
             if sinks is not None:
                 logits = torch.cat([logits, sinks.float().view(1, -1, 1, 1).expand(*logits.shape[:-1], 1)], -1)
@@ -1322,12 +1325,53 @@ class TestKVCache:
         assert torch.isfinite(out).all()
         torch.testing.assert_close(out.float(), ref_out, atol=4e-2 * 1e6, rtol=4e-2)
 
+    @pytest.mark.parametrize("num_splits", [0, 1, 4])
+    @pytest.mark.parametrize("mode", ["causal", "window40", "non_causal", "sinks"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_leftpad(self, head_dim, num_splits, mode, dtype):
+        """HF left padding: keys [leftpad, seqlens), causal / window aligned to the
+        end; leftpad == seqlens leaves a row with no key (only the sink)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(4, 2, 4, 2, head_dim, 160, dtype, "bhsd_view")
+        seqlens, leftpad = [160, 100, 30, 90], [0, 37, 30, 89]
+        self._poison(k, v, seqlens)
+        for b, lp in enumerate(leftpad):  # padded slots: never read either
+            k[b, :lp] = float("nan")
+            v[b, :lp] = float("nan")
+        cs, lp_t = (torch.tensor(x, dtype=torch.int32, device="cuda") for x in (seqlens, leftpad))
+        causal, window, sinks = mode != "non_causal", (40, 0) if mode == "window40" else (-1, -1), None
+        if mode == "sinks":
+            sinks = torch.randn(4, device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, cache_leftpad=lp_t, causal=causal,
+                                               window_size=window, num_splits=num_splits, sinks=sinks,
+                                               return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, k.nan_to_num(), v.nan_to_num(), seqlens, 1.0 / math.sqrt(head_dim),
+                                     causal=causal, window=window, sinks=sinks, leftpad=leftpad)
+        self._check(out, lse, ref_out, ref_lse, dtype)
+        assert (out[2] == 0).all()
+
+    def test_leftpad_clamped_and_checked(self):
+        """leftpad outside [0, seqlens] is clamped; an int cache_seqlens with a tensor
+        leftpad works; wrong shapes or types raise."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 1, 4, 4, 64, 64, torch.float16, "bshd")
+        lp = torch.tensor([-5, 100, 10], dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            out = flash_attn_with_kvcache(q, k, v, cache_seqlens=50, cache_leftpad=lp)
+            ref_out, _ = self._ref(q, k, v, [50, 50, 50], 0.125, leftpad=[0, 50, 10])
+            torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
+            with pytest.raises(RuntimeError, match="cache_leftpad"):
+                flash_attn_with_kvcache(q, k, v, cache_leftpad=torch.zeros(4, dtype=torch.int32, device="cuda"))
+            for bad in ([0, 0, 0], torch.zeros(3, device="cuda")):
+                with pytest.raises(ValueError, match="cache_leftpad"):
+                    flash_attn_with_kvcache(q, k, v, cache_leftpad=bad)
+
     def test_rejects(self):
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(1, 1, 4, 4, 64, 32, torch.float16, "bshd")
         with torch.no_grad():
-            for kw in ({"k": k}, {"block_table": torch.zeros(1, 1, dtype=torch.int32, device="cuda")},
-                       {"cache_leftpad": torch.zeros(1, dtype=torch.int32, device="cuda")}):
+            for kw in ({"k": k}, {"block_table": torch.zeros(1, 1, dtype=torch.int32, device="cuda")}):
                 with pytest.raises(NotImplementedError):
                     flash_attn_with_kvcache(q, k, v, **kw)
             with pytest.raises(NotImplementedError):  # 16 query rows per KV head: not yet

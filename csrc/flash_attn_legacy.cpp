@@ -614,10 +614,18 @@ std::vector<torch::Tensor> flash_attn_backward_varlen(
 // H_q, d], caches [B, max_len, H_kv, d] with any 16-byte aligned strides (no
 // copy: HF's [B, H_kv, N, d] cache passes as a transposed view), cache_seqlens
 // [B] int32 = end of the valid keys of each row (clamped to [0, max_len] in the
-// kernel: never read past the cache). fp16 or bf16, read natively.
+// kernel: never read past the cache), cache_leftpad [B] int32 = first valid key
+// (left padding; clamped to [0, seqlen]). fp16 or bf16, read natively.
 // Returns out like q (BSHD) and lse [B, H_q, q_len] (natural log; -inf for rows
 // with no visible key nor sink).
 // ---------------------------------------------------------------------------
+// int32 [B] on q's device (cache_seqlens, cache_leftpad), made contiguous.
+static torch::Tensor check_batch_int32(const torch::Tensor& t, const torch::Tensor& q, int B, const char* name) {
+    TORCH_CHECK(t.is_cuda() && t.device() == q.device() && t.dtype() == torch::kInt32 && t.dim() == 1 &&
+                t.size(0) == B, name, " must be int32 [B] on q's device");
+    return t.contiguous();
+}
+
 static void check_decode_layout(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.stride(-1) == 1, name, ": the last dimension must be contiguous");
     for (int i = 0; i < t.dim() - 1; i++) {
@@ -630,7 +638,7 @@ static void check_decode_layout(const torch::Tensor& t, const char* name) {
 std::vector<torch::Tensor> flash_attn_with_kvcache(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor cache_seqlens,
     float softmax_scale, bool is_causal, int64_t window_left, int64_t window_right, double softcap,
-    c10::optional<torch::Tensor> sinks, int64_t num_splits
+    c10::optional<torch::Tensor> sinks, int64_t num_splits, c10::optional<torch::Tensor> cache_leftpad
 ) {
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "q must be [B, q_len, H_q, d], k_cache / v_cache [B, max_len, H_kv, d]");
@@ -649,13 +657,14 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
     TORCH_CHECK_NOT_IMPLEMENTED(H_q / H_kv * q_len <= flash_attn_decode_max_rows(),
                 "flash_attn_with_kvcache: (num_heads_q / num_heads_kv) * q_len = ", H_q / H_kv * q_len,
                 " query rows per KV head; at most ", flash_attn_decode_max_rows(), " for now");
-    TORCH_CHECK(cache_seqlens.is_cuda() && cache_seqlens.device() == q.device() &&
-                cache_seqlens.dtype() == torch::kInt32 && cache_seqlens.dim() == 1 && cache_seqlens.size(0) == B,
-                "cache_seqlens must be int32 [B] on q's device");
     q = contiguous_aligned(q);
     check_decode_layout(k_cache, "k_cache");
     check_decode_layout(v_cache, "v_cache");
-    cache_seqlens = cache_seqlens.contiguous();
+    cache_seqlens = check_batch_int32(cache_seqlens, q, B, "cache_seqlens");
+    torch::Tensor leftpad;
+    if (cache_leftpad.has_value() && cache_leftpad->defined()) {
+        leftpad = check_batch_int32(*cache_leftpad, q, B, "cache_leftpad");
+    }
     const torch::Tensor sink = sink_logits(sinks, q, H_q);
 
     torch::Tensor out = torch::empty_like(q);
@@ -670,6 +679,7 @@ std::vector<torch::Tensor> flash_attn_with_kvcache(
     p.q = q.data_ptr(); p.k = k_cache.data_ptr(); p.v = v_cache.data_ptr(); p.out = out.data_ptr();
     p.lse = lse.data_ptr<float>();
     p.cache_seqlens = cache_seqlens.data_ptr<int>();
+    p.cache_leftpad = leftpad.defined() ? leftpad.data_ptr<int>() : nullptr;
     p.sinks = data_or_null(sink);
     p.q_batch_stride = q.stride(0); p.q_seq_stride = q.stride(1); p.q_head_stride = q.stride(2);
     p.k_batch_stride = k_cache.stride(0); p.k_seq_stride = k_cache.stride(1); p.k_head_stride = k_cache.stride(2);
@@ -728,7 +738,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_seqlens"),
           py::arg("softmax_scale"), py::arg("is_causal") = false,
           py::arg("window_left") = -1, py::arg("window_right") = -1, py::arg("softcap") = 0.0,
-          py::arg("sinks") = py::none(), py::arg("num_splits") = 0);
+          py::arg("sinks") = py::none(), py::arg("num_splits") = 0, py::arg("cache_leftpad") = py::none());
     m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,
           "Automatic key splits of flash_attn_with_kvcache for (B * H_kv, SMs, max_len)",
           py::arg("blocks"), py::arg("sms"), py::arg("max_len"));

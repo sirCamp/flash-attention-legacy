@@ -130,6 +130,7 @@ struct DecodeParams {
     void* __restrict__ out;
     float* __restrict__ lse;
     const int* __restrict__ cache_seqlens;  // [B]: end of the valid keys
+    const int* __restrict__ cache_leftpad;  // [B]: first valid key (left padding), or nullptr
     const float* __restrict__ sinks;        // [H_q] or nullptr
     index_t q_batch_stride, q_seq_stride, q_head_stride;
     index_t k_batch_stride, k_seq_stride, k_head_stride;

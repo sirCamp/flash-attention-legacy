@@ -145,9 +145,11 @@ decode_kernel(DecodeParams p) {
 
     const typename Elem::T* K = static_cast<const typename Elem::T*>(p.k) + b * p.k_batch_stride + hk * p.k_head_stride;
     const typename Elem::T* V = static_cast<const typename Elem::T*>(p.v) + b * p.v_batch_stride + hk * p.v_head_stride;
-    // The rows see keys [first_key(0), last_key(q_len - 1)]; this split takes
+    // The rows see keys [first_key(0), last_key(q_len - 1)] (causal / window
+    // aligned to the end, seqlen), none before the left padding; this split takes
     // `chunk` of them (a multiple of the block's NG keys per step)
-    const int key_first = w.first_key(0), key_last = w.last_key(p.q_len - 1);
+    const int leftpad = p.cache_leftpad ? min(max(p.cache_leftpad[b], 0), seqlen) : 0;
+    const int key_first = max(w.first_key(0), leftpad), key_last = w.last_key(p.q_len - 1);
     const int range = max(key_last - key_first + 1, 0);
     const int chunk = (cdiv(range, p.num_splits) + NG - 1) / NG * NG;
     const int key_begin = key_first + split * chunk;

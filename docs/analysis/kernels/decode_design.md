@@ -30,6 +30,8 @@ flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None, ro
 - cache_seqlens: int or [B] int32, the END index of the valid keys (default max_len); cache_leftpad [B] int32 the first one.
   Valid keys of row b: [leftpad_b, seqlens_b). Query i (of q_len) sees key j iff leftpad <= j <= seqlens - q_len + i (causal;
   bottom-right) and, with a window, j >= seqlens - q_len + i - left. q_len == 1 makes causal irrelevant.
+- A future cache_batch_idx keeps indexing cache_seqlens / cache_leftpad by the batch row b (as upstream), not by the
+  cache index. Rotary (later) follows upstream: cos / sin rows by absolute cache slot.
 - Rows with no visible key: O = 0, lse = -inf (this repo's convention; upstream FA2 may return +inf there: documented).
 - dtypes: q / cache fp16 or bf16 (fp32 optional), read natively and computed in fp32 (bf16 -> fp32 is a shift): no Python
   conversion, no range check, no copy of the cache on the decode path. Inference only: raises if grad is required.
