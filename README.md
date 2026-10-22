@@ -111,7 +111,8 @@ The integration decides **per attention call** whether our kernel can run, and n
 | BF16 / FP32 inference | kernel (FP16 compute, range-checked) |
 | Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
 | Decode (`q_len == 1`), padding with holes inside a row, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast | SDPA fallback |
-| Logit softcapping (Gemma 2), attention sinks (gpt-oss) | FP32 eager fallback |
+| Logit softcapping (Gemma 2) | kernel (`softcap`; decode steps on the FP32 eager fallback) |
+| Attention sinks (gpt-oss) | FP32 eager fallback |
 
 Check what happened in your run:
 
@@ -422,7 +423,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 
 1. **Head dimensions**: d = 32, 64, 72, 80, 96, 128, 256; other sizes run on the SDPA fallback
 2. **FP16 compute**: BF16/FP32 for inference only (see above); no native BF16
-3. **Kernel features**: causal (bottom-right aligned) or no mask, sliding window (`window_size=(left, right)`, as upstream flash-attn), packed segments. No softcap, sinks or dropout in the kernel yet: those layers run on the fallbacks
+3. **Kernel features**: causal (bottom-right aligned) or no mask, sliding window (`window_size=(left, right)`, as upstream flash-attn), logit softcapping (`softcap`), packed segments. No sinks or dropout in the kernel yet: those layers run on the fallbacks
 4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
 5. **Non-deterministic dQ**: the backward accumulates dQ with FP32 `atomicAdd`
 6. Known integration corner cases:
@@ -442,7 +443,8 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] FlashAttention-2 style kernels (warp bands, register accumulators): at or above PyTorch SDPA memory-efficient speed (`docs/bench/`)
 - [x] head_dim 72 / 80
 - [x] Sliding window in the kernel (forward and backward, out-of-window blocks skipped)
-- [ ] Softcap and attention sinks in the kernel; decode kernel (see `docs/PLAN.md`)
+- [x] Logit softcapping in the kernel (forward and backward)
+- [ ] Attention sinks in the kernel; decode kernel (see `docs/PLAN.md`)
 
 ## References
 

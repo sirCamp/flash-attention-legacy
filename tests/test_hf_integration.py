@@ -732,13 +732,15 @@ def test_tagged_mask_longer_than_keys_raises():
 
 
 # ---------------------------------------------------------------------------
-# P0.3 — softcap / sinks / position_bias: eager fallback that applies them
-# (temporary until the kernel supports them, docs/PLAN.md §3b)
+# P0.3 / P4.2 — softcap on the kernel; sinks / position_bias: eager fallback
+# that applies them (temporary until the kernel supports them, docs/PLAN.md §3b)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("arch,reason", [("gemma2", "softcap"), ("gpt_oss", "s_aux")])
+@pytest.mark.parametrize("arch", ["gemma2", "gpt_oss"])
 @pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
-def test_eager_feature_models_vs_gold(monkeypatch, arch, reason, n_tokens):
+def test_feature_models_vs_gold(monkeypatch, arch, n_tokens):
+    """Gemma 2 (softcap, P4.2): every layer on the kernel, sliding layers with
+    their window. gpt-oss (sinks): eager fallback. Both within the FP16 noise."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
     gold = logits(load_impl(base, "eager", torch.float32), ids)
@@ -750,11 +752,18 @@ def test_eager_feature_models_vs_gold(monkeypatch, arch, reason, n_tokens):
             for layer in plain.model.layers:
                 layer.self_attn.sinks.fill_(-1e4)  # sinks with no mass
     _, cos_plain, _ = compare(logits(load_impl(plain, "eager", torch.float32), ids), gold)
-    assert 1.0 - cos_plain > 1e-3, f"{reason} does not change the gold logits"
+    assert 1.0 - cos_plain > 1e-3, f"{arch}: the feature does not change the gold logits"
     noise = logits(load_impl(base, "eager"), ids)
     counter = KernelCounter(monkeypatch)
     out = logits(load_impl(base, "flash_attn_legacy"), ids)
-    assert counter.calls == [] and fallback_stats() == {reason: base.config.num_hidden_layers}
+    n_layers = base.config.num_hidden_layers
+    if arch == "gemma2":
+        W = base.config.sliding_window
+        assert len(counter.calls) == n_layers and fallback_stats() == {}
+        assert [w for w in counter.windows if w != (-1, -1)] == \
+            [(W - 1, W - 1)] * layer_types(base.config).count("sliding_attention")
+    else:
+        assert counter.calls == [] and fallback_stats() == {"s_aux": n_layers}
     assert_close_to_gold(out, gold, noise, f"{arch} N={n_tokens}")
 
 
@@ -832,10 +841,12 @@ def test_eager_attention_gqa_does_not_copy_kv_per_query_head():
     assert peak < kv_fp32_bytes * rep / 2, f"peak {peak} B suggests K/V copied per query head"
 
 
-@pytest.mark.parametrize("kwarg,reason", [("softcap", "softcap"), ("s_aux", "s_aux"),
+@pytest.mark.parametrize("kwarg,reason", [("softcap", None), ("s_aux", "s_aux"),
                                           ("position_bias", "position_bias")])
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
-def test_eager_kwargs_routed_and_applied(kwarg, reason, q_len):
+def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
+    """softcap: kernel on prefill, eager (not SDPA, which would ignore it) on
+    decode; sinks / position_bias: eager. Softcap 2.0 with scale 0.5 saturates."""
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=q_len, kv_len=16)
     value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda"),
@@ -846,7 +857,9 @@ def test_eager_kwargs_routed_and_applied(kwarg, reason, q_len):
                      softcap=value if kwarg == "softcap" else None,
                      sinks=value if kwarg == "s_aux" else None,
                      bias=value if kwarg == "position_bias" else None)
-    assert fallback_stats() == {reason: 1}
+    if reason is None:  # softcap: the kernel on prefill, decode falls back
+        reason = "decode" if q_len == 1 else None
+    assert fallback_stats() == ({reason: 1} if reason else {})
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
 
 
@@ -886,10 +899,11 @@ def test_cu_seq_lens_direct(monkeypatch, causal, kv_heads, head_dim, path):
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
 
 
-def test_cu_seq_lens_with_softcap_uses_segment_mask_in_eager():
+def test_cu_seq_lens_with_softcap_on_varlen_kernel(monkeypatch):
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=_CU[-1], kv_len=_CU[-1])
     cu = torch.tensor(_CU, dtype=torch.int32, device="cuda")
+    counter = KernelCounter(monkeypatch)
     out, _ = integrations.flash_attn_legacy_forward(
         _Attn(is_causal=True), q, k, v, None, scaling=0.5, softcap=2.0,
         cu_seq_lens_q=cu, cu_seq_lens_k=cu)
@@ -897,7 +911,7 @@ def test_cu_seq_lens_with_softcap_uses_segment_mask_in_eager():
     for a, b in zip(_CU[:-1], _CU[1:]):
         outs.append(_reference(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], 0.5,
                                integrations._causal_mask(b - a, b - a, "cuda"), softcap=2.0))
-    assert fallback_stats() == {"softcap": 1}
+    assert counter.varlen_calls == [(_CU[-1], len(_CU) - 1)] and fallback_stats() == {}
     torch.testing.assert_close(out.transpose(1, 2).float(), torch.cat(outs, dim=2), atol=2e-3, rtol=2e-3)
 
 

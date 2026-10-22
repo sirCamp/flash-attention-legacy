@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 
 class FallbackReason(NamedTuple):
     message: str
-    # "sdpa": torch SDPA; "eager": _eager_attention (applies softcap / sinks /
-    # position_bias, which SDPA would ignore); "raise": NotImplementedError
+    # "sdpa": torch SDPA (eager instead when the call has a softcap, which SDPA
+    # would ignore); "eager": _eager_attention (applies sinks / position_bias /
+    # softcap); "raise": NotImplementedError
     action: str = "sdpa"
     expected: bool = False   # expected by design: counted but not logged
     hint: str = ""           # what to use instead (for action="raise")
@@ -55,7 +56,6 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
         "raise", hint="segments must be the same for queries and keys, in a batch of 1, "
                       "strictly increasing from 0 to the sequence length"),
     # -- SDPA would ignore them: eager fallback (temporary, docs/PLAN.md §3b) --
-    "softcap": FallbackReason("attention logit softcapping (e.g. Gemma 2)", "eager"),
     "s_aux": FallbackReason("attention sinks s_aux (e.g. gpt-oss)", "eager"),
     "position_bias": FallbackReason("additive position_bias", "eager"),
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
@@ -135,9 +135,6 @@ def reset_fallback_stats() -> None:
 def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, kwargs):
     """Decide per call (on the real tensors and kwargs, never on the model
     config) whether the kernel can run. Returns (reason, detail) or (None, "")."""
-    softcap = kwargs.get("softcap")
-    if softcap is not None and float(softcap) != 0.0:  # None or 0.0: no softcapping
-        return "softcap", f" (softcap={softcap})"
     if kwargs.get("s_aux") is not None:
         return "s_aux", ""
     if kwargs.get("position_bias") is not None:
@@ -443,7 +440,8 @@ def flash_attn_legacy_forward(
     1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
     Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
     and the call runs on PyTorch SDPA, on _eager_attention (features SDPA would
-    ignore: softcap, sinks, position_bias) or raises NotImplementedError.
+    ignore: sinks, position_bias, and softcap, which the kernel applies) or
+    raises NotImplementedError.
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
@@ -514,6 +512,7 @@ def flash_attn_legacy_forward(
         # unpadding shifts bidirectional rows against their keys
         reason, detail = "attention_mask", " (padding with a non-causal sliding window)"
     window_size = (-1, -1) if window is None else (window - 1, window - 1)
+    softcap = float(kwargs.get("softcap") or 0.0)  # None or 0: no softcapping (Gemma 2: c > 0)
     unpad = None
     if reason is None and padding_2d:  # the plan's host sync only when the kernel can run
         unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
@@ -536,19 +535,19 @@ def flash_attn_legacy_forward(
                     return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[3]).index_select(0, idx)
                 out = flash_attn_varlen_func(rows(query, q_idx), rows(key, k_idx), rows(value, k_idx),
                                              cu_q, cu_k, max_q, max_k, softmax_scale=scaling,
-                                             causal=is_causal, window_size=window_size,
+                                             causal=is_causal, window_size=window_size, softcap=softcap,
                                              validate=False)  # built by _unpad_plan
                 attn_output = (query.new_zeros(B * q_len, H_q, out.shape[-1]).index_copy(0, q_idx, out)
                                .view(B, q_len, H_q, -1).transpose(1, 2))
             elif segments is None:
                 attn_output = flash_attention(query, key, value, softmax_scale=scaling,
-                                              causal=is_causal, window_size=window_size)
+                                              causal=is_causal, window_size=window_size, softcap=softcap)
             else:
                 cu_seqlens, max_len = segments
                 packed = [t[0].transpose(0, 1) for t in (query, key, value)]  # [N, H, d]
                 attn_output = flash_attn_varlen_func(
                     *packed, cu_seqlens, cu_seqlens, max_len, max_len,
-                    softmax_scale=scaling, causal=is_causal, window_size=window_size,
+                    softmax_scale=scaling, causal=is_causal, window_size=window_size, softcap=softcap,
                     validate=False,  # validated / built by _packed_segments
                 ).transpose(0, 1).unsqueeze(0)  # -> [1, H, N, d]
         except FP16RangeError:
@@ -559,9 +558,11 @@ def flash_attn_legacy_forward(
 
     if attn_output is None:
         action = _record_fallback(reason, detail)  # raises if no correct fallback exists
+        if action == "sdpa" and softcap:
+            action = "eager"  # SDPA would ignore the softcap
         if reason == "non_fp16_training" and not module.training:
             _warn_once("grad_in_eval", "flash_attn_legacy: %s inference with gradients enabled "
-                       "runs on SDPA; wrap it in torch.inference_mode() to use the kernel",
+                       "runs on a fallback; wrap it in torch.inference_mode() to use the kernel",
                        query.dtype)
 
         # One mask for both fallbacks: boolean (True = keep) or additive float,
@@ -605,7 +606,7 @@ def flash_attn_legacy_forward(
                 mask = _causal_mask(q_len, kv_len, query.device)
             attn_output = _eager_attention(
                 query, key, value, mask, scaling, dropout_p,
-                softcap=kwargs.get("softcap"), sinks=kwargs.get("s_aux"),
+                softcap=softcap, sinks=kwargs.get("s_aux"),
                 position_bias=kwargs.get("position_bias"))
         else:
             # GQA via repeat_interleave, not enable_gqa: on sm_6x/7x there is no
