@@ -113,6 +113,7 @@ The integration decides **per attention call** whether our kernel can run, and n
 | Decode (`q_len == 1`), padding with holes inside a row, unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast | SDPA fallback |
 | Logit softcapping (Gemma 2) | kernel (`softcap`; decode steps on the FP32 eager fallback) |
 | Attention sinks (gpt-oss `s_aux`) | kernel (`sinks`, trainable; decode steps on the FP32 eager fallback) |
+| Additive position bias (T5 family: T5, mT5, LongT5, UDOP, Switch Transformers, ...) | SDPA fallback (the bias in SDPA's mask, as HF's SDPA) |
 
 Check what happened in your run:
 

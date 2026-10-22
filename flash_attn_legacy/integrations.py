@@ -41,9 +41,9 @@ logger = logging.getLogger(__name__)
 
 class FallbackReason(NamedTuple):
     message: str
-    # "sdpa": torch SDPA (eager instead when the call has a softcap or sinks,
-    # which SDPA would ignore); "eager": _eager_attention (applies sinks /
-    # position_bias / softcap); "raise": NotImplementedError
+    # "sdpa": torch SDPA, with position_bias added to its mask; a call with a
+    # softcap or sinks (which SDPA would ignore) goes to _eager_attention
+    # instead, which applies them and position_bias. "raise": NotImplementedError
     action: str = "sdpa"
     expected: bool = False   # expected by design: counted but not logged
     hint: str = ""           # what to use instead (for action="raise")
@@ -55,9 +55,8 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
         "inconsistent cu_seq_lens (q/k differ, batch > 1, or not 0 < ... < q_len == kv_len)",
         "raise", hint="segments must be the same for queries and keys, in a batch of 1, "
                       "strictly increasing from 0 to the sequence length"),
-    # -- SDPA would ignore it: eager fallback (temporary, docs/PLAN.md §3b) ---
-    "position_bias": FallbackReason("additive position_bias", "eager"),
     # -- correct on SDPA, the kernel does not handle them (yet) ---------------
+    "position_bias": FallbackReason("additive position_bias (T5 family)"),
     "decode": FallbackReason("q_len == 1 (decode)", expected=True),
     "attention_mask": FallbackReason(
         "explicit attention mask (padding inside a sequence, bidirectional sliding window, "
@@ -436,9 +435,9 @@ def flash_attn_legacy_forward(
     (no mask other than padding, packing or a static cache's valid prefix,
     1 < q_len <= kv_len, supported head_dim, no unsupported kwargs).
     Otherwise the reason is recorded in FALLBACK_REASONS (see fallback_stats())
-    and the call runs on PyTorch SDPA, on _eager_attention (features SDPA would
-    ignore: position_bias, and softcap / sinks, which the kernel applies) or
-    raises NotImplementedError.
+    and the call runs on PyTorch SDPA (position_bias added to its mask), on
+    _eager_attention (softcap / sinks, which SDPA would ignore, e.g. on decode
+    steps) or raises NotImplementedError.
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
@@ -614,6 +613,11 @@ def flash_attn_legacy_forward(
                 rep = H_q // key.shape[1]
                 key = key.repeat_interleave(rep, dim=1)
                 value = value.repeat_interleave(rep, dim=1)
+            bias = kwargs.get("position_bias")
+            if bias is not None:
+                mask, causal_only = _add_bias_to_mask(
+                    bias, _causal_mask(q_len, kv_len, query.device) if causal_only else mask,
+                    kv_len, query.dtype)
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, attn_mask=mask, dropout_p=dropout_p,
                 is_causal=causal_only, scale=scaling)
@@ -622,6 +626,21 @@ def flash_attn_legacy_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, None
+
+
+def _add_bias_to_mask(bias, mask, kv_len, dtype):
+    """SDPA attn_mask = additive position_bias (2D-4D, broadcastable to [B, H, q, kv],
+    as T5's relative bias) + the mask (bool: True = keep, or additive), as HF's
+    SDPA does for these models. Masked slots get the lowest finite value, not
+    -inf (rows of only masked slots stay finite, as in eager). Differentiable in
+    the bias. Returns (attn_mask, is_causal=False)."""
+    lowest = torch.finfo(dtype).min
+    bias = bias[..., :kv_len].to(dtype).clamp_min(lowest)  # -inf in the bias: finite too
+    if mask is None:
+        return bias, False
+    if mask.dtype == torch.bool:
+        return torch.where(mask, bias, lowest), False
+    return (bias + mask.to(dtype)).clamp_min(lowest), False
 
 
 def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offset=0,

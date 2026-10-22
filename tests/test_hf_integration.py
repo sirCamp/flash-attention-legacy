@@ -540,21 +540,23 @@ def test_generate_matches_gold(arch, cache_implementation, mode):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
-@pytest.mark.parametrize("arch", ["mistral", "gemma3", "phi3"])
-def test_sliding_window_models_on_kernel(monkeypatch, arch, n_tokens):
-    """Every layer (sliding ones included) on the kernel, no fallback, logits
-    within the noise of FP32 eager; sliding layers get window_size=(W-1, W-1)."""
+@pytest.mark.parametrize("arch", list(TINY_MODELS))
+def test_model_matrix_on_kernel(monkeypatch, arch, n_tokens):
+    """P4.4: every model's prefill with every layer on the kernel and no
+    fallback, sliding window (Mistral, Gemma 2/3, Phi-3, gpt-oss), softcap
+    (Gemma 2) and sinks (gpt-oss) included; sliding layers get window_size=
+    (W-1, W-1); logits within the noise of FP32 eager."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
     ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
     gold = logits(load_impl(base, "eager", torch.float32), ids)
     noise = logits(load_impl(base, "eager"), ids)
     counter = KernelCounter(monkeypatch)
     out = logits(load_impl(base, "flash_attn_legacy"), ids)
-    W = base.config.sliding_window
-    n_sliding = layer_types(base.config).count("sliding_attention")
     assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
-    assert counter.windows.count((W - 1, W - 1)) == n_sliding > 0
-    assert_close_to_gold(out, gold, noise, f"{arch} sliding window, {n_tokens} tokens")
+    n_sliding = layer_types(base.config).count("sliding_attention")
+    expected = [(base.config.sliding_window - 1,) * 2] * n_sliding if n_sliding else []  # Llama: none
+    assert [w for w in counter.windows if w != (-1, -1)] == expected
+    assert_close_to_gold(out, gold, noise, f"{arch}, {n_tokens} tokens")
 
 
 def test_sliding_window_mutation():
@@ -732,19 +734,18 @@ def test_tagged_mask_longer_than_keys_raises():
 
 
 # ---------------------------------------------------------------------------
-# P0.3 / P4.2 / P4.3 — softcap and sinks on the kernel; position_bias: eager
-# fallback that applies it (temporary until the kernel supports it, docs/PLAN.md §3b)
+# P0.3 / P4.2 / P4.3 / P4.4 — softcap and sinks on the kernel; position_bias
+# (T5 family) on SDPA, added to its mask
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("arch", ["gemma2", "gpt_oss"])
-@pytest.mark.parametrize("n_tokens", [24, 300])  # both beyond the sliding window (8)
-def test_feature_models_vs_gold(monkeypatch, arch, n_tokens):
-    """Gemma 2 (softcap, P4.2) and gpt-oss (sinks, P4.3): every layer on the
-    kernel, sliding layers with their window, within the FP16 noise."""
+def test_model_features_matter(arch):
+    """Guard for test_model_matrix_on_kernel: softcap (Gemma 2) and sinks
+    (gpt-oss) change the gold logits of these models, or matching them proves
+    nothing about the feature."""
     base = TINY_MODELS[arch](initializer_range=_INIT[arch])
-    ids = torch.randint(0, base.config.vocab_size, (1, n_tokens))
+    ids = torch.randint(0, base.config.vocab_size, (1, 24))
     gold = logits(load_impl(base, "eager", torch.float32), ids)
-    # Guard: the feature must matter on this model, or the test proves nothing.
     without = {"gemma2": dict(attn_logit_softcapping=None), "gpt_oss": {}}[arch]
     plain = TINY_MODELS[arch](initializer_range=_INIT[arch], **without)
     if arch == "gpt_oss":
@@ -753,14 +754,6 @@ def test_feature_models_vs_gold(monkeypatch, arch, n_tokens):
                 layer.self_attn.sinks.fill_(-1e4)  # sinks with no mass
     _, cos_plain, _ = compare(logits(load_impl(plain, "eager", torch.float32), ids), gold)
     assert 1.0 - cos_plain > 1e-3, f"{arch}: the feature does not change the gold logits"
-    noise = logits(load_impl(base, "eager"), ids)
-    counter = KernelCounter(monkeypatch)
-    out = logits(load_impl(base, "flash_attn_legacy"), ids)
-    W = base.config.sliding_window
-    assert len(counter.calls) == base.config.num_hidden_layers and fallback_stats() == {}
-    assert [w for w in counter.windows if w != (-1, -1)] == \
-        [(W - 1, W - 1)] * layer_types(base.config).count("sliding_attention")
-    assert_close_to_gold(out, gold, noise, f"{arch} N={n_tokens}")
 
 
 def test_gpt_oss_training_sink_gradients(monkeypatch):
@@ -866,7 +859,7 @@ def test_eager_attention_gqa_does_not_copy_kv_per_query_head():
 @pytest.mark.parametrize("q_len", [16, 1], ids=["prefill", "decode"])
 def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
     """softcap / sinks: kernel on prefill, eager (not SDPA, which would ignore
-    them) on decode; position_bias: eager. Softcap 2.0 with scale 0.5 saturates."""
+    them) on decode; position_bias: SDPA. Softcap 2.0 with scale 0.5 saturates."""
     torch.manual_seed(0)
     q, k, v = _qkv(q_len=q_len, kv_len=16)
     value = {"softcap": 2.0, "s_aux": torch.randn(4, device="cuda"),
@@ -881,6 +874,112 @@ def test_feature_kwargs_routed_and_applied(kwarg, reason, q_len):
         reason = "decode" if q_len == 1 else None
     assert fallback_stats() == ({reason: 1} if reason else {})
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+
+
+def _no_eager(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("position_bias must run on SDPA, not on the eager fallback")
+    monkeypatch.setattr(integrations, "_eager_attention", fail)
+
+
+@pytest.mark.parametrize("bias_kind", ["4d", "3d_longer", "minus_inf"])
+@pytest.mark.parametrize("mask_kind", ["causal", "padding", "bool4d", "additive4d", "none"])
+def test_position_bias_on_sdpa(monkeypatch, mask_kind, bias_kind):
+    """position_bias added to SDPA's mask with every mask form the integration
+    passes on (causal flag, 2D padding, 4D bool / additive at the fp16 minimum,
+    none) and bias forms (4D, 3D wider than the keys, -inf entries); output and
+    the gradients of q / k / v / bias vs the fp32 formula, on the rows that see
+    a key (left-padded rows: don't care, as in HF)."""
+    torch.manual_seed(0)
+    B, n = 2, 24
+    q, k, v = (torch.randn(B, 4, n, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+               for _ in range(3))
+    bias = torch.randn(1, 4, n, n + (3 if bias_kind == "3d_longer" else 0), device="cuda")
+    if bias_kind == "minus_inf":
+        bias[..., 3] = float("-inf")  # a key no row may see, in every row
+    bias = (bias[0] if bias_kind == "3d_longer" else bias).half().requires_grad_(True)
+    causal = integrations._causal_mask(n, n, "cuda")
+    pad = torch.ones(B, n, dtype=torch.bool, device="cuda")
+    pad[1, :5] = False
+    lowest = torch.finfo(torch.float16).min
+    mask, ref_mask, is_causal = {
+        "causal": (None, causal, True),
+        "padding": (pad, pad[:, None, None, :] & causal, True),
+        "bool4d": (causal[None, None], causal, False),
+        "additive4d": (torch.where(causal, 0.0, lowest).half()[None, None], causal, False),
+        "none": (None, None, False),
+    }[mask_kind]
+    _no_eager(monkeypatch)
+    out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=is_causal), q, k, v, mask,
+                                                    scaling=0.125, position_bias=bias)
+    assert fallback_stats() == {"position_bias": 1}
+    assert torch.isfinite(out).all()
+    seen = (pad if mask_kind == "padding" else torch.ones_like(pad))[:, :, None, None]  # [B, n, 1, 1]
+    go = torch.randn_like(out) * seen  # left-padded rows carry no gradient
+    out.backward(go)
+    got = [t.grad for t in (q, k, v, bias)]
+    for t in (q, k, v, bias):
+        t.grad = None
+    if ref_mask is not None:  # rows with no key attend everything, as the fallback (no NaN)
+        ref_mask = ref_mask | ~ref_mask.any(-1, keepdim=True)
+    ref = _reference(q, k, v, 0.125, ref_mask, bias=bias.float()[..., :n]).transpose(1, 2)
+    ref.backward(go.float())
+    torch.testing.assert_close(torch.where(seen, out.float(), 0.0), torch.where(seen, ref.detach(), 0.0),
+                               atol=2e-3, rtol=2e-3)
+    for g, t in zip(got, (q, k, v, bias)):
+        torch.testing.assert_close(g.float(), t.grad.float(), atol=1e-2, rtol=1e-2)
+
+
+def _tiny_t5():
+    from transformers import T5Config, T5ForConditionalGeneration
+
+    torch.manual_seed(0)
+    cfg = T5Config(vocab_size=256, d_model=256, d_kv=64, num_heads=4, num_layers=2, d_ff=512,
+                   initializer_factor=0.5, decoder_start_token_id=0, pad_token_id=0)
+    src = torch.randint(1, 256, (2, 30), device="cuda")
+    src_mask = torch.ones_like(src)
+    src_mask[1, 20:] = 0  # padded encoder row
+    return T5ForConditionalGeneration(cfg).eval(), src, src_mask
+
+
+def test_t5_runs_on_sdpa_with_position_bias(monkeypatch):
+    """T5 (relative position bias in every layer: encoder, decoder, cross):
+    SDPA, never eager; logits within the noise of FP32 eager."""
+    base, src, src_mask = _tiny_t5()
+    cfg = base.config
+    tgt = torch.randint(0, 256, (2, 12), device="cuda")
+
+    def run(impl, dtype=torch.float16):
+        with torch.no_grad():
+            return load_impl(base, impl, dtype)(input_ids=src, attention_mask=src_mask,
+                                                decoder_input_ids=tgt).logits.float()
+
+    gold, noise = run("eager", torch.float32), run("eager")
+    _no_eager(monkeypatch)
+    out = run("flash_attn_legacy")
+    assert fallback_stats() == {"position_bias": 3 * cfg.num_layers}  # self, decoder self, cross
+    assert_close_to_gold(out.flatten(0, 1), gold.flatten(0, 1), noise.flatten(0, 1), "t5")
+
+
+@pytest.mark.parametrize("cache_implementation", ["dynamic", "static"])
+def test_t5_generate_with_position_bias(monkeypatch, cache_implementation):
+    """T5 generate: decode steps (q_len 1, the bias's last row) and a static cache
+    (keys trimmed to the valid prefix, the bias sliced to them) on SDPA; every
+    step's logits within the noise of FP32 eager."""
+    base, src, src_mask = _tiny_t5()
+    kw = dict(attention_mask=src_mask, max_new_tokens=8, min_new_tokens=8, do_sample=False,
+              return_dict_in_generate=True, output_logits=True,
+              cache_implementation=cache_implementation, disable_compile=True)
+
+    def gen(impl, dtype=torch.float16):
+        return torch.stack(load_impl(base, impl, dtype).generate(src, **kw).logits).float()
+
+    gold, noise = gen("eager", torch.float32), gen("eager")
+    _no_eager(monkeypatch)
+    out = gen("flash_attn_legacy")
+    assert set(fallback_stats()) == {"position_bias"}
+    assert_close_to_gold(out.flatten(0, 1), gold.flatten(0, 1), noise.flatten(0, 1),
+                         f"t5 generate ({cache_implementation})")
 
 
 # ---------------------------------------------------------------------------
