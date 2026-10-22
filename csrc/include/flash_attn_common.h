@@ -317,10 +317,11 @@ struct BwdTileWmma {
 
 // mma.sync backward (Turing, docs/analysis/kernels/bwd_design.md): K, V [Bc,kLdH],
 // Q, dO [Br,kLdH] (half, rows padded by 8: conflict-free ldmatrix), L, D [Br]
-// (float), dS^T [Bc,kLdS] (half, key-major, for dQ = dS K). P^T and dS^T of a
-// warp's band stay in registers; no per-warp buffers. kNumWarps = (Bc / 16) *
-// kSplitD: warp w owns the 16 keys of band w / kSplitD and d / kSplitD columns
-// of dK / dV.
+// (float), dS^T [Bc,kLdS] (half, key-major, for dQ = dS K), with kSplitD > 1
+// also P^T [Bc,kLdS] (the warps of a band share P^T / dS^T of their query
+// slices); no per-warp buffers. kNumWarps = (Bc / 16) * kSplitD: warp w owns the
+// 16 keys of band w / kSplitD, queries [Br / kSplitD * (w % kSplitD), +Br /
+// kSplitD) of S^T / dP^T and d / kSplitD columns of dK / dV.
 template <int Br_, int Bc_, int d_, int kSplitD_ = 1>
 struct BwdTileMma {
     static constexpr int Br = Br_;
@@ -331,9 +332,10 @@ struct BwdTileMma {
     static constexpr int kLdH = d_ + 8;
     static constexpr int kLdS = Br_ + 8;
     static constexpr int smem_bytes() {
-        return (2 * Bc + 2 * Br) * kLdH * 2 + 2 * Br * 4 + Bc * kLdS * 2;
+        return (2 * Bc + 2 * Br) * kLdH * 2 + 2 * Br * 4 + (kSplitD_ > 1 ? 2 : 1) * Bc * kLdS * 2;
     }
     static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % (16 * kSplitD_) == 0, "invalid mma backward tile");
+    static_assert(kSplitD_ == 1 || Bc_ / 16 < 16, "one named barrier per band (ids 1..15)");
 };
 
 // CUDA-core backward (Pascal): K, V [Bc,kLdH], Q, dO [Br,kLdH] (half, rows padded

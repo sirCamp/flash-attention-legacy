@@ -600,19 +600,27 @@ struct BwdWmma {
 // ============================================================================
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 
+// Barrier of the `threads` threads of one band (id 1 + band; 0 is __syncthreads).
+__device__ __forceinline__ void bwd_band_barrier(int band, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(1 + band), "r"(threads) : "memory");
+}
+
 // ---------------------------------------------------------------------------
 // Same block geometry as BwdWmma (key blocks of Bc, loop over the Q heads of the
 // KV head and the query blocks of Br; warp w owns the 16 keys of band w / kSplitD
 // and the DP = d / kSplitD columns of slice w % kSplitD of dK / dV), with m16n8k8
 // MMAs whose register layout is known (flash_attn_mma.h). Per query block each
-// warp computes, in registers,
-//   S^T = K_band Q^T, dP^T = V_band dO^T  ([16 keys, Br]: Br / 8 accumulators each)
+// warp computes, for the 16 keys of its band and its QW = Br / kSplitD queries
+// (no work repeated across the warps of a band),
+//   S^T = K_band Q^T, dP^T = V_band dO^T  (QW / 8 accumulators each)
 //   P^T = exp2(x(S^T) - L), dS^T = P^T (dP^T - D) dx/dS  (ScoreMap; masked to 0)
-//   dV += P^T dO, dK += dS^T Q  (P^T / dS^T are the A operands as they are)
-// and the slice-0 warp of each band writes dS^T to shared memory; after one block
-// barrier the warps compute dQ = dS K for the query block in 16 x 16 output tiles
-// and add it to the fp32 dQ buffer with atomics straight from the accumulators.
-// Two block barriers per query block.
+// then dV += P^T dO and dK += dS^T Q over its columns and all Br queries: with
+// kSplitD == 1 P^T / dS^T are the A operands as they are; with kSplitD > 1 the
+// warps of a band exchange them through key-major shared memory (named barrier
+// per band). dS^T stays in shared memory; after one block barrier the warps
+// compute dQ = dS K for the query block in 16 x 16 output tiles and add it to
+// the fp32 dQ buffer with atomics straight from the accumulators. Two block
+// barriers per query block (+1 band barrier with kSplitD > 1).
 // ---------------------------------------------------------------------------
 struct BwdMma {
 template <typename Tile>
@@ -625,9 +633,13 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     constexpr int SPLIT = Tile::kSplitD;
     constexpr int LDH = Tile::kLdH;
     constexpr int LDS = Tile::kLdS;
-    constexpr int QN = Br / 8;     // query n-tiles of S^T / dP^T (k-steps of dV / dK)
+    constexpr int QN = Br / 8;     // query n-tiles of the block (k-steps of dV / dK)
+    constexpr int QW = Br / SPLIT; // queries of this warp's S^T / dP^T
+    constexpr int QWN = QW / 8;    // ... as n-tiles
     constexpr int DP = D / SPLIT;  // dK / dV columns of a warp
     constexpr int DN = DP / 8;     // dK / dV n-tiles of a warp
+    static_assert(Br % SPLIT == 0 && QW % 8 == 0 && (QWN % 2 == 0 || QWN == 1), "query slice of a warp");
+    static_assert(QWN % 2 == 0 || D % 32 == 0, "single n-tile slices need D % 32 == 0");
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -636,6 +648,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     const int lr = lane & 7, lm = lane >> 3;  // ldmatrix: row within matrix lm
     const int band = warp_id / SPLIT;
     const int part = warp_id % SPLIT;
+    const int qw0 = part * QW;  // first query of this warp's S^T / dP^T
 
     const int kv_start = a.kv_start;
     const int valid_kv = min(Bc, a.seq_len_k - kv_start);
@@ -650,6 +663,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     float* smem_L  = reinterpret_cast<float*>(smem_dO + Br * LDH);  // L * log2(e)
     float* smem_D  = smem_L + Br;
     half*  smem_dSt = reinterpret_cast<half*>(smem_D + Br);           // dS^T [Bc, LDS]
+    half*  smem_Pt  = smem_dSt + Bc * LDS;                            // P^T [Bc, LDS] (kSplitD > 1)
 
     float dK[DN][4], dV[DN][4];
     #pragma unroll
@@ -682,45 +696,69 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             }
             __syncthreads();
 
-            // S^T and dP^T for the band: [16 keys, Br queries], n-tile j = queries 8j..8j+7
-            float S[QN][4], dP[QN][4];
+            // S^T and dP^T for the band and this warp's queries: n-tile j = queries
+            // qw0 + 8j..+7. B = Q^T / dO^T from query rows (ldmatrix, no trans).
+            float S[QWN][4], dP[QWN][4];
             #pragma unroll
-            for (int j = 0; j < QN; j++) {
+            for (int j = 0; j < QWN; j++) {
                 #pragma unroll
                 for (int e = 0; e < 4; e++) { S[j][e] = 0.0f; dP[j][e] = 0.0f; }
             }
-            #pragma unroll
-            for (int k = 0; k < D; k += 16) {
-                uint32_t ka[4], va[4];  // {rows 0-7, 8-15} x {k, k + 8}
-                ldmatrix_x4(ka, K_rows + k);
-                ldmatrix_x4(va, V_rows + k);
+            if constexpr (QWN % 2 == 0) {
                 #pragma unroll
-                for (int j = 0; j < QN; j += 2) {
-                    // B = Q^T / dO^T from query rows: matrices (j, k), (j, k + 8), (j + 1, k), (j + 1, k + 8)
-                    const int row = (j + (lm >> 1)) * 8 + lr, col = k + (lm & 1) * 8;
+                for (int k = 0; k < D; k += 16) {
+                    uint32_t ka[4], va[4];  // {rows 0-7, 8-15} x {k, k + 8}
+                    ldmatrix_x4(ka, K_rows + k);
+                    ldmatrix_x4(va, V_rows + k);
+                    #pragma unroll
+                    for (int j = 0; j < QWN; j += 2) {
+                        // matrices (j, k), (j, k + 8), (j + 1, k), (j + 1, k + 8)
+                        const int row = qw0 + (j + (lm >> 1)) * 8 + lr, col = k + (lm & 1) * 8;
+                        uint32_t qb[4], ob[4];
+                        ldmatrix_x4(qb, smem_Q + row * LDH + col);
+                        ldmatrix_x4(ob, smem_dO + row * LDH + col);
+                        mma_m16n8k8(S[j], ka[0], ka[1], qb[0]);
+                        mma_m16n8k8(S[j], ka[2], ka[3], qb[1]);
+                        mma_m16n8k8(S[j + 1], ka[0], ka[1], qb[2]);
+                        mma_m16n8k8(S[j + 1], ka[2], ka[3], qb[3]);
+                        mma_m16n8k8(dP[j], va[0], va[1], ob[0]);
+                        mma_m16n8k8(dP[j], va[2], va[3], ob[1]);
+                        mma_m16n8k8(dP[j + 1], va[0], va[1], ob[2]);
+                        mma_m16n8k8(dP[j + 1], va[2], va[3], ob[3]);
+                    }
+                }
+            } else {  // one n-tile: B matrices (k, k + 8, k + 16, k + 24) of the 8 queries
+                #pragma unroll
+                for (int k = 0; k < D; k += 32) {
+                    uint32_t ka[4], kb2[4], va[4], vb2[4];
+                    ldmatrix_x4(ka, K_rows + k);
+                    ldmatrix_x4(kb2, K_rows + k + 16);
+                    ldmatrix_x4(va, V_rows + k);
+                    ldmatrix_x4(vb2, V_rows + k + 16);
+                    const int row = qw0 + lr, col = k + lm * 8;
                     uint32_t qb[4], ob[4];
                     ldmatrix_x4(qb, smem_Q + row * LDH + col);
                     ldmatrix_x4(ob, smem_dO + row * LDH + col);
-                    mma_m16n8k8(S[j], ka[0], ka[1], qb[0]);
-                    mma_m16n8k8(S[j], ka[2], ka[3], qb[1]);
-                    mma_m16n8k8(S[j + 1], ka[0], ka[1], qb[2]);
-                    mma_m16n8k8(S[j + 1], ka[2], ka[3], qb[3]);
-                    mma_m16n8k8(dP[j], va[0], va[1], ob[0]);
-                    mma_m16n8k8(dP[j], va[2], va[3], ob[1]);
-                    mma_m16n8k8(dP[j + 1], va[0], va[1], ob[2]);
-                    mma_m16n8k8(dP[j + 1], va[2], va[3], ob[3]);
+                    mma_m16n8k8(S[0], ka[0], ka[1], qb[0]);
+                    mma_m16n8k8(S[0], ka[2], ka[3], qb[1]);
+                    mma_m16n8k8(S[0], kb2[0], kb2[1], qb[2]);
+                    mma_m16n8k8(S[0], kb2[2], kb2[3], qb[3]);
+                    mma_m16n8k8(dP[0], va[0], va[1], ob[0]);
+                    mma_m16n8k8(dP[0], va[2], va[3], ob[1]);
+                    mma_m16n8k8(dP[0], vb2[0], vb2[1], ob[2]);
+                    mma_m16n8k8(dP[0], vb2[2], vb2[3], ob[3]);
                 }
             }
 
             // P^T (in S) and dS^T (in dP), element-wise: e = 0, 1 key g, e = 2, 3 key g + 8;
-            // query 8j + 2t + (e & 1)
+            // query qw0 + 8j + 2t + (e & 1)
             score_map.dispatch([&](auto softcap) {
                 #pragma unroll
-                for (int j = 0; j < QN; j++) {
+                for (int j = 0; j < QWN; j++) {
                     #pragma unroll
                     for (int e = 0; e < 4; e++) {
                         const int key = kv_start + band * 16 + g + (e >> 1) * 8;
-                        const int q = j * 8 + 2 * t + (e & 1);  // row within the query block
+                        const int q = qw0 + j * 8 + 2 * t + (e & 1);  // row within the query block
                         // selects, not a branch (as BwdWmma)
                         const bool masked = q >= valid_q || w.masked(q_start + q, key);
                         float dx_ds;
@@ -732,15 +770,38 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                 }
             });
 
-            // dV += P^T dO and dK += dS^T Q over this warp's columns: A from the
-            // accumulators (k-step j = queries 8j..8j+7), B = dO / Q [query, column]
-            // with ldmatrix.trans: matrices (j, c), (j, c + 8), (j + 1, c), (j + 1, c + 8)
+            // dS^T (and P^T with kSplitD > 1) to shared memory, key-major: half2 of
+            // queries 2t, 2t + 1 of each n-tile
+            #pragma unroll
+            for (int j = 0; j < QWN; j++) {
+                const int qcol = qw0 + j * 8 + 2 * t;
+                const int r0 = (band * 16 + g) * LDS + qcol, r1 = r0 + 8 * LDS;
+                *reinterpret_cast<uint32_t*>(smem_dSt + r0) = pack_half2(dP[j][0], dP[j][1]);
+                *reinterpret_cast<uint32_t*>(smem_dSt + r1) = pack_half2(dP[j][2], dP[j][3]);
+                if constexpr (SPLIT > 1) {
+                    *reinterpret_cast<uint32_t*>(smem_Pt + r0) = pack_half2(S[j][0], S[j][1]);
+                    *reinterpret_cast<uint32_t*>(smem_Pt + r1) = pack_half2(S[j][2], S[j][3]);
+                }
+            }
+            if constexpr (SPLIT > 1) bwd_band_barrier(band, SPLIT * 32);  // the band's P^T / dS^T complete
+
+            // dV += P^T dO and dK += dS^T Q over this warp's columns and all queries:
+            // k-step j = queries 8j..8j+7; B = dO / Q [query, column] with
+            // ldmatrix.trans: matrices (j, c), (j, c + 8), (j + 1, c), (j + 1, c + 8)
             #pragma unroll
             for (int j = 0; j < QN; j += 2) {
-                const uint32_t p0a = pack_half2(S[j][0], S[j][1]), p0b = pack_half2(S[j][2], S[j][3]);
-                const uint32_t p1a = pack_half2(S[j + 1][0], S[j + 1][1]), p1b = pack_half2(S[j + 1][2], S[j + 1][3]);
-                const uint32_t s0a = pack_half2(dP[j][0], dP[j][1]), s0b = pack_half2(dP[j][2], dP[j][3]);
-                const uint32_t s1a = pack_half2(dP[j + 1][0], dP[j + 1][1]), s1b = pack_half2(dP[j + 1][2], dP[j + 1][3]);
+                uint32_t pa[4], sa[4];  // A of k-steps j ({0, 1}) and j + 1 ({2, 3})
+                if constexpr (SPLIT > 1) {
+                    // key-major rows of the band: matrices (keys 0-7, j), (8-15, j), (0-7, j + 1), (8-15, j + 1)
+                    const int off = (band * 16 + (lm & 1) * 8 + lr) * LDS + (j + (lm >> 1)) * 8;
+                    ldmatrix_x4(pa, smem_Pt + off);
+                    ldmatrix_x4(sa, smem_dSt + off);
+                } else {
+                    pa[0] = pack_half2(S[j][0], S[j][1]);         pa[1] = pack_half2(S[j][2], S[j][3]);
+                    pa[2] = pack_half2(S[j + 1][0], S[j + 1][1]); pa[3] = pack_half2(S[j + 1][2], S[j + 1][3]);
+                    sa[0] = pack_half2(dP[j][0], dP[j][1]);         sa[1] = pack_half2(dP[j][2], dP[j][3]);
+                    sa[2] = pack_half2(dP[j + 1][0], dP[j + 1][1]); sa[3] = pack_half2(dP[j + 1][2], dP[j + 1][3]);
+                }
                 const int row = (j + (lm >> 1)) * 8 + lr;
                 #pragma unroll
                 for (int n = 0; n < DN; n += 2) {
@@ -748,27 +809,17 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                     uint32_t ob[4], qb[4];
                     ldmatrix_x4_trans(ob, smem_dO + row * LDH + col);
                     ldmatrix_x4_trans(qb, smem_Q + row * LDH + col);
-                    mma_m16n8k8(dV[n], p0a, p0b, ob[0]);
-                    mma_m16n8k8(dV[n + 1], p0a, p0b, ob[1]);
-                    mma_m16n8k8(dV[n], p1a, p1b, ob[2]);
-                    mma_m16n8k8(dV[n + 1], p1a, p1b, ob[3]);
-                    mma_m16n8k8(dK[n], s0a, s0b, qb[0]);
-                    mma_m16n8k8(dK[n + 1], s0a, s0b, qb[1]);
-                    mma_m16n8k8(dK[n], s1a, s1b, qb[2]);
-                    mma_m16n8k8(dK[n + 1], s1a, s1b, qb[3]);
-                }
-                // dS^T to shared memory, key-major (one warp per band): half2 of queries 2t, 2t + 1
-                if (part == 0) {
-                    #pragma unroll
-                    for (int h = 0; h < 2; h++) {
-                        const int qcol = (j + h) * 8 + 2 * t;
-                        const uint32_t lo = h ? s1a : s0a, hi = h ? s1b : s0b;
-                        *reinterpret_cast<uint32_t*>(smem_dSt + (band * 16 + g) * LDS + qcol) = lo;
-                        *reinterpret_cast<uint32_t*>(smem_dSt + (band * 16 + g + 8) * LDS + qcol) = hi;
-                    }
+                    mma_m16n8k8(dV[n], pa[0], pa[1], ob[0]);
+                    mma_m16n8k8(dV[n + 1], pa[0], pa[1], ob[1]);
+                    mma_m16n8k8(dV[n], pa[2], pa[3], ob[2]);
+                    mma_m16n8k8(dV[n + 1], pa[2], pa[3], ob[3]);
+                    mma_m16n8k8(dK[n], sa[0], sa[1], qb[0]);
+                    mma_m16n8k8(dK[n + 1], sa[0], sa[1], qb[1]);
+                    mma_m16n8k8(dK[n], sa[2], sa[3], qb[2]);
+                    mma_m16n8k8(dK[n + 1], sa[2], sa[3], qb[3]);
                 }
             }
-            __syncthreads();  // dS^T complete
+            __syncthreads();  // dS^T complete; P^T reads done
 
             // dQ[Br, D] += dS K: units of 16 queries x 16 columns over the warps.
             // A = dS [query, key] from the key-major dS^T (ldmatrix.trans: matrices
@@ -800,7 +851,7 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
                 }
             }
             // No barrier here: the next query block first writes Q, dO, L, D (not
-            // read by the dQ step) and writes dS^T only after its first barrier.
+            // read by the dQ step) and writes dS^T / P^T only after its first barrier.
         }
     }
 
@@ -894,19 +945,22 @@ static void dispatch_bwd_wmma_tile(int head_dim, F&& f) {
     if (!ok) throw_no_tile("WMMA backward", head_dim, limit);
 }
 
+// mma tiles, measured on T4 (backward kernel, causal B=2 H=16 N=4096): d=32
+// 7.3 ms (kSplitD 2: 9.9); d=64 14.6 (kSplitD 1: 16.8); d=128 26.9, d=256 136
+// (before S^T / dP^T were split by queries across a band's warps: 32.3, 168).
+// Only tiles that fit 64 KB (the sm >= 7.5 we test).
 template <typename F>
 static void dispatch_bwd_mma_tile(int head_dim, F&& f) {
     const int limit = max_dynamic_smem_per_block();
     bool ok = false;
     switch (head_dim) {
         case 32:  ok = with_first_fitting_tile<BwdTileMma<64, 64, 32>>(limit, f); break;
-        case 64:  ok = with_first_fitting_tile<BwdTileMma<64, 64, 64>>(limit, f); break;
+        case 64:  ok = with_first_fitting_tile<BwdTileMma<64, 64, 64, 2>>(limit, f); break;
         case 72:
         case 80:  ok = with_first_fitting_tile<BwdTileMma<32, 64, 80>>(limit, f); break;  // 72 zero-padded
-        // one tile each: they fit the 64 KB of every sm >= 7.5
         case 96:  ok = with_first_fitting_tile<BwdTileMma<32, 64, 96, 2>>(limit, f); break;
         case 128: ok = with_first_fitting_tile<BwdTileMma<32, 64, 128, 2>>(limit, f); break;
-        case 256: ok = with_first_fitting_tile<BwdTileMma<32, 32, 256, 4>, BwdTileMma<32, 16, 256, 4>>(limit, f); break;
+        case 256: ok = with_first_fitting_tile<BwdTileMma<32, 16, 256, 4>>(limit, f); break;
         default:  throw std::runtime_error("Unsupported head_dim for the backward");
     }
     if (!ok) throw_no_tile("mma backward", head_dim, limit);

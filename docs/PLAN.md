@@ -178,7 +178,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | ID | Intervento | Dim | Criterio di accettazione |
 |---|---|---|---|
 | P7.1 | **Fatto**: `precompute_D` coalescente (8 lane per riga): V100 0.76 → 0.09 ms, T4 2.62 → 0.28 | S | — |
-| P7.2 | **In corso**: backward Turing con `mma.sync` m16n8k8 e `ldmatrix` (`BwdMma`, progetto e misure in `docs/analysis/kernels/bwd_design.md`): P^T e dS^T restano nei registri come operandi A, niente buffer per warp, d=128 a 8 warp sulla T4. Backward T4 d=128 53.7 → 32.3 ms, d=64 18.2 → 16.6, d=256 invariato (S^T ricalcolato da ogni warp della banda: prossimo passo). Famiglia scelta dall'arch del codice che gira (`compiled_arch_for`); sm_8x usa `BwdMma` tramite il PTX 7.5 (non testato). | L | fwd+bwd T4 entro ~1× SDPA mem-efficient |
+| P7.2 | **In corso**: backward Turing con `mma.sync` m16n8k8 e `ldmatrix` (`BwdMma`, progetto e misure in `docs/analysis/kernels/bwd_design.md`): P^T e dS^T restano nei registri come operandi A, niente buffer per warp, d=128 a 8 warp sulla T4. Backward T4 d=128 53.7 → 32.3 ms, d=64 18.2 → 16.6; poi S^T / dP^T divisi per query tra i warp di una banda (P^T / dS^T scambiati in shared memory con una barriera di banda): d=128 26.9, d=256 168 → 136, d=64 14.6 (kSplitD 2). fwd+bwd T4 N=4096 contro SDPA mem-efficient: d=64 0.86×, d=128 0.83×, d=256 0.91×. Famiglia scelta dall'arch del codice che gira (`compiled_arch_for`); sm_8x usa `BwdMma` tramite il PTX 7.5 (non testato). | L | fwd+bwd T4 entro ~1× SDPA mem-efficient |
 | P7.3 | Forward Turing sugli stessi primitivi (P2.8 passo 3) | M | — |
 | P7.4 | V100: `mma.m8n8k4` oppure WMMA migliorato, da decidere dopo la T4 | M | fwd+bwd V100 entro ~1× SDPA |
 
@@ -212,6 +212,7 @@ Soluzioni provvisorie introdotte durante P0, ciascuna con la voce che la sostitu
 | ~~Encoder di visione con head_dim 72/80 (Qwen2-VL, SigLIP) → fallback a segmenti~~ **risolto da P2.7 e P3.3** | P0.4 | P2.7 nuovi head_dim | Encoder di visione di Qwen2-VL e SigLIP sul kernel varlen |
 | ~~Padding (maschera 2D con zeri o maschera 4D) → fallback SDPA~~ **risolto da P3.1** (resta il fallback per buchi dentro una riga) | prima di P0 | P3.1 padding nativo | Batch con padding sul kernel in tutti gli strati |
 | ~~Sliding window → fallback SDPA~~ **risolto da P4.1** | prima di P0 | P4.1 window nel kernel | Gemma 3, Mistral v0.1 e Phi-3 senza motivo `attention_mask` dovuto alla window |
+| Ciclo sui blocchi di query del backward duplicato tra `BwdWmma` e `BwdMma` (caricamenti di Q/dO/L/D, maschera e ScoreMap per elemento, passo dQ), e `band_barrier` ripetuta nel forward Pascal e nel backward Turing | P7.2 | Un ciclo condiviso come `fwd_band_loop` (corpo per famiglia), una sola barriera di banda in `flash_attn_common.h` | Una sola copia del ciclo e della barriera; test verdi su tutte le GPU |
 | ~~Guardia sulla T4 (tile che non entrano → fallback)~~ **risolto da P2.2/P2.3**: tile scelti a runtime con `with_first_fitting_tile`, nessun motivo di fallback per la shared memory | P0.6 | P2.2/P2.3 tile a runtime | Nessun fallback per shared memory su T4 |
 
 ## 4. Strategia di test
