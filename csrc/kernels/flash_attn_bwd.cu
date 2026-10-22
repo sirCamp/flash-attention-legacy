@@ -383,16 +383,19 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
 // the Q heads of its KV head (GQA) and the query blocks of Br rows that can see
 // its keys. Warp w owns the 16 keys of band w / kSplitD and the d / kSplitD
 // columns of slice w % kSplitD of dK / dV, accumulated in WMMA fragments. Per
-// query block, each warp on its own computes, as transposed [16 keys, Br]
-// fragments,
-//   S^T = K_band Q^T,  P^T = exp(x(S^T) - L)  (ScoreMap; masked to 0)
-//   dV += P^T dO,  dP^T = V_band dO^T,  dS^T = P^T (dP^T - D) * dx/dS,  dK += dS^T Q
+// query block each warp computes, as transposed [16 keys, 16 queries]
+// fragments for its query tiles (with kSplitD > 1 the warps of a band split the
+// query tiles when they divide evenly, so no S^T is computed twice),
+//   S^T = K_band Q^T,  dP^T = V_band dO^T
+//   P^T = exp(x(S^T) - L),  dS^T = P^T (dP^T - D) * dx/dS  (ScoreMap; masked to 0)
 // with the element-wise steps done on the fragments themselves (the row and
-// column of each element come from wmma_acc_layout). P^T / dS^T reach the
-// next WMMA as half through the warp's buffer, and dS^T also goes to a shared
-// [Bc, Br] buffer: after one block barrier all warps compute dQ = dS K for the
-// query block and add it to the fp32 dQ buffer with coalesced atomics (one per
-// element and key block). Two block barriers per query block.
+// column of each element come from wmma_acc_layout). P^T goes as half to the
+// band's buffer (each warp's own when the queries are not split) and dS^T to
+// the shared [Bc, Br] dS^T; after a band barrier each
+// warp adds dV += P^T dO and dK += dS^T Q over all queries and its columns.
+// After one block barrier all warps compute dQ = dS K for the query block and
+// add it to the fp32 dQ buffer with coalesced atomics (one per element and key
+// block). Two block barriers per query block (+1 band barrier with kSplitD > 1).
 // ---------------------------------------------------------------------------
 struct BwdWmma {
 template <typename Tile>
@@ -406,7 +409,11 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     constexpr int LDH = Tile::kLdH;
     constexpr int LDB = Tile::kLdB;
     constexpr int T = 16;
-    constexpr int QT = Br / T;            // query tiles of a band's S^T / dP^T
+    constexpr int QT = Br / T;            // query tiles of the block
+    // With kSplitD > 1 the warps of a band split the query tiles of S^T / dP^T
+    // when they divide evenly (else, d=256, each computes all of them)
+    constexpr int QSPLIT = (SPLIT > 1 && QT % SPLIT == 0) ? SPLIT : 1;
+    constexpr int QTW = QT / QSPLIT;      // query tiles of this warp's S^T / dP^T
     constexpr int DP = D / SPLIT;         // dK / dV columns of a warp
     constexpr int DPT = DP / T;           // dK / dV fragments of a warp
     constexpr int NE = kAccElems;
@@ -437,6 +444,10 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     half*  smem_dSt = reinterpret_cast<half*>(smem_D + Br);           // dS^T [Bc, LDB]
     half*  wbuf = smem_dSt + Bc * LDB + warp_id * (16 * LDB);         // this warp's [16, LDB]
     float* wstage = reinterpret_cast<float*>(wbuf);                   // same bytes, as 16x16 float
+    // P^T [16 keys, Br] of the band: the first warp's buffer when the band splits
+    // the queries, else each warp's own
+    half*  pbuf = QSPLIT > 1 ? smem_dSt + Bc * LDB + (warp_id - part) * (16 * LDB) : wbuf;
+    const int qt0 = (QSPLIT > 1 ? part : 0) * QTW;  // first query tile of this warp
 
     int e_row[NE], e_col[NE];  // position of each accumulator element in its 16x16 tile
     wmma_acc_layout(wstage, lane, e_row, e_col);
@@ -455,10 +466,10 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
     const half* V_band = smem_V + band * T * LDH;
 
     bwd_q_loop<Br, Bc, D, NUM_THREADS, LDH>(a, smem_Q, smem_dO, smem_L, smem_D, [&](int qh, int q_start, int valid_q) {
-        // S^T and dP^T for the band: [16 keys, Br queries] as QT fragments
-        Acc S[QT], dP[QT];
+        // S^T and dP^T for the band and this warp's query tiles qt0..qt0+QTW-1
+        Acc S[QTW], dP[QTW];
         #pragma unroll
-        for (int qt = 0; qt < QT; qt++) {
+        for (int qt = 0; qt < QTW; qt++) {
             wmma::fill_fragment(S[qt], 0.0f);
             wmma::fill_fragment(dP[qt], 0.0f);
         }
@@ -468,64 +479,48 @@ static __device__ __forceinline__ void run(const BwdBlockArgs& a) {
             wmma::load_matrix_sync(ka, K_band + k, LDH);
             wmma::load_matrix_sync(va, V_band + k, LDH);
             #pragma unroll
-            for (int qt = 0; qt < QT; qt++) {
+            for (int qt = 0; qt < QTW; qt++) {
                 FragBt qb, ob;  // Q^T, dO^T: [k, queries] = rows of Q / dO read column-major
-                wmma::load_matrix_sync(qb, smem_Q + qt * T * LDH + k, LDH);
-                wmma::load_matrix_sync(ob, smem_dO + qt * T * LDH + k, LDH);
+                wmma::load_matrix_sync(qb, smem_Q + (qt0 + qt) * T * LDH + k, LDH);
+                wmma::load_matrix_sync(ob, smem_dO + (qt0 + qt) * T * LDH + k, LDH);
                 wmma::mma_sync(S[qt], ka, qb, S[qt]);
                 wmma::mma_sync(dP[qt], va, ob, dP[qt]);
             }
         }
 
-        // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as
-        // half into the warp buffer for dV += P^T dO
+        // P^T (in S) and dS^T (in dP), element-wise on the fragments; P^T as half
+        // into the band's P^T buffer, dS^T into the shared dS^T (once per band
+        // when the warps of a band do not split the queries)
         score_map.dispatch([&](auto softcap) {
             #pragma unroll
-            for (int qt = 0; qt < QT; qt++) {
+            for (int qt = 0; qt < QTW; qt++) {
                 #pragma unroll
                 for (int i = 0; i < NE; i++) {
                     const int key = kv_start + band * T + e_row[i];
-                    const int q = qt * T + e_col[i];  // row within the query block
+                    const int q = (qt0 + qt) * T + e_col[i];  // row within the query block
                     const bool masked = q >= valid_q || w.masked(q_start + q, key);
                     bwd_p_ds<decltype(softcap)::value>(score_map, masked, smem_L[q], smem_D[q], S[qt].x[i], dP[qt].x[i]);
-                    wbuf[e_row[i] * LDB + q] = __float2half(S[qt].x[i]);
+                    pbuf[e_row[i] * LDB + q] = __float2half(S[qt].x[i]);
+                    if (QSPLIT > 1 || part == 0) smem_dSt[(band * T + e_row[i]) * LDB + q] = __float2half(dP[qt].x[i]);
                 }
             }
         });
-        __syncwarp();
-        #pragma unroll
-        for (int k = 0; k < Br; k += T) {
-            FragA pa;
-            wmma::load_matrix_sync(pa, wbuf + k, LDB);
-            #pragma unroll
-            for (int t = 0; t < DPT; t++) {
-                FragB ob;
-                wmma::load_matrix_sync(ob, smem_dO + k * LDH + part * DP + t * T, LDH);
-                wmma::mma_sync(dV[t], pa, ob, dV[t]);
-            }
-        }
-        __syncwarp();  // P^T reads done before dS^T overwrites the buffer
+        if constexpr (SPLIT > 1) band_barrier(band, SPLIT * 32);  // the band's P^T / dS^T complete
+        else __syncwarp();
 
-        // dS^T: into the warp buffer (dK += dS^T Q) and, once per band, into the
-        // shared dS^T for dQ
-        #pragma unroll
-        for (int qt = 0; qt < QT; qt++) {
-            #pragma unroll
-            for (int i = 0; i < NE; i++) {
-                const half ds = __float2half(dP[qt].x[i]);
-                wbuf[e_row[i] * LDB + qt * T + e_col[i]] = ds;
-                if (part == 0) smem_dSt[(band * T + e_row[i]) * LDB + qt * T + e_col[i]] = ds;
-            }
-        }
-        __syncwarp();
+        // dV += P^T dO, dK += dS^T Q over all queries and this warp's columns
+        const half* dSt_band = smem_dSt + band * T * LDB;
         #pragma unroll
         for (int k = 0; k < Br; k += T) {
-            FragA dsa;
-            wmma::load_matrix_sync(dsa, wbuf + k, LDB);
+            FragA pa, dsa;
+            wmma::load_matrix_sync(pa, pbuf + k, LDB);
+            wmma::load_matrix_sync(dsa, dSt_band + k, LDB);
             #pragma unroll
             for (int t = 0; t < DPT; t++) {
-                FragB qb;
+                FragB ob, qb;
+                wmma::load_matrix_sync(ob, smem_dO + k * LDH + part * DP + t * T, LDH);
                 wmma::load_matrix_sync(qb, smem_Q + k * LDH + part * DP + t * T, LDH);
+                wmma::mma_sync(dV[t], pa, ob, dV[t]);
                 wmma::mma_sync(dK[t], dsa, qb, dK[t]);
             }
         }

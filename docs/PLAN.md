@@ -180,7 +180,7 @@ Obiettivo: **nessun output sbagliato** su nessuna architettura. Si correggono so
 | P7.1 | **Fatto**: `precompute_D` coalescente (8 lane per riga): V100 0.76 → 0.09 ms, T4 2.62 → 0.28 | S | — |
 | P7.2 | **In corso**: backward Turing con `mma.sync` m16n8k8 e `ldmatrix` (`BwdMma`, progetto e misure in `docs/analysis/kernels/bwd_design.md`): P^T e dS^T restano nei registri come operandi A, niente buffer per warp, d=128 a 8 warp sulla T4. Backward T4 d=128 53.7 → 32.3 ms, d=64 18.2 → 16.6; poi S^T / dP^T divisi per query tra i warp di una banda (P^T / dS^T scambiati in shared memory con una barriera di banda): d=128 26.9, d=256 168 → 136, d=64 14.6 (kSplitD 2). fwd+bwd T4 N=4096 contro SDPA mem-efficient: d=64 0.86×, d=128 0.83×, d=256 0.91×. Famiglia scelta dall'arch del codice che gira (`compiled_arch_for`); sm_8x usa `BwdMma` tramite il PTX 7.5 (non testato). | L | fwd+bwd T4 entro ~1× SDPA mem-efficient |
 | P7.3 | Forward Turing sugli stessi primitivi (P2.8 passo 3) | M | — |
-| P7.4 | V100: `mma.m8n8k4` oppure WMMA migliorato, da decidere dopo la T4 | M | fwd+bwd V100 entro ~1× SDPA |
+| P7.4 | **In corso**: V100, WMMA con lo stesso split per query di S^T / dP^T tra i warp di una banda (P^T nel buffer della banda, dS^T dal buffer condiviso, barriera di banda). Backward kernel V100 N=4096: d=96 16.6 → 12.5 ms, d=128 19.3 → 14.6, d=64 12.0 → 11.3, d=32 5.6 → 5.2, d=256 50.8 → 49.4; fwd+bwd contro SDPA mem-efficient d=128 1.30× → 1.05×, d=64 1.27×, d=256 1.02×. Resta d=64 (`<64,64,64,1>`, 4 warp e spill). Alternativa `mma.m8n8k4` se serve. | M | fwd+bwd V100 entro ~1× SDPA |
 
 ### P6 — Estensioni (da prioritizzare)
 

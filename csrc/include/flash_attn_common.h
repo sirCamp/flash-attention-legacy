@@ -295,9 +295,10 @@ inline bool with_first_fitting_tile(int smem_limit, F& f) {
 // (w / kSplitD) and the slice (w % kSplitD) of d / kSplitD columns of dK / dV,
 // accumulated in WMMA fragments (registers). Shared memory: K, V [Bc,kLdH],
 // Q, dO [Br,kLdH] (half, rows padded by 8), L, D [Br] (float), dS^T [Bc,kLdB]
-// (half, key-major, for dQ = dS K), and per warp a [16,kLdB] half buffer (P^T,
-// then dS^T, as WMMA operands; also the float staging of dQ / dK / dV tiles and
-// the one-time fragment layout probe, hence Br >= 32).
+// (half, key-major: the dK operand and dQ = dS K), and per warp a [16,kLdB]
+// half buffer: P^T of the band (the band's first warp's buffer when its warps
+// split the queries, else each warp's own), and in every warp the float staging
+// of dQ / dK / dV tiles and the one-time fragment layout probe (hence Br >= 32).
 template <int Br_, int Bc_, int d_, int kSplitD_ = 1>
 struct BwdTileWmma {
     static constexpr int Br = Br_;
@@ -313,6 +314,7 @@ struct BwdTileWmma {
     }
     static_assert(Br_ % 16 == 0 && Bc_ % 16 == 0 && d_ % (16 * kSplitD_) == 0, "invalid WMMA backward tile");
     static_assert(kWarpBufBytes >= 256 * 4 + 256, "warp buffer too small for the layout probe (Br >= 32)");
+    static_assert(kSplitD_ == 1 || Bc_ / 16 < 16, "one named barrier per band (ids 1..15)");
 };
 
 // mma.sync backward (Turing, docs/analysis/kernels/bwd_design.md): K, V [Bc,kLdH],
