@@ -1,6 +1,6 @@
 # torch.compile and CUDA graphs (P6.5)
 
-Status: design, 2026-10-22. The code becomes the reference once implemented.
+Status: done (steps a-d), 2026-10-22. The code is the reference.
 
 ## Where we start (T4, torch 2.7.1, transformers 5.20.2)
 Probe: tiny Llama, `generate(cache_implementation="static")` 32 new tokens, B=2, with and without HF's compile.
@@ -74,6 +74,24 @@ static cache's 4D decode mask on the kernel, no host sync) and the import moved 
 `cache_implementation="static"` allocates a new cache per call and recompiles on every call (guards on the cache tensors'
 identity, SDPA alike): pass a StaticCache as `past_key_values` and reuse it. Inductor needs Triton (SM >= 7.0): on Pascal
 compile with `backend="aot_eager"` or run eager.
+
+## Results (step d, real models: `benchmarks/models.py`, `docs/bench/models.md`)
+Decode tokens/s with a reused StaticCache and HF's compiled decode step (inductor), 128 new tokens:
+
+| | V100 ours | V100 SDPA | V100 eager | T4 ours | T4 SDPA | T4 eager |
+|---|---|---|---|---|---|---|
+| TinyLlama 1.1B, B=1, 2k | 165.3 | 86.8 | 139.6 | 91.2 | 60.4 | 68.5 |
+| TinyLlama 1.1B, B=8, 2k | 973.5 | 338.5 | 495.9 | 547.4 | 171.2 | OOM |
+| Qwen2.5-3B, B=8, 2k | 471.7 | 263.1 | 273.0 | 224.6 | 106.1 | 103.3 |
+| Qwen2.5-3B, B=1, 8k | 70.8 | 25.1 | 46.4 | 32.5 | OOM | OOM |
+| Gemma 2 2B, B=1, 8k | 70.5 | 27.1 | 54.3 | - | - | - |
+
+Every compiled step is one graph with no break and no fallback (dynamo counters and fallback statistics in the JSON lines).
+Compiled vs eager steps with our kernel (V100): TinyLlama B=1 2k 52.0 -> 165.3 tok/s, Gemma 2 8k 31.9 -> 70.5. On the RTX 2080 Ti (11 GB) the compiled
+steps run 1.04-1.31x where SDPA / eager fit, and at B=8 only ours fits (TinyLlama 2k 1,080 tok/s, Qwen2.5-3B 2k 477). The gain over
+SDPA / eager grows with the context and the batch: the decode kernel splits the keys of a row over blocks and reads the cache
+once per KV head (GQA rows share it), while SDPA's memory-efficient / math kernels on these GPUs and eager's two matmuls with
+the 4D mask run a single query row with little parallelism over the keys and read K / V once per query head.
 
 ## Acceptance
 - No graph break from flash_attn_legacy in a compiled decode step with a static cache (`torch._dynamo` counters), and a

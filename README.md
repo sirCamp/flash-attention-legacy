@@ -199,170 +199,65 @@ check_gpu_compatibility()
 
 ## Benchmarks
 
-> **Note**: All benchmarks below compare against **eager attention** (the naive O(N^2) implementation) to show the algorithmic difference. PyTorch's SDPA provides similar memory savings via its built-in `memory_efficient` backend — these numbers are about our kernel's characteristics, not a claim that eager is the only alternative.
+End to end on HuggingFace models (transformers 5.20.2, fp16), against PyTorch SDPA and eager attention on the same inputs:
+`python benchmarks/models.py`. Every table (prefill, generate, train, LoRA, padded batches; TinyLlama, Qwen2.5 3B / 14B, Gemma 2,
+Mistral 7B, Llama 3.1 8B, Qwen3.5 2B / 4B / 9B), with time ratios and peak memory, is in
+[`docs/bench/models.md`](docs/bench/models.md). Each cell: speedup of ours over the faster of SDPA and eager, and the peak memory
+saved against the smaller of their peaks; "only ours" = SDPA and eager run out of memory.
 
-### Prefill with TinyLlama 1.1B
-
-Extra memory above model weights during a single forward pass (prefill only, no generation).
-
-**V100 (Tesla V100-SXM2-32GB)** — WMMA tensor cores for both matmuls:
-
-| N | eager (MB) | flash (MB) | Memory saved | Speedup |
-|---|---|---|---|---|
-| 256 | 27.7 | 22.1 | 20% | 1.24x |
-| 512 | 87.6 | 45.0 | 49% | 0.86x |
-| 1024 | 304.3 | 88.5 | 71% | 0.87x |
-| 2048 | 1124.5 | 178.0 | 84% | 1.13x |
-| 4096 | 4313.0 | 354.0 | 92% | 1.12x |
-| 8192 | 16882.1 | 708.0 | **96%** | **1.15x** |
-
-On V100, flash attention is **faster than eager for N >= 2048** thanks to WMMA tensor cores for both matmuls.
-
-**P100 (Tesla P100-PCIE-16GB)** — half2 packed FP16, no tensor cores:
-
-| N | eager (MB) | flash (MB) | Memory saved | Speedup |
-|---|---|---|---|---|
-| 256 | 27.7 | 22.1 | 20% | 0.91x |
-| 512 | 87.6 | 45.0 | 49% | 0.91x |
-| 1024 | 304.3 | 88.5 | 71% | 0.90x |
-| 2048 | 1124.5 | 178.0 | 84% | 0.94x |
-| 4096 | 4313.0 | 354.0 | 92% | 0.92x |
-| 8192 | OOM | 708.0 | **eager OOM** | -- |
-
-On P100, flash is ~6-10% slower (no tensor cores) but the memory savings are identical. At N=8192, **eager OOMs on 16GB while flash fits comfortably**.
-
-Memory grows linearly (O(N)) instead of quadratically (O(N^2)) on both architectures.
-
-### V100 — Prefill with Llama 3.1 8B Instruct
-
-Same setup, larger model (head_dim=128, GQA 32Q/8KV heads, ~16GB FP16):
-
-| N | eager (MB) | flash (MB) | Memory saved | Speedup |
-|---|---|---|---|---|
-| 256 | 96.6 | 96.6 | 0% | 0.91x |
-| 512 | 194.0 | 194.0 | 0% | 0.86x |
-| 1024 | 434.5 | 386.5 | 11% | 0.86x |
-| 2048 | 1385.0 | 774.0 | 44% | 0.92x |
-| 4096 | 4834.0 | 1546.0 | **68%** | 0.87x |
-
-With head_dim=128, the attention score matrix is smaller per-element (fewer heads after GQA), so memory savings start later but are still substantial. At N=4096, flash saves **3.2 GB** of attention memory.
-
-### V100 — Kernel-level comparison
-
-Raw kernel (B=2, H=8, d=64):
-
-| N | eager (MB) | flash (MB) | Memory saved | Speedup |
-|---|---|---|---|---|
-| 128 | 3.2 | 0.3 | 91% | 1.67x |
-| 512 | 38.0 | 1.1 | 97% | 0.87x |
-| 2048 | 557.8 | 4.3 | 99% | 1.07x |
-| 4096 | 2197.8 | 8.7 | 100% | 1.26x |
-
-### Pascal (P100) — Kernel-level comparison
-
-> Measured before the FP32 dot-product change of the Pascal forward (which made the GTX 1080 Ti forward 2.3–2.9x faster); P100 numbers to be re-measured.
-
-Raw kernel on **Tesla P100-PCIE-16GB** (B=2, H=8, d=64):
-
-| N | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
-|---|---|---|---|---|---|---|
-| 128 | 0.19 | 0.27 | 0.70x | 3.2 | 0.3 | 91% |
-| 256 | 0.23 | 0.51 | 0.45x | 10.6 | 0.5 | 95% |
-| 512 | 0.57 | 1.20 | 0.48x | 38.0 | 1.1 | 97% |
-| 1024 | 1.95 | 3.35 | 0.58x | 143.7 | 2.2 | 98% |
-| 2048 | 8.08 | 10.42 | 0.78x | 557.8 | 4.3 | 99% |
-| 4096 | 28.16 | 36.03 | 0.78x | 2197.8 | 8.7 | 100% |
-
-On Pascal, the trade-off is pure compute for memory: no tensor cores means slower matmuls, but the O(N) memory footprint is the same as on Volta. The speed gap narrows at longer sequences (0.78x at N=4096 vs 0.45x at N=256).
-
-### Variable-length (packed sequences)
-
-Compares padded batching (all sequences padded to max length) vs packed batching (`flash_attn_varlen_func`, single kernel launch). H=8, d=64, FP16, causal.
-
-**V100 (Tesla V100-SXM2-32GB):**
-
-| Scenario | Seqs | Max len | Padding waste | Memory saved | Speedup |
+| | V100 32 GB | T4 16 GB | P100 16 GB | 1080 Ti 11 GB | 2080 Ti 11 GB |
 |---|---|---|---|---|---|
-| uniform_short | 16 | 64 | 0% | 0% | 0.81x |
-| uniform_medium | 8 | 256 | 0% | 0% | 0.90x |
-| mixed_short | 8 | 128 | 52% | **52%** | 0.74x |
-| mixed_heavy | 8 | 512 | 61% | **61%** | **1.88x** |
-| one_long + rest_short | 16 | 1024 | 91% | **91%** | **6.78x** |
-| all_long | 4 | 1024 | 0% | 0% | 0.97x |
+| Prefill, TinyLlama 1.1B, 4k tokens | **3.42x**, -3.9 GiB | **3.89x**, -3.9 GiB | **1.72x**, -3.9 GiB | **1.71x**, -3.9 GiB | **3.28x**, -3.9 GiB |
+| Prefill, Qwen2.5-3B, 8k tokens | **2.30x**, -7.7 GiB | only ours | only ours | only ours | only ours |
+| Decode, Qwen2.5-3B, B=8, 2k prompt | 1.17x, -3.2 GiB | **2.20x**, -3.2 GiB | **1.75x**, -3.2 GiB | only ours | only ours |
+| Decode, compiled static cache, TinyLlama, B=8, 2k | **1.96x**, -8.2 GiB | **3.20x**, -9.0 GiB | - | - | only ours |
+| Training step, TinyLlama, 1k tokens | **1.34x**, -3.0 GiB | **1.45x**, -3.0 GiB | 1.07x, -3.0 GiB | 1.01x, -3.0 GiB | **1.70x**, -3.0 GiB |
+| Training, gradient checkpointing, TinyLlama, 4k | **2.72x**, -5.9 GiB | **3.22x**, -5.9 GiB | **1.47x**, -5.9 GiB | only ours | only ours |
+| Training, checkpointing, padded batch B=4, TinyLlama, 2k | **1.38x** | **1.40x** | **1.39x** | **5.67x** | **1.33x** |
+| LoRA r=16, checkpointing, Qwen2.5-3B, 2k | **1.34x** | **1.41x** | 1.03x | 1.02x | only ours |
 
-**P100 (Tesla P100-PCIE-16GB):**
+Longest sequence that fits (ours / the better of SDPA and eager; ">=" = no longer length measured):
 
-| Scenario | Seqs | Max len | Padding waste | Memory saved | Speedup |
+| | V100 32 GB | T4 16 GB | P100 16 GB | 1080 Ti 11 GB | 2080 Ti 11 GB |
 |---|---|---|---|---|---|
-| uniform_short | 16 | 64 | 0% | 0% | 0.92x |
-| uniform_medium | 8 | 256 | 0% | 0% | 0.97x |
-| mixed_short | 8 | 128 | 52% | **52%** | **1.51x** |
-| mixed_heavy | 8 | 512 | 61% | **61%** | **2.17x** |
-| one_long + rest_short | 16 | 1024 | 91% | **91%** | **8.39x** |
-| all_long | 4 | 1024 | 0% | 0% | 0.99x |
+| Prefill, TinyLlama | >= 128k / 8k | >= 128k / 4k | >= 128k / 4k | 64k / 4k | 64k / 4k |
+| Prefill, Qwen2.5-3B | >= 128k / 8k | 32k / 4k | 64k / 4k | 32k / 4k | 16k / 4k |
+| Generate, Qwen2.5-3B, B=1 (prompt) | >= 64k / >= 8k | 32k / 2k | >= 64k / 2k | 32k / 2k | 32k / 2k |
+| Training, checkpointing, TinyLlama | 32k / 4k | 16k / 4k | 16k / 4k | 8k / 2k | 8k / 2k |
 
-When sequences have very different lengths (common in training), packing avoids wasting compute and memory on padding tokens. The `one_long_rest_short` scenario (1x1024 + 15x32) shows **6.78-8.39x speedup** and **91% memory savings** — padded would compute attention on 16x1024 = 16K tokens, packed only processes 1504 actual tokens.
+Larger models: Llama 3.1 8B on the V100 prefills at least 16k tokens (the longest measured; SDPA / eager 4k; 1.66x and -3.8 GiB at 4k), decodes 8 x 2k prompts
+compiled at 1.70x with -7.5 GiB, and LoRA-trains at 8k (others 4k; 1.48x at 4k); on the P100 (16 GB, weights 15 GiB) it prefills
+2k tokens and generates from a 2k prompt where SDPA and eager stop at 1k (prefill) / 512 (prompt). Qwen2.5-14B on the V100 prefills 8k (others 2k),
+Qwen3.5-9B at least 32k (others 8k).
 
-### V100 — Training with TinyLlama 1.1B
+The attention memory is O(N) in the sequence instead of O(N^2), so contexts up to 32x longer fit (TinyLlama prefill on the T4 /
+P100; the same length where the weights or the KV cache, not the attention, set the limit), and where all fit the kernel is
+faster or at parity: the rows below 1x in the full tables (0.93-0.99x) are the Qwen3.5 models (host bound), short prefills of
+7-8B models on the P100 (matmul bound) and decode with eager steps, within the noise of the shared cloud boxes (see
+`docs/bench/models.md`). The training loss agrees with SDPA and eager in every case where more than one fits (largest
+difference 0.0026). With gradient checkpointing on the large-vocabulary models (Qwen2.5, Llama 3.1: vocabularies of 128k-152k) the
+full-vocabulary fp32 logits of HF's loss take most of the memory, so the length gain shrinks (LoRA on the V100: Qwen2.5-3B 8k
+for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.53x V100, 2.69x T4); on TinyLlama (32k
+vocabulary) checkpointing with our kernel trains 4-8x longer sequences. On the 1080 Ti SDPA with a padding mask runs its fp16
+kernel, which sm_61 executes at 1/64 rate: hence 5.67x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
+layers in 4, here on transformers' PyTorch reference) run at parity or a little faster (compiled decode 1.02-1.31x), with the memory saving. Decode reads the cache in place with
+a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
+SM >= 7.0) run without graph breaks.
 
-End-to-end training comparison (forward + backward) on **Tesla V100-SXM2-32GB**. TinyLlama 1.1B, FP32 weights + FP16 autocast + GradScaler, B=2, 20 steps, gradient checkpointing enabled.
+Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
+results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
 
-| N | eager (ms/step) | flash (ms/step) | Speedup | eager loss | flash loss | Note |
+| | fwd d=64 | fwd d=128 | fwd d=256 | fwd+bwd d=64 | fwd+bwd d=128 | fwd+bwd d=256 |
 |---|---|---|---|---|---|---|
-| 2048 | 1369.5 | 1179.9 | **1.16x** | 9.24 | 9.31 | Flash faster thanks to WMMA backward |
-| 4096 | OOM | 2975.6 | -- | OOM | 8.24 | **Eager cannot train at this length** |
+| V100 | 0.92 | 1.12 | 0.66 | 0.95 | 1.04 | 1.01 |
+| T4 | 0.55 | 0.53 | 0.57 | 0.80 | 0.77 | 0.90 |
+| 2080 Ti | 0.68 | 0.68 | 0.61 | 0.83 | 0.77 | 0.97 |
+| P100 | 0.79 | 1.25 | 1.79 | 0.66 | 0.70 | 0.94 |
+| 1080 Ti | 0.06 | 0.08 | 0.12 | 0.08 | 0.09 | 0.10 |
 
-At N=2048, flash is **16% faster** than eager in full training (forward + backward) thanks to WMMA tensor cores in both passes. Both backends produce coherent loss curves (< 1% relative difference).
-
-At N=4096, eager runs out of memory while flash trains successfully. Note: SDPA (`attn_implementation="sdpa"`) would also handle this — these numbers demonstrate our kernel's correctness and performance characteristics vs the naive baseline.
-
-### Embeddings with Qwen3-Embedding-0.6B
-
-Sentence-transformers encoding benchmark with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B). Batch=16, 5 runs.
-
-**V100 (Tesla V100-SXM2-32GB) — FP32:**
-
-| seq_len | eager (ms) | sdpa (ms) | flash (ms) | flash vs eager | flash vs sdpa | eager (MB) | sdpa (MB) | flash (MB) |
-|---|---|---|---|---|---|---|---|---|
-| 256 | 236.6 | 236.3 | 252.5 | 0.94x | 0.94x | 306 | 298 | 281 |
-| 512 | 467.3 | 457.3 | 488.3 | 0.96x | 0.94x | 692 | 609 | 557 |
-| 1024 | 973.3 | 937.1 | 977.4 | 1.00x | 0.96x | 1698 | 1349 | 1109 |
-| 2048 | 2473.8 | 2323.4 | 2123.5 | **1.16x** | **1.09x** | 4687 | 3225 | **2215** |
-| 4096 | 6423.7 | 5800.9 | 5102.3 | **1.26x** | **1.14x** | 14554 | 8590 | **4424** |
-
-In FP32 on V100, flash is **faster than both eager and SDPA** at long sequences — 1.26x vs eager and 1.14x vs SDPA at seq_len=4096 — while using **half the memory of SDPA** (4.4 GB vs 8.6 GB). The WMMA tensor cores give a real speed advantage when FP32 accumulation dominates. With the larger Qwen3-Embedding-4B, the same pattern holds: at seq_len=4096, flash is 1.08x faster than SDPA while using **half the memory** (7.1 GB vs 14.5 GB).
-
-**V100 (Tesla V100-SXM2-32GB) — FP16:**
-
-| seq_len | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
-|---|---|---|---|---|---|---|
-| 256 | 77.6 | 98.3 | 0.79x | 298 | 280 | 6% |
-| 512 | 147.6 | 189.9 | 0.78x | 658 | 557 | 15% |
-| 1024 | 320.1 | 409.7 | 0.78x | 1571 | 1109 | 29% |
-| 2048 | 998.6 | 992.3 | **1.01x** | 4173 | 2213 | **47%** |
-| 4096 | 2677.0 | 2747.2 | 0.97x | 12502 | 4422 | **65%** |
-
-In FP16, flash matches eager speed at long sequences (1.01x at 2048) while saving up to **8 GB** of memory at seq_len=4096.
-
-**P100 (Tesla P100-PCIE-16GB) — FP16:**
-
-| seq_len | eager (ms) | flash (ms) | Speedup | eager (MB) | flash (MB) | Memory saved |
-|---|---|---|---|---|---|---|
-| 256 | 361.3 | 409.5 | 0.88x | 298 | 280 | 6% |
-| 512 | 1438.7 | 1776.7 | 0.81x | 1571 | 1109 | 29% |
-| 2048 | 3976.0 | 4446.1 | 0.89x | 4173 | 2213 | 47% |
-| 4096 | 10146.6 | 12368.8 | 0.82x | 12502 | 4422 | **65%** |
-
-On P100, flash is ~10-20% slower (no tensor cores), but saves up to **8 GB** at seq_len=4096.
-
-**P100 (Tesla P100-PCIE-16GB) — FP32 (sentence-transformers default):**
-
-| seq_len | eager | sdpa (ms) | flash (ms) | flash vs sdpa | sdpa (MB) | flash (MB) | Memory saved vs sdpa |
-|---|---|---|---|---|---|---|---|
-| 4096 | OOM | 11248.0 | 13141.3 | 0.86x | 8590 | 4424 | **49%** |
-| 8192 | OOM | OOM | 39048.9 | -- | OOM | 8845 | **only flash fits** |
-
-In FP32 (the default for sentence-transformers), flash uses **half the memory of SDPA** at seq_len=4096. At seq_len=8192, both eager and SDPA run out of memory on 16GB — flash is the only backend that fits.
+Above 1: the V100 at d=128 (forward 1.12, fwd+bwd 1.04) and d=256 fwd+bwd (1.01), and the P100 forward at d=128 / 256 (no
+tensor cores on Pascal: fp32 FMAs); the
+1080 Ti gap comes from the arithmetic: SDPA computes in fp16, which sm_61 runs at 1/64 of the fp32 rate, the kernel in fp32.
 
 ## How It Works
 
@@ -384,13 +279,11 @@ Tiles per head_dim are chosen by measurement (comments next to `TileTuring_*` / 
 
 ### Backward pass
 
-**D = rowsum(dO * O)** is precomputed in a separate kernel; each block owns Bc keys and loops over the query blocks (and the Q heads of its KV head, GQA).
+**D = rowsum(dO * O)** is precomputed in a separate kernel; each block owns Bc keys and loops over the query blocks (and the Q heads of its KV head, GQA; on small grids the heads of a KV head are split over several blocks, whose dK / dV partials are summed after the kernel).
 
 **Turing / Volta:** each warp owns a band of 16 keys and a slice of the d columns of dK / dV; the warps of a band split the queries of S^T and dP^T (no work repeated) and share P^T and dS^T through shared memory; the element-wise steps run on the accumulators; dK, dV accumulate in registers; dS^T is shared so that all warps compute dQ = dS @ K, added to an FP32 buffer with `atomicAdd` (one per element and key block). Turing uses `mma.sync` m16n8k8 + `ldmatrix` (P^T / dS^T are register operands when a band has one warp), Volta WMMA fragments.
 
 **Pascal:** the [Br, Bc] tile of S / P / dP / dS is computed cooperatively in FP32 (128-bit loads), dK, dV accumulate in registers, dQ with one `atomicAdd` per element and key block.
-
-Performance against PyTorch SDPA (memory-efficient backend) on every supported GPU: `python benchmarks/benchmark.py`, results in `docs/bench/`.
 
 ## Testing
 
@@ -440,7 +333,14 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] Sliding window in the kernel (forward and backward, out-of-window blocks skipped)
 - [x] Logit softcapping in the kernel (forward and backward)
 - [x] Attention sinks in the kernel (forward and backward, sink gradient)
-- [ ] Decode kernel (see `docs/PLAN.md`)
+- [x] Decode kernel (`flash_attn_with_kvcache`: split-KV, GQA, paged caches, key masks) and HF decode steps on it
+- [x] `torch.compile` (dispatcher ops with fake implementations; compiled HF decode steps without graph breaks)
+- [x] BF16 / FP32 inference
+- [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
+- [ ] Decode kernel beyond 8 query rows per KV head: MQA / GQA > 8:1 models and assisted / speculative decoding verification steps
+- [ ] Serving: varlen prefill straight from a paged cache, mixed prefill + decode batches (continuous batching in transformers;
+  a vLLM backend plugin only on Turing, see `docs/analysis/vllm_feasibility.md`)
+- [ ] Dropout and deterministic dQ in the kernel
 
 ## References
 
