@@ -12,7 +12,6 @@ so users can load models with:
     )
 
 Requires transformers >= 5.0 (uses ALL_ATTENTION_FUNCTIONS registry).
-For transformers < 5.0, use the monkey-patch approach in examples/hf_llama_patch.py.
 """
 
 import logging
