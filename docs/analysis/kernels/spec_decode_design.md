@@ -122,12 +122,12 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
 | T4 | 25.8 / 20.2 / 23.0 | 26.5 -> 26.1 / 21.7 / 22.4 | 32.0 -> 39.5 / 33.3 / 34.5 |
 | 1080 Ti | 13.3 / 11.5 / 14.5 | 12.6 / 8.5 / 13.2 | 16.1 / 9.5 / 15.5 |
 | 2080 Ti | 37.3 / 32.0 / 33.7 | 36.0 / 32.1 / 31.1 | 56.4 / 49.5 / 48.1 |
-| V100 | 24.2 / 26.9 / 28.9 | 24.5 / 27.7 / 28.6 | 36.9 / 43.0 / 43.3 |
+| V100 | 31.1 / 27.1 / 28.7 | - | 45.8 / 42.8 / 42.9 |
 
   Speculation now helps (or matches) with our backend everywhere but plain decoding stays ahead on the P100 here (a 3B model on
-  a 1.5k prompt; the draft / lookup acceptance decides). On the V100 even plain decoding trails: a 36-layer model at B=1 is host
-  bound there and our Python path costs ~30 us per call (`compile_design.md`): a separate item (host overhead of the HF decode
-  path), not a kernel one.
+  a 1.5k prompt; the draft / lookup acceptance decides). V100: a first run (ours 24.2 / 36.9 tok/s, behind SDPA / eager) was the
+  shared box's load (load average 16): measured again alternated, the row above (and the campaign's decode, 32.8 vs 28.6 / 29.8).
+  Host time per attention call of a decode step on the V100 (Qwen2.5-3B shapes): ours 61 us, HF's SDPA 175, eager 147.
 
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache
