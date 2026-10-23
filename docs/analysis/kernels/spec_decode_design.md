@@ -169,7 +169,12 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   decode with padding too. Possible refinement: the mask byte is read per score element and per 16-byte vector, and blocks or
   splits whose keys are all dropped still run (the decode kernel shrinks its splits to the kept keys): a per-block bitmask in
   shared memory and split bounds from the mask.
-- Still open (beyond 8 rows): BF16, paged caches (P6.9). Sinks with packed rows done: `fwd_softmax_init`
+- Paged caches beyond 8 rows done: the cache kernel's K / V row of key j comes from `paged_row_offset` (one rule with the
+  decode kernel: block_table[j / block_size], slot j % block_size); the per-row loader is taken only with a key mask or a
+  paged cache (a uniform branch per tile): on contiguous unmasked caches the one-stride loader, as fast as before (the per-row
+  function on every 16-byte vector cost up to 22% on the P100). Equal bit for bit to the same cache contiguous (NHD, HND,
+  vLLM layouts; block sizes 16 / 32 / 48 / 64).
+- Still open (beyond 8 rows): BF16. Sinks with packed rows done: `fwd_softmax_init`
   gives each row of the cache kernel its query head's sink (split 0; the plain forward keeps the head's one). `cache_leftpad` done: the cache
   kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 

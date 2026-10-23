@@ -1480,16 +1480,34 @@ class TestKVCache:
         if case != "broadcast_mask":
             assert (out[2] == 0).all() and torch.isinf(lse[2]).all()
 
+    @pytest.mark.parametrize("block_size,layout", [(16, "nhd"), (48, "nhd"), (64, "hnd"), (32, "vllm")])
+    @pytest.mark.parametrize("num_splits", [1, 5], ids=["one_split", "splits5"])
+    def test_forward_rows_paged(self, head_dim, block_size, layout, num_splits):
+        """A paged cache beyond 8 rows per KV head (shuffled blocks, block sizes a power of 2 or not,
+        NHD / HND / vLLM layouts; spare blocks NaN, never read): equal to the same cache contiguous,
+        with a key mask and sinks."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 6, 8, 2, head_dim, 192, torch.float16, "bshd", seed=7)  # 24 rows per KV head
+        seqlens = torch.tensor([192, 100, 17], dtype=torch.int32, device="cuda")
+        keep = torch.rand(3, 192, device="cuda") > 0.2
+        sinks = torch.randn(8, device="cuda")
+        kw = dict(cache_seqlens=seqlens, key_mask=keep, sinks=sinks, causal=True, num_splits=num_splits,
+                  return_softmax_lse=True)
+        kb, vb, table = self._paged(k, v, block_size, layout)
+        with torch.no_grad():
+            for cs in (seqlens, 150):  # a tensor and an int (uniform) cache_seqlens
+                kw["cache_seqlens"] = cs
+                ref_out, ref_lse = flash_attn_with_kvcache(q, k, v, **kw)
+                out, lse = flash_attn_with_kvcache(q, kb, vb, block_table=table, **kw)
+                assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)  # same math, same order
+
     def test_forward_rows_rejects(self):
-        """Beyond 8 rows per KV head: fp16 and a contiguous cache for now."""
+        """Beyond 8 rows per KV head: fp16 only for now."""
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(2, 4, 8, 2, 64, 64, torch.float16, "bshd")  # 16 rows per KV head
         with torch.no_grad():
             with pytest.raises(NotImplementedError, match="float16"):
                 flash_attn_with_kvcache(q.bfloat16(), k.bfloat16(), v.bfloat16())
-            kb, vb, table = self._paged(k, v, 16)
-            with pytest.raises(NotImplementedError, match="contiguous"):
-                flash_attn_with_kvcache(q, kb, vb, block_table=table)
 
     def test_seqlens_beyond_the_cache(self):
         """Tensor cache_seqlens are clamped to [0, max_len] on the GPU (never read

@@ -93,6 +93,10 @@ struct FlashAttnParams {
     const int* __restrict__ leftpad_k;
     const bool* __restrict__ key_mask;  // [B, N_kv] (True = attend; row b at b * mask_batch_stride), or nullptr
     index_t mask_batch_stride;
+    // Paged cache: K / V [num_blocks, block_size, H_kv, d] (block stride k / v_batch_stride), key j of row b in
+    // block block_table[b * max_blocks + j / block_size], slot j % block_size; nullptr = contiguous
+    const int* __restrict__ block_table;
+    int max_blocks, block_size, block_shift;  // block_shift: log2(block_size) for a power of 2, else -1
     int num_splits;
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
@@ -587,6 +591,16 @@ __device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, 
 template <int d>
 __host__ __device__ __forceinline__ int tile_valid_cols(int head_dim) {
     return (d == 80 || d == 96) ? head_dim : d;
+}
+
+// Offset of key j of a paged cache (table: the batch row's blocks; key j in block j / block_size, slot
+// j % block_size; block_shift = log2(block_size) for a power of 2, else -1): one rule for the decode
+// kernel and the cache forward.
+__device__ __forceinline__ index_t paged_row_offset(const int* __restrict__ table, int j, int block_size,
+                                                     int block_shift, index_t block_stride, index_t seq_stride) {
+    const int blk = block_shift >= 0 ? j >> block_shift : j / block_size;
+    const int slot = block_shift >= 0 ? j & (block_size - 1) : j % block_size;
+    return index_t(table[blk]) * block_stride + slot * seq_stride;
 }
 
 // Varlen grids: sequence of a flat block index, from the cumulative per-sequence

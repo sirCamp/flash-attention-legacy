@@ -744,9 +744,14 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     // verification, MQA): the forward kernels with key splits, on the same cache
     const int rows = H_q / H_kv * q_len;
     const bool on_forward = rows > flash_attn_decode_max_rows();
-    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || (q.dtype() == torch::kFloat16 && !paged),
+    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || q.dtype() == torch::kFloat16,
                 "flash_attn_with_kvcache with (num_heads_q / num_heads_kv) * q_len = ", rows, " > ",
-                flash_attn_decode_max_rows(), " query rows per KV head: float16 and a contiguous cache only for now");
+                flash_attn_decode_max_rows(), " query rows per KV head: float16 only for now");
+    int block_shift = -1;  // log2(block_size) for a power of 2: shifts instead of divisions
+    if (paged && (k_cache.size(1) & (k_cache.size(1) - 1)) == 0) {
+        block_shift = 0;
+        while ((int64_t(1) << block_shift) < k_cache.size(1)) block_shift++;
+    }
     q = contiguous_aligned(q);
     check_decode_layout(k_cache, "k_cache");
     check_decode_layout(v_cache, "v_cache");
@@ -793,6 +798,10 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         f.leftpad_k = leftpad.defined() ? leftpad.data_ptr<int>() : nullptr;
         f.key_mask = mask.defined() ? mask.data_ptr<bool>() : nullptr;
         f.mask_batch_stride = mask.defined() ? mask.stride(0) : 0;
+        f.block_table = paged ? table.data_ptr<int>() : nullptr;
+        f.max_blocks = paged ? table.size(1) : 0;
+        f.block_size = paged ? k_cache.size(1) : 0;
+        f.block_shift = block_shift;
         f.q_batch_stride = q.stride(0); f.q_seq_stride = q.stride(1); f.q_head_stride = q.stride(2);
         f.k_batch_stride = k_cache.stride(0); f.k_seq_stride = k_cache.stride(1); f.k_head_stride = k_cache.stride(2);
         f.v_batch_stride = v_cache.stride(0); f.v_seq_stride = v_cache.stride(1); f.v_head_stride = v_cache.stride(2);
@@ -832,11 +841,7 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     p.block_table = paged ? table.data_ptr<int>() : nullptr;
     p.max_blocks = paged ? table.size(1) : 0;
     p.block_size = paged ? k_cache.size(1) : 0;
-    p.block_shift = -1;
-    if (paged && (p.block_size & (p.block_size - 1)) == 0) {
-        p.block_shift = 0;
-        while ((1 << p.block_shift) < p.block_size) p.block_shift++;
-    }
+    p.block_shift = block_shift;
     p.sinks = data_or_null(sink);
     p.key_mask = mask.defined() ? mask.data_ptr<bool>() : nullptr;
     p.mask_batch_stride = mask.defined() ? mask.stride(0) : 0;

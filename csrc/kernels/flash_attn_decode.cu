@@ -100,11 +100,7 @@ decode_kernel(DecodeParams p) {
                                 (kPaged ? 0 : b * p.v_batch_stride);
     const int* table = kPaged ? p.block_table + index_t(b) * p.max_blocks : nullptr;
     auto key_offset = [&](int j, index_t batch_stride, index_t seq_stride) -> index_t {
-        if constexpr (kPaged) {
-            const int blk = p.block_shift >= 0 ? j >> p.block_shift : j / p.block_size;
-            const int slot = p.block_shift >= 0 ? j & (p.block_size - 1) : j % p.block_size;
-            return index_t(table[blk]) * batch_stride + slot * seq_stride;
-        }
+        if constexpr (kPaged) return paged_row_offset(table, j, p.block_size, p.block_shift, batch_stride, seq_stride);
         else return j * seq_stride;
     };
     // The rows see keys [first_key(0), last_key(q_len - 1)] (causal / window

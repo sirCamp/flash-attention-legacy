@@ -57,6 +57,9 @@ struct FwdBlockArgs {
     index_t q_head_stride;
     const float* __restrict__ sinks;  // the cache kernel: sinks of heads h0.. (split 0), else nullptr
     const bool* __restrict__ key_mask;  // the cache kernel: the row's key mask from key 0 of K, or nullptr
+    const int* __restrict__ block_table;  // the cache kernel, paged: the row's blocks (K / V: the KV head's base)
+    index_t k_block_stride, v_block_stride;
+    int block_size, block_shift;
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
@@ -299,9 +302,13 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
     };
     // K / V rows of the block from kv_start: the cache kernel with a key mask reads the dropped keys as
     // zeros (never read, as in the decode kernel: a NaN there would reach O through P = 0 times V)
-    auto kv_rows = [&](const half* src, int stride, int kv_start) {
+    // A paged cache: key j in block block_table[j / block_size], slot j % block_size (as the decode kernel).
+    auto kv_rows = [&](const half* src, index_t stride, index_t block_stride, int kv_start) {
         return [=, &a](int r) -> const half* {
-            return a.key_mask && !a.key_mask[kv_start + r] ? nullptr : src + r * stride;
+            const int j = kv_start + r;
+            if (a.key_mask && !a.key_mask[j]) return nullptr;
+            if (a.block_table) return src + paged_row_offset(a.block_table, j, a.block_size, a.block_shift, block_stride, stride);
+            return src + j * stride;
         };
     };
     if constexpr (Tile::kPrefetch) {
@@ -310,10 +317,10 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             [&](int kv_blk) {
                 const int kv_start = kv_blk * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                if constexpr (kCache) {
-                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.K + kv_start * a.k_stride, a.k_stride, kv_start),
+                if (kCache && (a.block_table || a.key_mask)) {  // per-row addresses only when needed (uniform)
+                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
                                                         next_K, valid_kv, a.head_dim);
-                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.V + kv_start * a.v_stride, a.v_stride, kv_start),
+                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
                                                         next_V, valid_kv, a.head_dim);
                 } else {
                     load_tile_g2r(a.K + kv_start * a.k_stride, a.k_stride, next_K, valid_kv, a.head_dim);
@@ -332,10 +339,10 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             [&]() {
                 const int kv_start = pending * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                if constexpr (kCache) {
-                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.K + kv_start * a.k_stride, a.k_stride, kv_start),
+                if (kCache && (a.block_table || a.key_mask)) {  // per-row addresses only when needed (uniform)
+                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
                                                             smem_K, valid_kv, a.head_dim);
-                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.V + kv_start * a.v_stride, a.v_stride, kv_start),
+                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
                                                             smem_V, valid_kv, a.head_dim);
                 } else {
                     load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
@@ -381,10 +388,20 @@ fwd_batched_kernel(FlashAttnParams p) {
         // window stay aligned to `end` as in the decode kernel
         const int end = p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
         const int start = p.leftpad_k ? min(max(p.leftpad_k[b_idx], 0), end) : 0;
-        a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride + index_t(start) * p.k_seq_stride;
+        if (p.block_table) {  // paged (no leftpad): K / V at the KV head, rows through the block table
+            a.K = p.K + kv_h_idx * p.k_head_stride;
+            a.V = p.V + kv_h_idx * p.v_head_stride;
+        } else {
+            a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride + index_t(start) * p.k_seq_stride;
+            a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride + index_t(start) * p.v_seq_stride;
+        }
         a.k_stride = p.k_seq_stride;
-        a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride + index_t(start) * p.v_seq_stride;
         a.v_stride = p.v_seq_stride;
+        a.block_table = p.block_table ? p.block_table + index_t(b_idx) * p.max_blocks : nullptr;
+        a.k_block_stride = p.k_batch_stride;
+        a.v_block_stride = p.v_batch_stride;
+        a.block_size = p.block_size;
+        a.block_shift = p.block_shift;
         a.O = nullptr;
         a.o_stride = 0;
         a.L = nullptr;
@@ -445,6 +462,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.q_head_stride = 0;
         a.sinks = nullptr;
         a.key_mask = nullptr;
+        a.block_table = nullptr;
     }
     Body::template run<Tile, kCache>(a);
 }
@@ -492,6 +510,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.q_head_stride = 0;
     a.sinks = nullptr;
     a.key_mask = nullptr;
+    a.block_table = nullptr;
     Body::template run<Tile, false>(a);
 }
 
