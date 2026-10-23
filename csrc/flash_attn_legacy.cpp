@@ -40,9 +40,10 @@ void precompute_D(
 void flash_attn_bwd_launch(FlashAttnBwdParams& params, int sm, int total_k_blocks, cudaStream_t stream);
 int flash_attn_bwd_block_cols(int head_dim, int sm);
 void flash_attn_decode(DecodeParams& params, bool bf16, cudaStream_t stream);
+void flash_attn_split_combine(const SplitCombineParams& params, bool bf16, cudaStream_t stream);
 int flash_attn_decode_max_rows();
-int flash_attn_decode_num_splits(int blocks, int sms, int max_len);
-int flash_attn_decode_max_splits();
+int flash_attn_num_splits(int blocks, int sms, int resident, int max_len, int rows);
+int flash_attn_max_splits();
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -117,6 +118,20 @@ static int get_sm_version(int device_id = -1) {
                     "family, mma.sync on SM >= 7.5), got '", f, "'");
     }
     return code_sm;
+}
+
+// The forward of the kernel family that runs on `sm` (get_sm_version), and the
+// query rows of the tile its launcher selects (same dispatch: they cannot disagree).
+static void run_fwd(FlashAttnParams& p, int sm, cudaStream_t stream) {
+    TORCH_CHECK(sm >= 60, "flash_attn_legacy requires SM >= 6.0. Got SM ", sm);
+    if (sm >= 75)      flash_attn_fwd_turing(p, stream);
+    else if (sm >= 70) flash_attn_fwd_volta(p, stream);
+    else               flash_attn_fwd_pascal(p, stream);
+}
+
+static int fwd_block_rows(int sm, int d) {
+    return sm >= 75 ? flash_attn_fwd_turing_block_rows(d)
+         : sm >= 70 ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
 }
 
 // Head dimensions with a kernel tile (72 and 80 run on the 80 / 96 tiles with
@@ -377,17 +392,7 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward(
     p.o_batch_stride = O.stride(0); p.o_head_stride = O.stride(1); p.o_seq_stride = O.stride(2);
     p.l_batch_stride = index_t(H_q) * N; p.l_head_stride = N;
 
-    int sm = get_sm_version();
-    if (sm >= 75) {
-        flash_attn_fwd_turing(p, stream);
-    } else if (sm >= 70) {
-        flash_attn_fwd_volta(p, stream);
-    } else if (sm >= 60) {
-        flash_attn_fwd_pascal(p, stream);
-    } else {
-        TORCH_CHECK(false, "flash_attn_legacy requires SM >= 6.0. Got SM ", sm);
-    }
-
+    run_fwd(p, get_sm_version(), stream);
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
     return {O, L};
 }
@@ -529,9 +534,7 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward_varlen(
     if (total_q == 0 || H_q == 0) return {O, L};  // no query tokens: nothing to launch
 
     int sm = get_sm_version();
-    // Br of the tile the launcher will select (same dispatch: they cannot disagree)
-    const int Br = sm >= 75 ? flash_attn_fwd_turing_block_rows(d)
-                 : sm >= 70 ? flash_attn_fwd_volta_block_rows(d) : flash_attn_fwd_pascal_block_rows(d);
+    const int Br = fwd_block_rows(sm, d);
     const VarlenBlocks q_blocks = varlen_blocks(cu_seqlens_q, cu_host.first, Br, total_q);
     if (q_blocks.total == 0) return {O, L};  // only empty sequences: nothing to launch
     const int total_q_blocks = q_blocks.total;
@@ -737,9 +740,13 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     }
     TORCH_CHECK(k_cache.size(3) == d, "k_cache head_dim must match q");
     TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "num_heads_q (", H_q, ") must be divisible by num_heads_kv (", H_kv, ")");
-    TORCH_CHECK_NOT_IMPLEMENTED(H_q / H_kv * q_len <= flash_attn_decode_max_rows(),
-                "flash_attn_with_kvcache: (num_heads_q / num_heads_kv) * q_len = ", H_q / H_kv * q_len,
-                " query rows per KV head; at most ", flash_attn_decode_max_rows(), " for now");
+    // More query rows per KV head than the decode kernel takes (speculative
+    // verification, MQA): the forward kernels with key splits, on the same cache
+    const int rows = H_q / H_kv * q_len;
+    const bool on_forward = rows > flash_attn_decode_max_rows();
+    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || (q.dtype() == torch::kFloat16 && !paged),
+                "flash_attn_with_kvcache with (num_heads_q / num_heads_kv) * q_len = ", rows, " > ",
+                flash_attn_decode_max_rows(), " query rows per KV head: float16 and a contiguous cache only for now");
     q = contiguous_aligned(q);
     check_decode_layout(k_cache, "k_cache");
     check_decode_layout(v_cache, "v_cache");
@@ -762,6 +769,9 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
                     "key_mask must be bool [B, max_len] = [", B, ", ", max_len, "] on q's device");
         if (mask.stride(1) != 1) mask = mask.contiguous();  // any batch stride (0: broadcast)
     }
+    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || (!leftpad.defined() && !mask.defined()),
+                "flash_attn_with_kvcache with more than ", flash_attn_decode_max_rows(),
+                " query rows per KV head: cache_leftpad and key_mask are not supported yet");
 
     torch::Tensor out = torch::empty_like(q);
     torch::Tensor lse = torch::empty({B, H_q, q_len}, q.options().dtype(torch::kFloat32));
@@ -769,7 +779,44 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
 
     const at::cuda::CUDAGuard device_guard(q.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    get_sm_version();  // a kernel image for this GPU
+    const int sm = get_sm_version();  // a kernel image for this GPU
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    TORCH_CHECK(num_splits >= 0, "num_splits must be >= 0 (0 = automatic)");
+    if (on_forward) {  // q, out [B, q_len, H_q, d] and the cache [B, max_len, H_kv, d] read through their strides
+        FlashAttnParams f = {};
+        f.Q = reinterpret_cast<const half*>(q.data_ptr<at::Half>());
+        f.K = reinterpret_cast<const half*>(k_cache.data_ptr<at::Half>());
+        f.V = reinterpret_cast<const half*>(v_cache.data_ptr<at::Half>());
+        f.O = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+        f.L = lse.data_ptr<float>();
+        f.batch_size = B; f.num_heads = H_q; f.num_heads_k = H_kv; f.head_dim = d;
+        f.seq_len_q = q_len;
+        f.seq_len_k = uniform_seqlen >= 0 ? int(uniform_seqlen) : max_len;
+        f.seqlens_k = seqlens.defined() ? seqlens.data_ptr<int>() : nullptr;
+        f.q_batch_stride = q.stride(0); f.q_seq_stride = q.stride(1); f.q_head_stride = q.stride(2);
+        f.k_batch_stride = k_cache.stride(0); f.k_seq_stride = k_cache.stride(1); f.k_head_stride = k_cache.stride(2);
+        f.v_batch_stride = v_cache.stride(0); f.v_seq_stride = v_cache.stride(1); f.v_head_stride = v_cache.stride(2);
+        f.o_batch_stride = out.stride(0); f.o_seq_stride = out.stride(1); f.o_head_stride = out.stride(2);
+        f.l_batch_stride = index_t(H_q) * q_len; f.l_head_stride = q_len;
+        f.softmax_scale = softmax_scale;
+        f.softcap = logit_softcap(softcap);
+        f.sinks = data_or_null(sink);
+        std::tie(f.window_left, f.window_right) = key_window(is_causal, window_left, window_right, q_len, max_len);
+        // Splits: each block reads its KV head's cache for its own q_len rows (resident: ~1 large block per SM)
+        const int blocks = cdiv(q_len, fwd_block_rows(sm, d)) * B * H_q;
+        f.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_max_splits()))
+                                      : flash_attn_num_splits(blocks, sms, 1, max_len, q_len);
+        // Partials of every split, even of one (the kernel variant of the cache; see fwd_batched_kernel)
+        torch::Tensor o_part = torch::empty({f.num_splits, B, H_q, q_len, d}, q.options().dtype(torch::kFloat32));
+        torch::Tensor lse_part = torch::empty({f.num_splits, B, H_q, q_len}, q.options().dtype(torch::kFloat32));
+        f.O_part = o_part.data_ptr<float>();
+        f.L_part = lse_part.data_ptr<float>();
+        run_fwd(f, sm, stream);
+        flash_attn_split_combine({f.O_part, f.L_part, out.data_ptr(), lse.data_ptr<float>(), out.stride(0),
+                                  out.stride(1), out.stride(2), B, q_len, H_q, d, f.num_splits}, false, stream);
+        FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+        return {out, lse};
+    }
 
     DecodeParams p = {};
     p.q = q.data_ptr(); p.k = k_cache.data_ptr(); p.v = v_cache.data_ptr(); p.out = out.data_ptr();
@@ -795,10 +842,8 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     p.batch_size = B; p.q_len = q_len; p.num_heads = H_q; p.num_heads_k = H_kv; p.head_dim = d;
     p.max_len = max_len;
     // Key splits: num_splits > 0 forced (capped), 0 = chosen from the grid
-    TORCH_CHECK(num_splits >= 0, "num_splits must be >= 0 (0 = automatic)");
-    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    p.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_decode_max_splits()))
-                                  : flash_attn_decode_num_splits(B * H_kv, sms, max_len);
+    p.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_max_splits()))
+                                  : flash_attn_num_splits(B * H_kv, sms, 4, max_len, rows);
     torch::Tensor o_part, lse_part;
     if (p.num_splits > 1) {
         o_part = torch::empty({p.num_splits, B, H_q, q_len, d}, q.options().dtype(torch::kFloat32));
@@ -852,8 +897,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compiled_archs", &flash_attn_legacy::compiled_archs,
           "CUDA architectures this build contains, e.g. ['6.0', '7.0', '7.5+PTX']");
     m.def("decode_max_rows", &flash_attn_legacy::flash_attn_decode_max_rows,
-          "Query rows per KV head ((H_q / H_kv) * q_len) flash_attn_with_kvcache handles");
-    m.def("decode_num_splits", &flash_attn_legacy::flash_attn_decode_num_splits,
-          "Automatic key splits of flash_attn_with_kvcache for (B * H_kv, SMs, max_len)",
-          py::arg("blocks"), py::arg("sms"), py::arg("max_len"));
+          "Query rows per KV head ((H_q / H_kv) * q_len) of flash_attn_with_kvcache's decode kernel "
+          "(more run on the forward kernels with key splits)");
+    m.def("num_splits", &flash_attn_legacy::flash_attn_num_splits,
+          "Automatic key splits of flash_attn_with_kvcache for (blocks, SMs, resident blocks per SM, max_len, "
+          "query rows per block)", py::arg("blocks"), py::arg("sms"), py::arg("resident"), py::arg("max_len"),
+          py::arg("rows"));
 }

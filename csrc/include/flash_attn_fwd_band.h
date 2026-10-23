@@ -31,7 +31,10 @@ namespace flash_attn_legacy {
 constexpr int kBandRows = 16;  // query rows per band (of one or more warps)
 
 // One Q block: its rows start at Q / O / L (row strides q_stride / o_stride /
-// l_stride); K and V start at key 0 of the sequence.
+// l_stride); K and V start at key 0 of the sequence. With key splits
+// (num_splits > 1) the block takes split `split` of its visible K/V blocks and
+// writes the split's partial rows at O_part (fp32, row stride head_dim) and
+// L_part (log2) instead of O / L.
 struct FwdBlockArgs {
     const half* __restrict__ Q; index_t q_stride;
     const half* __restrict__ K; index_t k_stride;
@@ -43,12 +46,44 @@ struct FwdBlockArgs {
     float softmax_scale, softcap;
     float sink_log2;                // sink logit of the head * log2(e), -inf = none
     int window_left, window_right;  // KeyWindow of the sequence
+    int split, num_splits;          // num_splits 1: no split
+    float* __restrict__ O_part;
+    float* __restrict__ L_part;
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
     }
     __device__ __forceinline__ ScoreMap score_map() const { return ScoreMap(softmax_scale, softcap); }
 };
+
+// The final values of N consecutive columns from `col` of block row `row` (O
+// already multiplied by the row's inv): half into O, or with kPartial (the
+// kCache kernel) fp32 into the split's partial. Every family writes its output
+// through these two.
+template <bool kPartial, int N>
+__device__ __forceinline__ void fwd_store_o(const FwdBlockArgs& a, int row, int col, const float (&v)[N]) {
+    static_assert(N == 2 || N == 4 || N == 8, "2, 4 or 8 columns");
+    if constexpr (kPartial) {  // fp32, 8-byte aligned (col even, head_dim % 8 == 0)
+        float* dst = a.O_part + index_t(row) * a.head_dim + col;
+        #pragma unroll
+        for (int i = 0; i < N; i += 2) *reinterpret_cast<float2*>(dst + i) = make_float2(v[i], v[i + 1]);
+    } else {
+        half2 h[N / 2];
+        #pragma unroll
+        for (int i = 0; i < N / 2; i++) h[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+        half* dst = a.O + row * a.o_stride + col;
+        if constexpr (N == 2) *reinterpret_cast<half2*>(dst) = h[0];
+        else if constexpr (N == 4) { uint2 u; memcpy(&u, h, sizeof(u)); *reinterpret_cast<uint2*>(dst) = u; }
+        else { uint4 u; memcpy(&u, h, sizeof(u)); *reinterpret_cast<uint4*>(dst) = u; }
+    }
+}
+
+// lse: natural log (BandSoftmax::finalize); the split partial keeps it in log2.
+template <bool kPartial>
+__device__ __forceinline__ void fwd_store_lse(const FwdBlockArgs& a, int row, float lse) {
+    if constexpr (kPartial) a.L_part[row] = lse * kLog2e;  // -inf stays -inf
+    else                    a.L[row * a.l_stride] = lse;
+}
 
 // Key `key` is not visible to sequence row `q_row` (KeyWindow; includes keys
 // past the end).
@@ -158,9 +193,14 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
     // inside [first_key(last row), last_key(first row)] of the band needs no mask.
     const KeyWindow w = a.window();
     const int q_first = a.q_row_start, q_last = a.q_row_start + a.valid_q - 1;
-    const int kv_begin = w.first_key(q_first) / Bc;
+    int kv_begin = w.first_key(q_first) / Bc;
     const int last_key = w.last_key(q_last);
-    const int kv_end = last_key < 0 ? 0 : last_key / Bc + 1;
+    int kv_end = last_key < 0 ? 0 : last_key / Bc + 1;
+    if (a.num_splits > 1) {  // this split's share of the visible blocks (may be empty)
+        const int chunk = cdiv(max(kv_end - kv_begin, 0), a.num_splits);
+        kv_begin += a.split * chunk;
+        kv_end = min(kv_end, kv_begin + chunk);
+    }
     const int band_first = a.q_row_start + band_row0, band_last = band_first + kBandRows - 1;
     const int band_first_key = w.first_key(band_first), band_last_key = w.last_key(band_last);
     const int nomask_first = w.first_key(band_last), nomask_last = w.last_key(band_first);
@@ -220,12 +260,19 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
 // ---------------------------------------------------------------------------
 // Kernels: locate the Q block of this CUDA block and run the family's Body.
 // ---------------------------------------------------------------------------
-template <typename Tile, typename Body>
+// kCache: the variant of flash_attn_with_kvcache (per-batch key lengths, key
+// splits, the splits' partials for the combine). A template parameter: the
+// plain forward carries none of it (a runtime branch or even the per-batch
+// length load made the compiler lay the kernel out differently: Pascal d=128
+// +23% on the P100, d=64 +9% on the 1080 Ti).
+template <typename Tile, typename Body, bool kCache>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_batched_kernel(FlashAttnParams p) {
     // Flat grid: x = (batch * heads) * q_blocks + q_block (no 65535 limit on
-    // B * H; the Q blocks of one head are adjacent, sharing its K/V in L2).
+    // B * H; the Q blocks of one head are adjacent, sharing its K/V in L2), y =
+    // key split (the query heads of a KV head adjacent within a split).
     const int q_blocks = cdiv(p.seq_len_q, Tile::Br);
+    const int split = blockIdx.y;
     const int bh_idx = blockIdx.x / q_blocks;
     const int b_idx = bh_idx / p.num_heads;
     const int h_idx = bh_idx % p.num_heads;
@@ -247,14 +294,23 @@ fwd_batched_kernel(FlashAttnParams p) {
     a.q_row_start = q_row_start;
     a.valid_q = min(Tile::Br, p.seq_len_q - q_row_start);
     a.seq_len_q = p.seq_len_q;
-    a.seq_len_k = p.seq_len_k;
+    a.seq_len_k = kCache && p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
     a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
     a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
     a.softcap = p.softcap;
-    a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
+    a.sink_log2 = p.sinks && (!kCache || split == 0) ? p.sinks[h_idx] * kLog2e : -INFINITY;  // once per row
     a.window_left = p.window_left;
     a.window_right = p.window_right;
-    Body::template run<Tile>(a);
+    a.split = kCache ? split : 0;
+    a.num_splits = kCache ? max(p.num_splits, 1) : 1;
+    a.O_part = nullptr;
+    a.L_part = nullptr;
+    if constexpr (kCache) {  // partial rows (split, b, h, query) of the combine
+        const index_t prow = (index_t(split) * p.batch_size * p.num_heads + bh_idx) * p.seq_len_q + q_row_start;
+        a.O_part = p.O_part + prow * p.head_dim;
+        a.L_part = p.L_part + prow;
+    }
+    Body::template run<Tile, kCache>(a);
 }
 
 template <typename Tile, typename Body>
@@ -292,7 +348,11 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
     a.window_left = p.window_left;
     a.window_right = p.window_right;
-    Body::template run<Tile>(a);
+    a.split = 0;
+    a.num_splits = 1;
+    a.O_part = nullptr;
+    a.L_part = nullptr;
+    Body::template run<Tile, false>(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,10 +363,14 @@ void launch_fwd(FlashAttnParams& params, cudaStream_t stream) {
     constexpr int smem = Tile::smem_bytes();
     const int64_t blocks = int64_t(cdiv(params.seq_len_q, Tile::Br)) * params.batch_size * params.num_heads;
     if (blocks > INT32_MAX) throw std::runtime_error("flash_attn_legacy: batch * heads * query blocks exceeds the grid limit");
-    dim3 grid(static_cast<unsigned>(blocks));
-    FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(
-        fwd_batched_kernel<Tile, Body>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    fwd_batched_kernel<Tile, Body><<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
+    const dim3 grid(static_cast<unsigned>(blocks), max(params.num_splits, 1));
+    auto launch = [&](auto cache) {
+        const auto kernel = fwd_batched_kernel<Tile, Body, decltype(cache)::value>;
+        FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
+    };
+    if (params.O_part) launch(std::true_type{});  // flash_attn_with_kvcache: partials, even of one split
+    else               launch(std::false_type{});
 }
 
 template <typename Tile, typename Body>

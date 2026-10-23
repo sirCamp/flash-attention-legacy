@@ -85,6 +85,32 @@ c. HF: q_len == 1 with rep > 8 to the packed path; the "decode (N query heads pe
    assisted generate / prompt lookup / a rep-12 model identical to plain greedy and to SDPA within noise.
 d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README / PLAN.
 
+## Step (a), done
+- `flash_attn_split.h`: element types, `decode_merge`, `split_combine_kernel` (`SplitCombineParams` in `flash_attn_common.h`, host
+  entry `flash_attn_split_combine`), shared by decode and forward; decode bit-identical (50 cases: fp16 / bf16, splits 1 / 3 / 16 /
+  auto, paged, sinks, softcap). One split-count rule `flash_attn_num_splits(blocks, sms, resident, max_len, rows)`, unchanged for
+  decode (rows <= 8).
+- Forward: `fwd_batched_kernel<Tile, Body, kCache>`. kCache (selected by `O_part`) is the variant of `flash_attn_with_kvcache`:
+  per-batch key lengths, split s of the visible K/V blocks, fp32 partials + log2 lse through `fwd_store_o` / `fwd_store_lse`
+  (also one split), sink in split 0. A template parameter because the plain forward must carry none of it: a runtime branch in
+  the epilogue made the Pascal d=128 forward 23% slower on the P100 (36 -> 44 ms at N=4096; 39 with the partial store out of
+  line), and the per-batch length load alone made d=64 9% slower on the 1080 Ti (15.7 -> 17.2 ms); with kCache the plain
+  forward measures as HEAD on every GPU (alternated A/B against a HEAD build on the same box).
+- `flash_attn_with_kvcache` with R > 8: the kCache forward on the cache views, fp16 and a contiguous cache (bf16, paged,
+  cache_leftpad, key_mask raise NotImplementedError).
+- Attention of one layer, d=128, B=1, us (HF's path today -> `flash_attn_with_kvcache`):
+
+| GPU | GQA 32/8, 16k, q_len 16 | GQA 32/8, 4k, q_len 4 | GQA 24/2, 4k, q_len 1 (SDPA today) |
+|---|---|---|---|
+| P100 | 7565 -> 3306 | 1878 -> 850 | 1130 -> 666 |
+| 1080 Ti | 5371 -> 2632 | 1335 -> 671 | 7218 -> 444 |
+| 2080 Ti | 723 -> 447 | 185 -> 122 | 223 -> 91 |
+| V100 | 1214 -> 628 | 311 -> 170 | 326 -> 157 |
+| T4 | 597 -> 602 | 154 -> 168 | 283 -> 123 |
+
+  The splits fill the grid where it was starved (Pascal, the V100's 80 and the 2080 Ti's 68 SMs); on the T4 the forward was already bandwidth
+  bound and each query head re-reads its KV head's cache (rep x the traffic): that is step (b).
+
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache
   read) on SM 7.x; on Pascal the larger of that and the fp32 compute floor (4 d R N H_kv FLOP: q_len 16, GQA 4, 4k, d 128,

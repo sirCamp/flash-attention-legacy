@@ -102,18 +102,18 @@ for e in entries:
     name = names[e["mangled"]]
     if "precompute_D" in name:
         kind, tile, warps, dyn = "precompute_D", "-", 8, 0
-    elif "decode_combine" in name:  # 256 threads; fp16 row (bf16 alike)
+    elif "split_combine" in name:  # 256 threads; fp16 row (bf16 alike)
         if "Bf16Elem" in name:
             continue
-        kind, tile, warps, dyn = "decode_combine", "-", 8, 0
+        kind, tile, warps, dyn = "split_combine", "-", 8, 0
     elif "decode_kernel" in name:  # 4 warps, static shared memory only; fp16 rows (bf16 alike)
         dt, d, r, paged = decode_re.search(name).groups()
         if dt != "Half":
             continue
         kind, tile, warps, dyn = "decode", "d=%s, R=%s%s" % (d, r, ", paged" if paged == "true" else ""), 4, 0
     else:
-        body = re.search(r"flash_attn_legacy::(\w+)>\(", name).group(1)
-        kind = BODIES[body] + ("_varlen" if "varlen_kernel" in name else "")
+        body, partial = re.search(r"flash_attn_legacy::(\w+)(?:, (true|false))?>\(", name).groups()
+        kind = BODIES[body] + ("_varlen" if "varlen_kernel" in name else "_cache" if partial == "true" else "")
         if int(e["arch"][3:]) < MIN_ARCH.get(BODIES[body], 0):
             continue
         tile = tile_re.search(name).group(1)

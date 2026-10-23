@@ -24,7 +24,8 @@ except ImportError as e:
 
 _ops = torch.ops.flash_attn_legacy
 
-# Query rows per KV head ((H_q / H_kv) * q_len) the decode kernel handles: read once
+# Query rows per KV head ((H_q / H_kv) * q_len) the decode kernel handles (more go to the
+# forward kernels with key splits): read once
 # (a pybind call would break torch.compile graphs).
 DECODE_MAX_ROWS = flash_attn_legacy_cuda.decode_max_rows()
 
@@ -571,7 +572,11 @@ def flash_attn_with_kvcache(
     """
     Attention of a few new queries against a KV cache (decode), the upstream
     flash-attn ``flash_attn_with_kvcache`` with the same positional order.
-    Inference only. Split-KV decode kernel on CUDA cores (every supported GPU).
+    Inference only. Up to DECODE_MAX_ROWS (8) query rows per KV head
+    ((H_q / H_kv) * q_len) the split-KV decode kernel on CUDA cores (every
+    supported GPU); beyond (speculative verification, MQA / GQA > 8:1) the
+    forward kernels with key splits on the same cache (float16, contiguous cache,
+    no cache_leftpad / key_mask yet; docs/analysis/kernels/spec_decode_design.md).
 
     Args:
         q: [B, q_len, H_q, d] float16 or bfloat16 (q_len small: decode, speculation)

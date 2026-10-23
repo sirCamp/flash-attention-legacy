@@ -24,7 +24,7 @@ namespace flash_attn_legacy {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 
 struct TuringFwd {
-template <typename Tile>
+template <typename Tile, bool kPartial>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -147,13 +147,12 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     for (int r = 0; r < 2; r++) {
         const int row = band_row0 + g + 8 * r;  // within the Q block
         if (row >= a.valid_q) continue;
-        if (t == 0) a.L[row * a.l_stride] = lse[r];
+        if (t == 0) fwd_store_lse<kPartial>(a, row, lse[r]);
         #pragma unroll
         for (int n = 0; n < ON; n++) {
             const int col = 8 * n + 2 * t;
             if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
-                *reinterpret_cast<half2*>(a.O + row * a.o_stride + col) =
-                    __floats2half2_rn(O[n][2 * r] * inv[r], O[n][2 * r + 1] * inv[r]);
+                fwd_store_o<kPartial>(a, row, col, {O[n][2 * r] * inv[r], O[n][2 * r + 1] * inv[r]});
             }
         }
     }
@@ -165,7 +164,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // Stub body for older device code — never launched there: the host selects the
 // family from the arch of the code that runs (compiled_arch_for).
 struct TuringFwd {
-    template <typename Tile>
+    template <typename Tile, bool kPartial>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 

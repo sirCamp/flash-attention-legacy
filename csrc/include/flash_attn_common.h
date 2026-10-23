@@ -82,6 +82,16 @@ struct FlashAttnParams {
 
     // Visible keys of each query row: KeyWindow (-1 = unbounded; causal is right = 0)
     int window_left, window_right;
+
+    // Inference against a KV cache (flash_attn_with_kvcache beyond the decode kernel's
+    // rows; O_part != nullptr selects that kernel variant): seqlens_k [B] = the keys of
+    // each batch row (clamped to [0, N_kv] on the device), nullptr = N_kv; each row's
+    // visible keys go in num_splits (>= 1) splits, whose partials replace O / L
+    // (flash_attn_split.h layout, rows (b, h, query) of N_q queries) for the combine.
+    const int* __restrict__ seqlens_k;
+    int num_splits;
+    float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
+    float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +167,17 @@ struct DecodeParams {
     float* __restrict__ lse_part;   // [splits, B, H_q, q_len], log2 domain
     float softmax_scale, softcap;
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
+};
+
+// The splits' partials and where their merge goes. Rows are (batch row, query
+// head, query) in that order: partial row s * rows + (b * H_q + h) * q_len + qi.
+struct SplitCombineParams {
+    const float* __restrict__ o_part;    // [splits, B, H_q, q_len, d] fp32, normalized
+    const float* __restrict__ lse_part;  // [splits, B, H_q, q_len], log2 domain (-inf: no visible key)
+    void* __restrict__ out;              // q's dtype, strides below
+    float* __restrict__ lse;             // [B, H_q, q_len], natural log
+    index_t o_batch_stride, o_seq_stride, o_head_stride;
+    int batch_size, q_len, num_heads, head_dim, num_splits;  // DecodeParams' order
 };
 
 // ---------------------------------------------------------------------------

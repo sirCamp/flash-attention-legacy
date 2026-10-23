@@ -22,7 +22,7 @@
 namespace flash_attn_legacy {
 
 struct PascalFwd {
-template <typename Tile>
+template <typename Tile, bool kPartial>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -166,17 +166,13 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     for (int i = 0; i < 4; i++) {
         const int row = row0 + i;
         if (row >= a.valid_q) break;
-        if (cg == 0 && part == 0) a.L[row * a.l_stride] = lse[i];
+        if (cg == 0 && part == 0) fwd_store_lse<kPartial>(a, row, lse[i]);
         #pragma unroll
         for (int t = 0; t < TD; t++) {
             const int col = col0 + 4 * cg + 32 * t;
             if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
-                const half2 lo = __floats2half2_rn(O[i][t].x * inv[i], O[i][t].y * inv[i]);
-                const half2 hi = __floats2half2_rn(O[i][t].z * inv[i], O[i][t].w * inv[i]);
-                uint2 packed;
-                memcpy(&packed.x, &lo, 4);
-                memcpy(&packed.y, &hi, 4);
-                *reinterpret_cast<uint2*>(a.O + row * a.o_stride + col) = packed;
+                fwd_store_o<kPartial>(a, row, col, {O[i][t].x * inv[i], O[i][t].y * inv[i], O[i][t].z * inv[i],
+                                          O[i][t].w * inv[i]});
             }
         }
     }

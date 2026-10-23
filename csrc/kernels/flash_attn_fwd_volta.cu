@@ -40,7 +40,7 @@ namespace flash_attn_legacy {
 // (wmma_acc_layout).
 // ---------------------------------------------------------------------------
 struct VoltaFwd {
-template <typename Tile>
+template <typename Tile, bool kPartial>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -168,7 +168,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     const int band_valid = min(T, a.valid_q - band_row0);
     if (h == 0) {
         row_scale[r] = inv[0];
-        if (r < band_valid) a.L[(band_row0 + r) * a.l_stride] = lse[0];
+        if (r < band_valid) fwd_store_lse<kPartial>(a, band_row0 + r, lse[0]);
     }
     __syncwarp();
     scale_o();
@@ -188,11 +188,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             if (row < band_valid && t0 * T + col < a.head_dim) {
                 const float4 lo = *reinterpret_cast<const float4*>(stage + row * LDS + col);
                 const float4 hi = *reinterpret_cast<const float4*>(stage + row * LDS + col + 4);
-                const half2 o[4] = {__floats2half2_rn(lo.x, lo.y), __floats2half2_rn(lo.z, lo.w),
-                                    __floats2half2_rn(hi.x, hi.y), __floats2half2_rn(hi.z, hi.w)};
-                uint4 packed;
-                memcpy(&packed, o, sizeof(packed));
-                *reinterpret_cast<uint4*>(a.O + (band_row0 + row) * a.o_stride + t0 * T + col) = packed;
+                fwd_store_o<kPartial>(a, band_row0 + row, t0 * T + col, {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w});
             }
         }
         __syncwarp();
@@ -205,7 +201,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // Stub body for SM < 7.0 device code — never launched there: the host selects the
 // family from the arch of the code that runs (compiled_arch_for).
 struct VoltaFwd {
-    template <typename Tile>
+    template <typename Tile, bool kPartial>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 
