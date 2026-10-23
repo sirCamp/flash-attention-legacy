@@ -179,6 +179,27 @@ struct DecodeParams {
     int window_left, window_right;  // KeyWindow (-1 = unbounded; causal is right = 0)
 };
 
+// New keys / values written into a KV cache (flash_attn_with_kvcache's k, v): token t of row b
+// to key cache_seqlens[b] + t of the cache ([B, max_len, H_kv, d], or paged as in DecodeParams).
+// Rows with a negative start (padding rows of a static batch), keys past the cache and keys in
+// a block entry outside [0, num_blocks) are skipped. Rows whose tables share a block (prefix
+// sharing) must not write the same slot in one call (unordered, as upstream).
+struct KvAppendParams {
+    void* __restrict__ k_cache;              // fp16 or bf16: copied as bytes
+    void* __restrict__ v_cache;
+    const void* __restrict__ k;              // [B, seqlen_new, H_kv, d]
+    const void* __restrict__ v;
+    const int* __restrict__ cache_seqlens;   // [B]: where row b's new keys start, or nullptr: uniform_seqlen
+    int uniform_seqlen;
+    const int* __restrict__ block_table;     // [B, max_blocks] or nullptr (contiguous)
+    int max_blocks, block_size, block_shift, num_blocks;
+    index_t kc_batch_stride, kc_seq_stride, kc_head_stride;  // paged: batch = block stride
+    index_t vc_batch_stride, vc_seq_stride, vc_head_stride;
+    index_t k_batch_stride, k_seq_stride, k_head_stride;
+    index_t v_batch_stride, v_seq_stride, v_head_stride;
+    int batch_size, seqlen_new, num_heads_k, head_dim, max_len;
+};
+
 // The splits' partials and where their merge goes. Rows are (batch row, query
 // head, query) in that order: partial row s * rows + (b * H_q + h) * q_len + qi.
 struct SplitCombineParams {
@@ -595,14 +616,17 @@ __host__ __device__ __forceinline__ int tile_valid_cols(int head_dim) {
     return (d == 80 || d == 96) ? head_dim : d;
 }
 
-// Offset of key j of a paged cache (table: the batch row's blocks; key j in block j / block_size, slot
-// j % block_size; block_shift = log2(block_size) for a power of 2, else -1): one rule for the decode
-// kernel and the cache forward.
+// Paged caches: key j in block j / block_size, slot j % block_size (block_shift = log2(block_size) for a
+// power of 2, else -1): one rule for the decode kernel, the cache forward and the cache append.
+__device__ __forceinline__ int paged_block(int j, int block_size, int block_shift) {
+    return block_shift >= 0 ? j >> block_shift : j / block_size;
+}
+
+// Offset of key j of a paged cache (table: the batch row's blocks).
 __device__ __forceinline__ index_t paged_row_offset(const int* __restrict__ table, int j, int block_size,
                                                      int block_shift, index_t block_stride, index_t seq_stride) {
-    const int blk = block_shift >= 0 ? j >> block_shift : j / block_size;
     const int slot = block_shift >= 0 ? j & (block_size - 1) : j % block_size;
-    return index_t(table[blk]) * block_stride + slot * seq_stride;
+    return index_t(table[paged_block(j, block_size, block_shift)]) * block_stride + slot * seq_stride;
 }
 
 // Varlen grids: sequence of a flat block index, from the cumulative per-sequence

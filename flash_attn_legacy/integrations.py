@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 # (speculative verification steps are 2-20 tokens; longer chunks are prefills)
 SHORT_Q_MAX = 64
 
+# transformers' PagedAttentionCache (continuous batching), set by register()
+_PagedAttentionCache = None
+
 # ---------------------------------------------------------------------------
 # Fallback registry — the single place that lists why a call does not run our
 # kernel. Each reason either falls back to torch SDPA (correct result, no
@@ -464,6 +467,10 @@ def flash_attn_legacy_forward(
 
     Returns (attn_output, attn_weights) where attn_weights is always None.
     """
+    cache = kwargs.get("cache")
+    if _PagedAttentionCache is not None and isinstance(cache, _PagedAttentionCache):
+        return _continuous_batching_forward(module, query, key, value, attention_mask, dropout, scaling, cache, kwargs)
+
     # fp16 autocast (e.g. q / k fp32 after HF's rotary, v fp16): attention computes
     # in fp16, as SDPA does under autocast (no range check). K / V are converted
     # below, after the slicing to the valid slots of a pre-allocated cache.
@@ -689,6 +696,52 @@ def flash_attn_legacy_forward(
     return attn_output, None
 
 
+def _continuous_batching_forward(module, query, key, value, attention_mask, dropout, scaling, cache, kwargs):
+    """transformers' continuous batching (generate_batch, transformers serve; docs/PLAN.md P6.9): the
+    batch's tokens packed as one sequence [1, H, T, d] and a paged cache that cache.update fills.
+    Decode-only batches (block_table given, one new token per sequence): the new keys / values are
+    written into the paged cache and attended by flash_attn_with_kvcache; padding sequences of the
+    CUDA graphs (no key) are skipped. Otherwise (prefill, chunked prefill, mixed batches)
+    cache.update writes the new keys and returns each sequence's keys packed: the varlen kernel,
+    causal bottom-right aligned per sequence (the query rows of padding sequences are not written).
+    No host sync on either path (CUDA graphs). The batch's layout is all in cu_seq_lens_q / k: the
+    mask our builder makes for the packed sequence is not read (as flash_attention_2 there)."""
+    d = query.shape[-1]
+    if (query.dtype not in (torch.float16, torch.bfloat16)
+            or d not in SUPPORTED_HEAD_DIMS or value.shape[-1] != d or (dropout > 0.0 and module.training)
+            or (torch.is_grad_enabled() and query.requires_grad)):
+        raise NotImplementedError(
+            f"flash_attn_legacy: continuous batching runs fp16 / bf16 inference with head_dim in "
+            f"{SUPPORTED_HEAD_DIMS} (got {query.dtype}, head_dim {d}); use attn_implementation='sdpa' "
+            f"for the rest")
+    from .flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    key, value = cache.update(key_states=key, value_states=value, layer_idx=module.layer_idx, kwargs=kwargs)
+    window = kwargs.get("sliding_window")
+    common = dict(softmax_scale=scaling,
+                  causal=bool(kwargs["is_causal"] if kwargs.get("is_causal") is not None else module.is_causal),
+                  window_size=(-1, -1) if window is None else (window - 1, window - 1),
+                  softcap=float(kwargs.get("softcap") or 0.0), sinks=kwargs.get("s_aux"))
+    H_q = query.shape[1]
+    if kwargs.get("block_table") is not None:
+        # cache.update left the new keys as they were (written below, by the append)
+        if key.shape[2] != query.shape[2]:
+            raise RuntimeError(f"flash_attn_legacy: continuous batching decode expects the new keys only "
+                               f"({query.shape[2]}), got {key.shape[2]}")
+        q, k, v = (t.transpose(1, 2).reshape(-1, 1, t.shape[1], d) for t in (query, key, value))  # [n, 1, H, d]
+        n = q.shape[0]
+        cu_k = kwargs["cu_seq_lens_k"]
+        seqlens = cu_k[1:n + 1] - cu_k[:n] - 1  # keys before the new one; -1: a padding sequence
+        out = flash_attn_with_kvcache(q, kwargs["k_cache"], kwargs["v_cache"], k, v, cache_seqlens=seqlens,
+                                      block_table=kwargs["block_table"], **common)
+        return out.view(1, n, H_q, d), None
+    out = flash_attn_varlen_func(
+        query[0].transpose(0, 1), key[0].transpose(0, 1), value[0].transpose(0, 1),
+        kwargs["cu_seq_lens_q"].to(torch.int32), kwargs["cu_seq_lens_k"].to(torch.int32),
+        kwargs["max_length_q"], kwargs["max_length_k"], validate=False, **common)  # built by transformers
+    return out.unsqueeze(0), None
+
+
 def _add_bias_to_mask(bias, mask, kv_len, dtype):
     """SDPA attn_mask = additive position_bias (2D-4D, broadcastable to [B, H, q, kv],
     as T5's relative bias) + the mask (bool: True = keep, or additive), as HF's
@@ -839,6 +892,31 @@ def register():
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS.register("flash_attn_legacy", _flash_attn_legacy_mask)
         except (ImportError, AttributeError):
             pass  # older transformers: masks are built per model
+
+        # Step 1c: continuous batching's paged cache (transformers 5.x), recognised in
+        # flash_attn_legacy_forward (its class imported here: no import per call). Its decode
+        # fast path (a block table, the new keys written by flash_attn_with_kvcache) is offered
+        # to FA2 / FA3 names only: ours takes it too, when every attention type of the model
+        # supports block tables (transformers' own condition; it turns it off for sliding
+        # windows). Without it every decode step gathers each sequence's keys out of the cache.
+        try:
+            global _PagedAttentionCache
+            from transformers.generation.continuous_batching import PagedAttentionCache
+            from transformers.generation.continuous_batching import initialization as cb_init
+            _PagedAttentionCache = PagedAttentionCache
+            original_fast_path = cb_init.ensure_decode_fast_path_is_available
+
+            def _patched_fast_path(config, cb_config, user_requested):
+                if config._attn_implementation != "flash_attn_legacy":
+                    return original_fast_path(config, cb_config, user_requested)
+                if not all(cb_init.ATTN_TYPE_TO_ALLOCATOR[t].supports_block_table
+                           for t in cb_init.group_layers_by_attn_type(config)):
+                    cb_config.max_blocks_per_request = 0
+
+            if hasattr(cb_init, "ATTN_TYPE_TO_ALLOCATOR") and hasattr(cb_init, "group_layers_by_attn_type"):
+                cb_init.ensure_decode_fast_path_is_available = _patched_fast_path
+        except (ImportError, AttributeError):
+            pass
 
         # Step 2: Patch the validation to skip flash preload for our implementation.
         #

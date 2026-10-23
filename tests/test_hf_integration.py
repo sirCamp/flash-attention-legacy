@@ -192,6 +192,54 @@ def test_short_queries_with_padding_on_kvcache(monkeypatch, dtype):
         assert counter.decode_q_lens == [q_len] and counter.varlen_calls == [] and fallback_stats() == {}
 
 
+@pytest.mark.parametrize("arch,dtype,cuda_graph", [
+    ("llama", torch.float16, False), ("llama", torch.float16, True), ("llama", torch.bfloat16, False),
+    ("gemma2", torch.float16, False), ("gemma2", torch.float16, True), ("gpt_oss", torch.float16, False),
+    ("mistral", torch.float16, False)], ids=lambda x: str(x).replace("torch.float", "fp").replace("torch.b", "b"))
+def test_continuous_batching(monkeypatch, arch, dtype, cuda_graph):
+    """P6.9: transformers' continuous batching (generate_batch) on our kernels: prefills and mixed
+    batches on the varlen kernel (keys packed by the paged cache), decode-only batches on
+    flash_attn_with_kvcache writing the new keys into the paged cache (padding sequences of the
+    CUDA graphs skipped); sliding window (Gemma 2, gpt-oss, Mistral), softcap (Gemma 2) and sinks
+    (gpt-oss) on both paths; no fallback. Every generated token is FP32 eager's greedy choice on
+    the same prefix within the noise of eager in the same dtype (fp16 / bf16 rounding flips near-tied
+    steps of these tiny models, eager's own included); Llama fp16: equal to plain greedy generate.
+    (gpt-oss with CUDA graphs fails in transformers itself, eager included.)"""
+    from transformers import GenerationConfig
+    from transformers.generation.configuration_utils import ContinuousBatchingConfig
+    if arch == "llama":
+        base = tiny_llama(n_heads=8, n_kv_heads=2, initializer_range=_INIT["llama"])
+    else:
+        base = TINY_MODELS[arch](initializer_range=_INIT[arch])
+    model = load_impl(base, "flash_attn_legacy", dtype)
+    torch.manual_seed(0)
+    prompts = [torch.randint(0, base.config.vocab_size, (n,)).tolist() for n in (5, 17, 40, 3, 64, 9, 33, 120)]
+    new = 12
+    gc = GenerationConfig(max_new_tokens=new, do_sample=False, eos_token_id=-1, pad_token_id=0)
+    counter = KernelCounter(monkeypatch)
+    with torch.no_grad():
+        out = model.generate_batch(prompts, generation_config=gc,
+                                   continuous_batching_config=ContinuousBatchingConfig(use_cuda_graph=cuda_graph))
+    assert model.config._attn_implementation == "flash_attn_legacy" and fallback_stats() == {}
+    assert counter.varlen_calls
+    if arch == "llama":  # decode-only batches with a block table (transformers: full attention layers only)
+        assert counter.decode_calls and max(counter.decode_q_lens) == 1
+    got = [out[f"req_{i}"] for i in range(len(prompts))]
+    assert [o.error for o in got] == [None] * len(prompts)
+    gold, noise = load_impl(base, "eager", torch.float32), load_impl(base, "eager", dtype)
+    with torch.no_grad():
+        for p, o in zip(prompts, got):
+            ids = torch.tensor([p + o.generated_tokens], device="cuda")
+            lg, ln = (logits(m, ids)[len(p) - 1:-1] for m in (gold, noise))
+            chosen = lg.gather(1, torch.tensor(o.generated_tokens, device="cuda")[:, None])[:, 0]
+            gap = lg.max(-1).values - chosen  # 0 where the token is FP32's greedy choice
+            assert (gap <= 2 * (ln - lg).abs().max() + 1e-3).all(), f"{arch}: {gap.tolist()}"
+        if (arch, dtype) == ("llama", torch.float16):
+            plain = [model.generate(torch.tensor([p], device="cuda"), max_new_tokens=new, min_new_tokens=new,
+                                    do_sample=False)[0, len(p):].tolist() for p in prompts]
+            assert [o.generated_tokens for o in got] == plain
+
+
 def test_decode_fp32_falls_back():
     base = tiny_llama()
     model = load_impl(base, "flash_attn_legacy", torch.float32)

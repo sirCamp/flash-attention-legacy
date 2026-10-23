@@ -308,6 +308,42 @@ int flash_attn_num_splits(int blocks, int sms, int resident, int max_len, int ro
     return max(1, min(min(want, by_len), kMaxSplits));
 }
 
+namespace {
+
+// One block per (row, new token); each thread copies 16-byte chunks of the KV heads' rows.
+__global__ void __launch_bounds__(128) kvcache_append_kernel(KvAppendParams p) {
+    const int b = blockIdx.x / p.seqlen_new, t = blockIdx.x % p.seqlen_new;
+    const int start = p.cache_seqlens ? p.cache_seqlens[b] : p.uniform_seqlen;
+    if (start < 0 || start >= p.max_len - t) return;  // padding row, or past the cache (no int overflow)
+    const int j = start + t;
+    index_t kc = index_t(b) * p.kc_batch_stride + index_t(j) * p.kc_seq_stride;
+    index_t vc = index_t(b) * p.vc_batch_stride + index_t(j) * p.vc_seq_stride;
+    if (p.block_table) {
+        const int* table = p.block_table + index_t(b) * p.max_blocks;
+        const int blk = table[paged_block(j, p.block_size, p.block_shift)];
+        if (blk < 0 || blk >= p.num_blocks) return;
+        kc = paged_row_offset(table, j, p.block_size, p.block_shift, p.kc_batch_stride, p.kc_seq_stride);
+        vc = paged_row_offset(table, j, p.block_size, p.block_shift, p.vc_batch_stride, p.vc_seq_stride);
+    }
+    const index_t k = index_t(b) * p.k_batch_stride + index_t(t) * p.k_seq_stride;
+    const index_t v = index_t(b) * p.v_batch_stride + index_t(t) * p.v_seq_stride;
+    const int vecs = p.head_dim / 8;  // 16-byte chunks of 2-byte elements
+    for (int e = threadIdx.x; e < p.num_heads_k * vecs; e += blockDim.x) {
+        const int h = e / vecs, c = 8 * (e % vecs);
+        *reinterpret_cast<uint4*>(static_cast<uint16_t*>(p.k_cache) + kc + h * p.kc_head_stride + c) =
+            *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(p.k) + k + h * p.k_head_stride + c);
+        *reinterpret_cast<uint4*>(static_cast<uint16_t*>(p.v_cache) + vc + h * p.vc_head_stride + c) =
+            *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(p.v) + v + h * p.v_head_stride + c);
+    }
+}
+
+}  // namespace
+
+void flash_attn_kvcache_append_launch(const KvAppendParams& p, cudaStream_t stream) {
+    if (p.batch_size == 0 || p.seqlen_new == 0) return;
+    kvcache_append_kernel<<<p.batch_size * p.seqlen_new, 128, 0, stream>>>(p);
+}
+
 void flash_attn_split_combine(const SplitCombineParams& p, bool bf16, cudaStream_t stream) {
     if (bf16) launch_split_combine<Bf16Elem>(p, stream);
     else      launch_split_combine<HalfElem>(p, stream);

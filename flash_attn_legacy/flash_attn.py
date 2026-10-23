@@ -68,6 +68,10 @@ def _register_fakes():
         B, q_len, H_q, _ = q.shape
         return q.new_empty(q.shape), q.new_empty((B, H_q, q_len), dtype=torch.float32)
 
+    @register("flash_attn_legacy::kvcache_append")
+    def _(k_cache, v_cache, k, v, cache_seqlens, uniform_seqlen=-1, block_table=None):
+        return None
+
 
 _register_fakes()
 
@@ -583,6 +587,13 @@ def flash_attn_with_kvcache(
         k_cache, v_cache: [B, max_len, H_kv, d], q's dtype, read in place: any
             strides with a contiguous last dimension and 16-byte aligned rows
             (e.g. a HuggingFace cache [B, H_kv, N, d] passed as ``.transpose(1, 2)``)
+        k, v: [B, seqlen_new, H_kv, d] or None: new keys / values, written into
+            the caches in place at keys [cache_seqlens, cache_seqlens + seqlen_new)
+            of each row (paged caches through block_table) before the attention,
+            which then covers them too (as upstream). Needs cache_seqlens; rows
+            with a negative cache_seqlens (padding rows of a static batch) are
+            neither written nor attended (output 0), keys past the cache are not
+            written
         cache_seqlens: int or int32 [B]: end of the valid keys of each row
             (default max_len); keys [cache_leftpad, cache_seqlens) are attended.
             Tensor values are clamped to [0, max_len] on the GPU (no sync); an
@@ -614,8 +625,8 @@ def flash_attn_with_kvcache(
             cache_leftpad / causal / window (padding of any shape, holes included,
             without host sync; any batch stride, e.g. a [1, max_len] mask
             expanded). Indexed by key position (paged caches too)
-        k, v, rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes: not
-            supported yet (NotImplementedError when given)
+        rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes: not supported
+            yet (NotImplementedError when given)
 
     Returns:
         out [B, q_len, H_q, d] in q's dtype, or (out, lse) with return_softmax_lse
@@ -624,12 +635,14 @@ def flash_attn_with_kvcache(
     a tensor without grad_fn); rows with no visible key give lse = -inf; tensor
     cache_seqlens / cache_leftpad are clamped to the cache (upstream: undefined).
     """
-    given = dict(k=k, v=v, rotary_cos=rotary_cos, rotary_sin=rotary_sin, cache_batch_idx=cache_batch_idx,
+    given = dict(rotary_cos=rotary_cos, rotary_sin=rotary_sin, cache_batch_idx=cache_batch_idx,
                  alibi_slopes=alibi_slopes)  # not supported yet
     unsupported = [name for name, value in given.items() if value is not None]
     if unsupported:
         raise NotImplementedError(f"flash_attn_with_kvcache: {', '.join(unsupported)} not supported yet")
-    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k_cache, v_cache)):
+    if (k is None) != (v is None):
+        raise ValueError("flash_attn_with_kvcache: k and v go together")
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (q, k_cache, v_cache, k, v)):
         raise RuntimeError("flash_attn_with_kvcache is inference only (no autograd): run under torch.no_grad()")
     if q.dim() != 4 or k_cache.dim() != 4:
         raise ValueError("q must be [B, q_len, H_q, d] and k_cache / v_cache [B, max_len, H_kv, d]")
@@ -639,12 +652,20 @@ def flash_attn_with_kvcache(
             raise ValueError(f"block_table must be [B, max_blocks], got {tuple(block_table.shape)}")
     max_len = k_cache.shape[1] * (block_table.shape[1] if block_table is not None else 1)
     uniform_seqlen = -1  # an int cache_seqlens goes to the kernel as it is (no tensor to build)
+    seqlen_new = 0 if k is None else k.shape[1]
     if isinstance(cache_seqlens, numbers.Integral) and not isinstance(cache_seqlens, bool):
-        if not 0 <= cache_seqlens <= max_len:
-            raise ValueError(f"cache_seqlens={cache_seqlens} outside [0, max_len={max_len}]")
+        if not 0 <= cache_seqlens <= max_len - seqlen_new:
+            raise ValueError(f"cache_seqlens={cache_seqlens} (+ {seqlen_new} new keys) outside "
+                             f"[0, max_len={max_len}]")
         uniform_seqlen, cache_seqlens = int(cache_seqlens), None
     elif cache_seqlens is not None:
         cache_seqlens = _batch_int_tensor(cache_seqlens, "cache_seqlens", q.device)
+    if k is not None:
+        if uniform_seqlen < 0 and cache_seqlens is None:
+            raise ValueError("flash_attn_with_kvcache: k / v need cache_seqlens (where the new keys go)")
+        if k.dim() != 4 or k.shape[0] != q.shape[0] or k.dtype != q.dtype or v.shape != k.shape or v.dtype != q.dtype:
+            raise ValueError(f"flash_attn_with_kvcache: k / v must be [B={q.shape[0]}, seqlen_new, H_kv, d] in "
+                             f"q's dtype, got {tuple(k.shape)} {k.dtype} / {tuple(v.shape)} {v.dtype}")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if not isinstance(num_splits, numbers.Integral) or isinstance(num_splits, bool) or num_splits < 0:
@@ -653,6 +674,12 @@ def flash_attn_with_kvcache(
     sinks = _check_sinks(sinks, q.shape[2], q.device)
     if cache_leftpad is not None:
         cache_leftpad = _batch_int_tensor(cache_leftpad, "cache_leftpad", q.device)
+    if k is not None:  # after every check above: a call that raises leaves the cache as it was
+        _ops.kvcache_append(k_cache, v_cache, k, v, cache_seqlens, uniform_seqlen, block_table)
+        if cache_seqlens is None:
+            uniform_seqlen += seqlen_new
+        else:  # the new keys attended too; padding rows (negative) none
+            cache_seqlens = torch.where(cache_seqlens < 0, 0, cache_seqlens.clamp_max(max_len) + seqlen_new)
     out, lse = _ops.with_kvcache(q, k_cache, v_cache, cache_seqlens, softmax_scale, causal, *window_size, softcap,
                                  sinks, num_splits, cache_leftpad, block_table, key_mask, uniform_seqlen)
     return (out, lse) if return_softmax_lse else out

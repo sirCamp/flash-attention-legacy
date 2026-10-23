@@ -1533,6 +1533,69 @@ class TestKVCache:
         ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), causal=True)
         self._check(out.float() / 1e6, lse, ref_out / 1e6, ref_lse, torch.bfloat16)
 
+    @pytest.mark.parametrize("paged", [0, 32, 48], ids=["contiguous", "paged32", "paged48"])
+    @pytest.mark.parametrize("seqlen_new,H_q", [(1, 8), (3, 4), (2, 16)])  # 4, 6, 16 rows per KV head
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_append(self, head_dim, paged, seqlen_new, H_q, dtype):
+        """k / v written into the cache at cache_seqlens (paged: through block_table), then attended:
+        as writing them by hand and attending cache_seqlens + seqlen_new keys. A row with a negative
+        cache_seqlens (a padding row; its block_table row -1) is neither written nor attended; nothing
+        else in the cache changes; keys past the cache are dropped. An int cache_seqlens writes every
+        row at the same place."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(4, seqlen_new, H_q, 2, head_dim, 96, dtype, "bshd", seed=11)
+        torch.manual_seed(12)
+        k_new, v_new = (torch.randn(4, seqlen_new, 2, head_dim, device="cuda", dtype=dtype) for _ in range(2))
+        start = [0, 40, -1, 97 - seqlen_new]  # row 3: its last new key past the cache (seqlen_new > 1)
+        kw = dict(causal=True, return_softmax_lse=True)
+        for cs in (torch.tensor(start, dtype=torch.int32, device="cuda"), 30):
+            starts = start if isinstance(cs, torch.Tensor) else [30] * 4
+            k_ref, v_ref = k.clone(), v.clone()
+            for b, s in enumerate(starts):
+                if s >= 0:
+                    m = min(seqlen_new, 96 - s)
+                    k_ref[b, s:s + m], v_ref[b, s:s + m] = k_new[b, :m], v_new[b, :m]
+            ends = torch.tensor([min(s + seqlen_new, 96) if s >= 0 else 0 for s in starts], dtype=torch.int32,
+                                device="cuda")
+            if paged:
+                kc, vc, table = self._paged(k, v, paged)
+                if isinstance(cs, torch.Tensor):
+                    table[2] = -1  # the padding row owns no block
+                kr, vr, _ = self._paged(k_ref, v_ref, paged)
+            else:
+                kc, vc, table, kr, vr = k.clone(), v.clone(), None, k_ref, v_ref
+            spare = kc.isnan()  # paged spare blocks: never written
+            with torch.no_grad():
+                out, lse = flash_attn_with_kvcache(q, kc, vc, k_new, v_new, cache_seqlens=cs, block_table=table, **kw)
+                ref_out, ref_lse = flash_attn_with_kvcache(q, kr, vr, cache_seqlens=ends,
+                                                           block_table=None if table is None else table.abs(), **kw)
+            assert torch.equal(kc.isnan(), spare)
+            assert torch.equal(torch.nan_to_num(kc), torch.nan_to_num(kr))
+            assert torch.equal(torch.nan_to_num(vc), torch.nan_to_num(vr))
+            assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
+            if isinstance(cs, torch.Tensor):
+                assert (out[2] == 0).all() and torch.isinf(lse[2]).all()
+
+    def test_append_skips_bad_blocks(self):
+        """The append alone: block entries -1 or past the cache's blocks are not written (the
+        attention would read them: undefined, as upstream), the other rows are."""
+        q, k, v = self._case(3, 1, 4, 1, 64, 64, torch.float16, "bshd", seed=13)  # H_kv = 1
+        kb, vb, table = self._paged(k, v, 16)
+        table[0, 1] = -1
+        table[1, 1] = kb.shape[0]  # one past the last block
+        before_k, before_v = kb.clone(), vb.clone()
+        k_new = torch.randn(3, 2, 1, 64, device="cuda", dtype=torch.float16)
+        v_new = torch.randn_like(k_new)
+        cs = torch.tensor([16, 16, 16], dtype=torch.int32, device="cuda")  # keys 16, 17: block 1 of each row
+        torch.ops.flash_attn_legacy.kvcache_append(kb, vb, k_new, v_new, cs, -1, table)
+        same = (kb == before_k) | (kb.isnan() & before_k.isnan())
+        same &= (vb == before_v) | (vb.isnan() & before_v.isnan())
+        changed = ~same.all(-1).all(-1)  # per (block, slot)
+        expect = torch.zeros_like(changed)
+        expect[table[2, 1], :2] = True
+        assert torch.equal(changed, expect)
+        assert torch.equal(kb[table[2, 1], :2], k_new[2]) and torch.equal(vb[table[2, 1], :2], v_new[2])
+
     def test_seqlens_beyond_the_cache(self):
         """Tensor cache_seqlens are clamped to [0, max_len] on the GPU (never read
         past the cache); an int outside the range raises."""
@@ -1792,9 +1855,14 @@ class TestKVCache:
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(1, 1, 4, 4, 64, 32, torch.float16, "bshd")
         with torch.no_grad():
-            for kw in ({"k": k}, {"cache_batch_idx": torch.zeros(1, dtype=torch.int32, device="cuda")}):
-                with pytest.raises(NotImplementedError):
-                    flash_attn_with_kvcache(q, k, v, **kw)
+            with pytest.raises(NotImplementedError):
+                flash_attn_with_kvcache(q, k, v, cache_batch_idx=torch.zeros(1, dtype=torch.int32, device="cuda"))
+            with pytest.raises(ValueError, match="together"):
+                flash_attn_with_kvcache(q, k, v, k=k[:, :1])
+            with pytest.raises(ValueError, match="cache_seqlens"):
+                flash_attn_with_kvcache(q, k, v, k[:, :1], v[:, :1])
+            with pytest.raises(ValueError, match="outside"):
+                flash_attn_with_kvcache(q, k, v, k[:, :2], v[:, :2], cache_seqlens=31)
             buf = torch.randn(32 * 260, device="cuda", dtype=torch.float16)
             k_odd = buf.as_strided((1, 32, 4, 64), (32 * 260, 260, 64, 1))  # key rows 260 elements apart
             with pytest.raises(RuntimeError, match="multiples of 8"):

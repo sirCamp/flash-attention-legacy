@@ -112,6 +112,7 @@ The integration decides **per attention call** whether our kernel can run, and n
 | Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
 | Decode (`q_len == 1`): dynamic / static caches, left padding, sliding window, softcap, sinks, FP16 or BF16 caches | decode kernel (`flash_attn_with_kvcache`, split-KV, the cache read in place) |
 | Short queries after a longer cache (assisted / speculative decoding and prompt lookup verification steps, q_len 2-64), MQA / GQA > 8:1 decode | `flash_attn_with_kvcache`: the decode kernel up to 8 query rows per KV head, beyond it the forward kernels with key splits and packed GQA rows (FP16 on the architecture's body, BF16 on the CUDA-core one, read as FP32; padding as a key mask) |
+| Continuous batching (`model.generate_batch`, `init_continuous_batching`, `transformers serve`): paged cache, eager or CUDA graphs | prefill and mixed batches on the varlen kernel, decode-only batches on `flash_attn_with_kvcache` writing the new keys into the paged cache (`k`, `v`) |
 | Padding with holes inside a row (prefill; decode handles it on the kernel), unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast, FP32 decode | SDPA fallback |
 | Logit softcapping (Gemma 2) | kernel (`softcap`) |
 | Attention sinks (gpt-oss `s_aux`) | kernel (`sinks`, trainable) |
@@ -353,7 +354,8 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] Sliding window in the kernel (forward and backward, out-of-window blocks skipped)
 - [x] Logit softcapping in the kernel (forward and backward)
 - [x] Attention sinks in the kernel (forward and backward, sink gradient)
-- [x] Decode kernel (`flash_attn_with_kvcache`: split-KV, GQA, paged caches, key masks) and HF decode steps on it
+- [x] Decode kernel (`flash_attn_with_kvcache`: split-KV, GQA, paged caches, key masks, new keys appended with `k` / `v`) and HF decode steps on it
+- [x] transformers' continuous batching (`generate_batch`, paged cache, CUDA graphs) on the kernels
 - [x] `torch.compile` (dispatcher ops with fake implementations; compiled HF decode steps without graph breaks)
 - [x] BF16 / FP32 inference
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
