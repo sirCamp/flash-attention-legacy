@@ -154,8 +154,8 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
         if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype:
             return "decode", f" ({query.dtype})"
         rows = query.shape[1] // key.shape[1]
-        if rows > DECODE_MAX_ROWS:
-            return "decode", f" ({rows} query heads per KV head)"
+        if rows > DECODE_MAX_ROWS and query.dtype != torch.float16:  # beyond: the forward with key splits, fp16
+            return "decode", f" ({rows} query heads per KV head, {query.dtype})"
         if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
             return "decode", " (gradients)"
         if not (_decode_layout_ok(key) and _decode_layout_ok(value)):
@@ -561,6 +561,10 @@ def flash_attn_legacy_forward(
             # A static cache's empty slots follow the query: causal / window aligned to
             # the last kept key, as cache_seqlens computed on the device (no sync)
             decode_seqlens = (decode_mask * torch.arange(1, kv_len + 1, device=query.device)).amax(1).int()
+        if decode_mask is not None and H_q // key.shape[1] > DECODE_MAX_ROWS:
+            # beyond the decode kernel's rows flash_attn_with_kvcache takes no key mask yet
+            reason, detail = "decode", f" ({H_q // key.shape[1]} query heads per KV head with a key mask)"
+            decode_mask = decode_seqlens = None
     elif reason is None and padding_2d:  # the unpad plan's host sync only for the kernel
         unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
         if unpad is None:

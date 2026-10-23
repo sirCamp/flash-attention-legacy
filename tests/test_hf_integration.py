@@ -155,6 +155,31 @@ def test_short_queries_on_kvcache(monkeypatch, dtype):
     assert fallback_stats() == {}
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_decode_mqa_beyond_decode_rows(monkeypatch, dtype):
+    """P6.8: 16 query heads per KV head at q_len 1 (beyond the decode kernel's 8 rows): fp16 on
+    flash_attn_with_kvcache (the forward with key splits), every step within the noise of FP32
+    eager; bf16 there falls back (recorded)."""
+    base = tiny_llama(n_heads=16, n_kv_heads=1)
+    ids = torch.randint(0, base.config.vocab_size, (1, 40), device="cuda")
+    kw = dict(max_new_tokens=6, min_new_tokens=6, do_sample=False, return_dict_in_generate=True, output_logits=True)
+
+    def gen(impl, dt):
+        with torch.no_grad():
+            return load_impl(base, impl, dt).generate(ids, **kw)
+
+    gold, noise = gen("eager", torch.float32), gen("eager", dtype)
+    counter = KernelCounter(monkeypatch)
+    out = gen("flash_attn_legacy", dtype)
+    steps = kw["max_new_tokens"] - 1
+    if dtype == torch.float16:
+        assert len(counter.decode_calls) == steps * base.config.num_hidden_layers and fallback_stats() == {}
+    else:
+        assert counter.decode_calls == [] and fallback_stats() == {"decode": steps * base.config.num_hidden_layers}
+    for o, g, n in zip(out.logits, gold.logits, noise.logits):
+        assert_close_to_gold(o.float(), g.float(), n.float(), f"MQA 16:1 decode {dtype}")
+
+
 def test_decode_fp32_falls_back():
     base = tiny_llama()
     model = load_impl(base, "flash_attn_legacy", torch.float32)

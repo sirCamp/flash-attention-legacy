@@ -159,6 +159,12 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   2080 Ti 56.2 / 49.7 / 50.2, P100 23.3 / 19.1 / 21.1, 1080 Ti 16.2 / 9.5 / 14.8: ours fastest everywhere, outputs identical to
   plain greedy, no fallback (at 1.5k the attention is a small part of the step; the kernel gains grow with the cache).
 
+## Step (c), done
+- HF decode (q_len 1) with more than 8 query heads per KV head (MQA, GQA 12:1 / 16:1) goes to `flash_attn_with_kvcache` (the
+  packed forward) in FP16 without a padding mask; BF16 or a key mask keep the SDPA fallback (`decode` reason, recorded). Test:
+  an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
+- Still open (beyond 8 rows): BF16, `cache_leftpad` / `key_mask`, paged caches (P6.9), sinks with packed rows.
+
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache
   read) on SM 7.x; on Pascal the larger of that and the fp32 compute floor (4 d R N H_kv FLOP: q_len 16, GQA 4, 4k, d 128,
