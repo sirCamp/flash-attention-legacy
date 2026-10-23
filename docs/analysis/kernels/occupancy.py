@@ -27,8 +27,9 @@ ARCH = {
     "sm_70": dict(name="V100", smem_sm=96 * 1024, smem_blk=96 * 1024, warps=64, blocks=32, regs=65536),
     "sm_75": dict(name="T4", smem_sm=64 * 1024, smem_blk=64 * 1024, warps=32, blocks=16, regs=65536),
 }
-BODIES = {"VoltaFwd": "fwd_volta", "PascalFwd": "fwd_pascal", "BwdWmma": "bwd_wmma", "BwdSimt": "bwd_simt"}
-TENSOR_CORE = ("fwd_volta", "bwd_wmma")  # stubs on sm_6x
+BODIES = {"VoltaFwd": "fwd_volta", "TuringFwd": "fwd_turing", "PascalFwd": "fwd_pascal", "BwdWmma": "bwd_wmma",
+          "BwdMma": "bwd_mma", "BwdSimt": "bwd_simt"}
+MIN_ARCH = {"fwd_volta": 70, "bwd_wmma": 70, "fwd_turing": 75, "bwd_mma": 75}  # stubs below
 
 
 def occ(arch, regs, smem, warps_blk):
@@ -77,7 +78,8 @@ for f in sorted(os.listdir(RAW)):
 names = demangle(sorted({e["mangled"] for e in entries}))
 
 # 2. tiles: block size and dynamic smem from the headers
-tile_re = re.compile(r"flash_attn_legacy::((?:Fwd|Bwd)Tile(?:Simt|Wmma)<[^>]*>)")
+tile_re = re.compile(r"flash_attn_legacy::((?:Fwd|Bwd)Tile(?:Simt|Wmma|Mma)<[^>]*>)")
+decode_re = re.compile(r"decode_kernel<[^,]*::(\w+)Elem, (\d+), (\d+), (true|false)>")
 tiles = sorted({tile_re.search(n).group(1) for n in names.values() if tile_re.search(n)})
 src = os.path.join(OUT, "tile_report.cu")
 with open(src, "w") as fh:
@@ -100,10 +102,19 @@ for e in entries:
     name = names[e["mangled"]]
     if "precompute_D" in name:
         kind, tile, warps, dyn = "precompute_D", "-", 8, 0
+    elif "decode_combine" in name:  # 256 threads; fp16 row (bf16 alike)
+        if "Bf16Elem" in name:
+            continue
+        kind, tile, warps, dyn = "decode_combine", "-", 8, 0
+    elif "decode_kernel" in name:  # 4 warps, static shared memory only; fp16 rows (bf16 alike)
+        dt, d, r, paged = decode_re.search(name).groups()
+        if dt != "Half":
+            continue
+        kind, tile, warps, dyn = "decode", "d=%s, R=%s%s" % (d, r, ", paged" if paged == "true" else ""), 4, 0
     else:
         body = re.search(r"flash_attn_legacy::(\w+)>\(", name).group(1)
         kind = BODIES[body] + ("_varlen" if "varlen_kernel" in name else "")
-        if BODIES[body] in TENSOR_CORE and e["arch"] in ("sm_60", "sm_61"):
+        if int(e["arch"][3:]) < MIN_ARCH.get(BODIES[body], 0):
             continue
         tile = tile_re.search(name).group(1)
         warps, dyn = tile_info[tile]
