@@ -326,9 +326,13 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.Q = p.Q + b_idx * p.q_batch_stride + h0 * p.q_head_stride;  // token 0 (rows: fwd_band_run)
         a.q_stride = p.q_seq_stride;
         a.q_head_stride = p.q_head_stride;
-        a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride;
+        // keys [start, end) of the row (left padding, cache_seqlens): K / V from `start`, so causal /
+        // window stay aligned to `end` as in the decode kernel
+        const int end = p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
+        const int start = p.leftpad_k ? min(max(p.leftpad_k[b_idx], 0), end) : 0;
+        a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride + index_t(start) * p.k_seq_stride;
         a.k_stride = p.k_seq_stride;
-        a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride;
+        a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride + index_t(start) * p.v_seq_stride;
         a.v_stride = p.v_seq_stride;
         a.O = nullptr;
         a.o_stride = 0;
@@ -337,7 +341,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.q_row_start = q_row_start;
         a.valid_q = min(Tile::Br, rows - q_row_start);
         a.seq_len_q = p.seq_len_q;  // tokens
-        a.seq_len_k = p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
+        a.seq_len_k = end - start;
         a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
         a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
         a.softcap = p.softcap;

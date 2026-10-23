@@ -1387,6 +1387,27 @@ class TestKVCache:
         ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(head_dim), causal=True, sinks=sinks)
         self._check(out, lse, ref_out, ref_lse, torch.float16)
 
+    @pytest.mark.parametrize("window", [(-1, 0), (24, 0)], ids=["causal", "window"])
+    @pytest.mark.parametrize("num_splits", [1, 4], ids=["one_split", "splits4"])
+    def test_forward_rows_leftpad(self, head_dim, window, num_splits):
+        """cache_leftpad beyond 8 rows per KV head: keys [leftpad, seqlens) per row, causal / window
+        aligned to seqlens (padding never read: NaN there)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(4, 6, 8, 2, head_dim, 200, torch.float16, "bhsd_view", seed=4)  # 24 rows per KV head
+        seqlens, leftpad = [200, 150, 90, 40], [0, 37, 89, 40]  # row 3: no key (leftpad == seqlens)
+        for b, n in enumerate(leftpad):
+            k[b, :n] = float("nan")
+            v[b, :n] = float("nan")
+        self._poison(k, v, seqlens)
+        cs, lp = (torch.tensor(x, dtype=torch.int32, device="cuda") for x in (seqlens, leftpad))
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, cache_leftpad=lp, causal=True,
+                                               window_size=window, num_splits=num_splits, return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(torch.nan_to_num(q), torch.nan_to_num(k), torch.nan_to_num(v), seqlens,
+                                     1.0 / math.sqrt(head_dim), causal=True, window=window, leftpad=leftpad)
+        self._check(out, lse, ref_out, ref_lse, torch.float16)
+        assert (out[3] == 0).all()
+
     @pytest.mark.parametrize("q_len,H_q,H_kv", [(1, 16, 1), (64, 4, 2)])
     def test_forward_rows_32k(self, q_len, H_q, H_kv):
         from flash_attn_legacy import flash_attn_with_kvcache
@@ -1424,8 +1445,6 @@ class TestKVCache:
             kb, vb, table = self._paged(k, v, 16)
             with pytest.raises(NotImplementedError, match="contiguous"):
                 flash_attn_with_kvcache(q, kb, vb, block_table=table)
-            with pytest.raises(NotImplementedError, match="leftpad"):
-                flash_attn_with_kvcache(q, k, v, cache_leftpad=torch.zeros(2, dtype=torch.int32, device="cuda"))
             with pytest.raises(NotImplementedError, match="key_mask"):
                 flash_attn_with_kvcache(q, k, v, key_mask=torch.ones(2, 64, dtype=torch.bool, device="cuda"))
 

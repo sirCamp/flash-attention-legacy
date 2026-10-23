@@ -84,11 +84,13 @@ struct FlashAttnParams {
     int window_left, window_right;
 
     // Inference against a KV cache (flash_attn_with_kvcache beyond the decode kernel's
-    // rows; O_part != nullptr selects that kernel variant): seqlens_k [B] = the keys of
-    // each batch row (clamped to [0, N_kv] on the device), nullptr = N_kv; each row's
+    // rows; O_part != nullptr selects that kernel variant): seqlens_k [B] = the end of the
+    // keys of each batch row (clamped to [0, N_kv] on the device), nullptr = N_kv;
+    // leftpad_k [B] = their first key (left padding, clamped to [0, end]), nullptr = 0; each row's
     // visible keys go in num_splits (>= 1) splits, whose partials replace O / L
     // (flash_attn_split.h layout, rows (b, h, query) of N_q queries) for the combine.
     const int* __restrict__ seqlens_k;
+    const int* __restrict__ leftpad_k;
     int num_splits;
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain

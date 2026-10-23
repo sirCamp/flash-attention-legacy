@@ -163,7 +163,8 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
 - HF decode (q_len 1) with more than 8 query heads per KV head (MQA, GQA 12:1 / 16:1) goes to `flash_attn_with_kvcache` (the
   packed forward) in FP16 without a padding mask; BF16 or a key mask keep the SDPA fallback (`decode` reason, recorded). Test:
   an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
-- Still open (beyond 8 rows): BF16, `cache_leftpad` / `key_mask`, paged caches (P6.9), sinks with packed rows.
+- Still open (beyond 8 rows): BF16, `key_mask`, paged caches (P6.9), sinks with packed rows. `cache_leftpad` done: the cache
+  kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 
 ## Step (d), done
 - `benchmarks/speculative.py` (kernel: one verification call per path; generate: plain / prompt lookup / assisted end to end),
