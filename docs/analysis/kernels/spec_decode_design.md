@@ -135,7 +135,7 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   and the kernel): a block covers rows (token, query head of the group) of one KV head, token-major; `fwd_row` is the one place
   rows split into (token, head offset): the Q loader (`load_tile_g2s_rows`, the tile loader with a row-address function; the
   one-stride loader is its wrapper), the KeyWindow masks and the band / block key bounds (`fwd_token<kCache>`), the partial rows
-  (`fwd_part_row`). Calls with sinks run unpacked (one sink per query head; `BandSoftmax::init` takes one per thread).
+  (`fwd_part_row`). Sinks: one per row (`BandSoftmax::init_rows`, see step c).
 - Split count, measured on packed shapes (`split_sweep.py`): the cap of step (a), partials within 1/4 of the K / V read, kept
   too few splits once packing shrank the grid (GQA 16/2, 1.5k cache, q_len 11: 2 KV heads x 1-3 blocks; P100 351 us at the
   automatic count against 68 with 16 splits). Now at least max(128, rows) keys per split (partials within ~2x of the read) and
@@ -163,7 +163,8 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
 - HF decode (q_len 1) with more than 8 query heads per KV head (MQA, GQA 12:1 / 16:1) goes to `flash_attn_with_kvcache` (the
   packed forward) in FP16 without a padding mask; BF16 or a key mask keep the SDPA fallback (`decode` reason, recorded). Test:
   an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
-- Still open (beyond 8 rows): BF16, `key_mask`, paged caches (P6.9), sinks with packed rows. `cache_leftpad` done: the cache
+- Still open (beyond 8 rows): BF16, `key_mask`, paged caches (P6.9). Sinks with packed rows done: `fwd_softmax_init`
+  gives each row of the cache kernel its query head's sink (split 0; the plain forward keeps the head's one). `cache_leftpad` done: the cache
   kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 
 ## Step (d), done

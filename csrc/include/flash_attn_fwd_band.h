@@ -55,6 +55,7 @@ struct FwdBlockArgs {
     float* __restrict__ L_part;
     int rows_per_token;             // the cache kernel: 1, or H_q / H_kv with packed GQA rows
     index_t q_head_stride;
+    const float* __restrict__ sinks;  // the cache kernel: sinks of heads h0.. (split 0), else nullptr
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
@@ -151,6 +152,15 @@ struct BandSoftmax {
         for (int r = 0; r < ROWS; r++) { m[r] = sink_log2; sum[r] = share; }
     }
 
+    // One sink per row (packed GQA rows of the cache kernel: rows of different query heads)
+    __device__ __forceinline__ void init_rows(const float (&sink_log2)[ROWS]) {
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            m[r] = sink_log2[r];
+            sum[r] = sink_log2[r] > -INFINITY ? 1.0f / ROW_LANES : 0.0f;
+        }
+    }
+
     // s: this lane's scores of the block, already scaled to the log2 domain and
     // -inf where masked. Turns them into p = exp2(s - m) in place and returns the
     // factor alpha[r] the row's O accumulator must be multiplied by.
@@ -193,6 +203,21 @@ struct BandSoftmax {
         }
     }
 };
+
+// The softmax state of a thread's rows (row(r): absolute row of row r): the head's sink in the plain
+// forward, one sink per row in the cache kernel (each row's query head; split 0 only).
+template <bool kCache, int ROWS, int ROW_LANES, typename RowOf>
+__device__ __forceinline__ void fwd_softmax_init(BandSoftmax<ROWS, ROW_LANES>& softmax, const FwdBlockArgs& a,
+                                                 RowOf&& row) {
+    if constexpr (kCache) {
+        float s[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) s[r] = a.sinks ? a.sinks[fwd_row(a, row(r)).head] * kLog2e : -INFINITY;
+        softmax.init_rows(s);
+    } else {
+        softmax.init(a.sink_log2);
+    }
+}
 
 // The K/V loop of one Q block. The caller supplies:
 //   load_q()          global -> shared Q (published by the first barrier)
@@ -345,7 +370,8 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
         a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
         a.softcap = p.softcap;
-        a.sink_log2 = p.sinks && split == 0 ? p.sinks[h0] * kLog2e : -INFINITY;  // once per row (no packing with sinks)
+        a.sink_log2 = -INFINITY;  // per row: a.sinks (fwd_softmax_init)
+        a.sinks = p.sinks && split == 0 ? p.sinks + h0 : nullptr;  // the sink once per row
         a.window_left = p.window_left;
         a.window_right = p.window_right;
         a.split = split;
@@ -390,6 +416,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.L_part = nullptr;
         a.rows_per_token = 1;
         a.q_head_stride = 0;
+        a.sinks = nullptr;
     }
     Body::template run<Tile, kCache>(a);
 }
@@ -435,6 +462,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.L_part = nullptr;
     a.rows_per_token = 1;
     a.q_head_stride = 0;
+    a.sinks = nullptr;
     Body::template run<Tile, false>(a);
 }
 

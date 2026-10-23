@@ -804,8 +804,8 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         f.sinks = data_or_null(sink);
         std::tie(f.window_left, f.window_right) = key_window(is_causal, window_left, window_right, q_len, max_len);
         // Packed GQA rows: the q_len tokens x H_q / H_kv query heads of a KV head in one block (its K / V
-        // read once for them); not with sinks (one per query head; those calls keep a block per head)
-        f.pack_gqa = !sink.defined() && H_q > H_kv;
+        // read once for them; sinks one per row)
+        f.pack_gqa = H_q > H_kv;
         const int rpt = gqa_rows_per_token(f.pack_gqa, H_q, H_kv);
         // Splits: each block reads its KV head's cache for its q_len * rpt rows (resident blocks per SM: 4 on
         // Pascal, compute bound on small tiles; 1 on SM 7.x, bandwidth bound on large ones)

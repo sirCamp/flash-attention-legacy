@@ -94,7 +94,7 @@ struct FlashAttnParams {
     int num_splits;
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
-    int pack_gqa;                 // rows of the H_q / H_kv query heads of a KV head in one block (no sinks)
+    int pack_gqa;                 // rows of the H_q / H_kv query heads of a KV head in one block
 };
 
 // ---------------------------------------------------------------------------

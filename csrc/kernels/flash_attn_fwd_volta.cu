@@ -81,7 +81,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     #pragma unroll
     for (int t = 0; t < O_TILES; t++) wmma::fill_fragment(O[t], 0.0f);
     BandSoftmax<1, 2> softmax;
-    softmax.init(a.sink_log2);
+    fwd_softmax_init<kCache>(softmax, a, [&](int) { return q_row; });
 
     // O rows times per-row factors published in row_scale
     auto scale_o = [&]() {

@@ -62,7 +62,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         for (int t = 0; t < TD; t++) O[i][t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
     BandSoftmax<4, 8> softmax;
-    softmax.init(a.sink_log2);
+    fwd_softmax_init<kCache>(softmax, a, [&](int i) { return a.q_row_start + row0 + i; });
 
     auto step = [&](auto mask_tag, int kv_start) {
         constexpr bool kMask = decltype(mask_tag)::value;
