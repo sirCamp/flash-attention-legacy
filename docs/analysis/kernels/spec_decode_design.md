@@ -111,6 +111,24 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   The splits fill the grid where it was starved (Pascal, the V100's 80 and the 2080 Ti's 68 SMs); on the T4 the forward was already bandwidth
   bound and each query head re-reads its KV head's cache (rep x the traffic): that is step (b).
 
+- HF: q_len 2..SHORT_Q_MAX (64) new tokens against a longer cache go to `flash_attn_with_kvcache` (the cache read in place: the
+  decode kernel up to 8 rows per KV head, the kCache forward beyond; inference, no padding; bf16 beyond 8 rows stays on the
+  forward). End to end, HF generate as in "Why" (Qwen2.5-3B, 1.5k prompt, 128 tokens, outputs identical to plain greedy, no
+  fallback), tok/s ours (before -> after) / SDPA / eager:
+
+| GPU | plain | assisted (draft) | prompt lookup |
+|---|---|---|---|
+| P100 | 27.0 / 20.6 / 23.0 | 21.4 -> 23.4 / 19.3 / 21.4 | 15.7 -> 23.1 / 19.1 / 21.1 |
+| T4 | 25.8 / 20.2 / 23.0 | 26.5 -> 26.1 / 21.7 / 22.4 | 32.0 -> 39.5 / 33.3 / 34.5 |
+| 1080 Ti | 13.3 / 11.5 / 14.5 | 12.6 / 8.5 / 13.2 | 16.1 / 9.5 / 15.5 |
+| 2080 Ti | 37.3 / 32.0 / 33.7 | 36.0 / 32.1 / 31.1 | 56.4 / 49.5 / 48.1 |
+| V100 | 24.2 / 26.9 / 28.9 | 24.5 / 27.7 / 28.6 | 36.9 / 43.0 / 43.3 |
+
+  Speculation now helps (or matches) with our backend everywhere but plain decoding stays ahead on the P100 here (a 3B model on
+  a 1.5k prompt; the draft / lookup acceptance decides). On the V100 even plain decoding trails: a 36-layer model at B=1 is host
+  bound there and our Python path costs ~30 us per call (`compile_design.md`): a separate item (host overhead of the HF decode
+  path), not a kernel one.
+
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache
   read) on SM 7.x; on Pascal the larger of that and the fp32 compute floor (4 d R N H_kv FLOP: q_len 16, GQA 4, 4k, d 128,

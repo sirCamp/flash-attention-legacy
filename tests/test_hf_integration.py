@@ -127,6 +127,34 @@ def test_decode_4d_mask(monkeypatch, case):
     assert fallback_stats() == expected
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_short_queries_on_kvcache(monkeypatch, dtype):
+    """P6.8: the verification steps of prompt lookup (q_len 2..6 after a longer cache)
+    read the cache through flash_attn_with_kvcache, never through the forward (bf16 with
+    more than DECODE_MAX_ROWS rows per KV head stays on the forward); output identical to
+    plain greedy, no fallback."""
+    base = tiny_llama(n_heads=8, n_kv_heads=2)  # 4 query heads per KV head: q_len 3+ beyond 8 rows
+    model = load_impl(base, "flash_attn_legacy", dtype)
+    torch.manual_seed(0)
+    chunk = torch.randint(0, base.config.vocab_size, (1, 12), device="cuda")
+    ids = torch.cat([chunk, chunk, chunk[:, :6]], 1)  # repeats: prompt lookup proposes candidates
+    kw = dict(max_new_tokens=12, min_new_tokens=12, do_sample=False)
+    with torch.no_grad():
+        plain = model.generate(ids, **kw)
+        counter = KernelCounter(monkeypatch)
+        out = model.generate(ids, prompt_lookup_num_tokens=5, **kw)
+    assert torch.equal(out, plain)
+    short_on_forward = [(q, kv) for q, kv in counter.calls if 1 < q < kv]
+    rows_per_kv = 4
+    if dtype == torch.float16:
+        assert short_on_forward == []
+    else:  # bf16: only the steps with more than 8 rows per KV head
+        assert all(q * rows_per_kv > integrations.DECODE_MAX_ROWS for q, _ in short_on_forward)
+    if dtype == torch.float16:  # some verification steps ran here (bf16: all beyond 8 rows, on the forward)
+        assert max(counter.decode_q_lens) > 1
+    assert fallback_stats() == {}
+
+
 def test_decode_fp32_falls_back():
     base = tiny_llama()
     model = load_impl(base, "flash_attn_legacy", torch.float32)
@@ -501,23 +529,34 @@ def test_static_cache_stepwise(monkeypatch, arch, offloading):
     # The kernel must run on the multi-token steps of every layer: full-attention
     # layers on K/V sliced to the filled part of the cache (kv == tokens so far),
     # sliding layers (P4.1) on the filled slots of their sliding cache (the last
-    # W - 1 tokens plus the new ones), with the window.
+    # W - 1 tokens plus the new ones), with the window. A step's tokens against a
+    # longer cache (P6.8: short queries) go to flash_attn_with_kvcache, the others
+    # to the forward.
     types = layer_types(base.config)
     W = getattr(base.config, "sliding_window", None) or 0  # 0: no sliding layers (llama)
-    expected = Counter()
+    expected, short = Counter(), Counter()
+    sliding_forward = sliding_short = 0
     for i, n in enumerate(_STEPS):
         if n > 1:
             total = sum(_STEPS[:i + 1])
-            expected[(n, total)] += types.count("full_attention")
-            expected[(n, min(total, W - 1 + n))] += types.count("sliding_attention")
+            for kv, layers, sliding in ((total, types.count("full_attention"), False),
+                                        (min(total, W - 1 + n), types.count("sliding_attention"), True)):
+                if not layers:
+                    continue
+                on_kvcache = n < kv and n <= integrations.SHORT_Q_MAX
+                (short if on_kvcache else expected)[(n, kv)] += layers
+                if sliding and on_kvcache:
+                    sliding_short += layers
+                elif sliding:
+                    sliding_forward += layers
     assert Counter(counter.calls) == +expected
-    sliding_calls = sum(n > 1 for n in _STEPS) * types.count("sliding_attention")
-    assert [w for w in counter.windows if w != (-1, -1)] == [(W - 1, W - 1)] * sliding_calls
+    assert Counter((q, kv) for q, (_, kv) in zip(counter.decode_q_lens, counter.decode_calls) if q > 1) == +short
+    assert [w for w in counter.windows if w != (-1, -1)] == [(W - 1, W - 1)] * sliding_forward
     # single-token steps on the decode kernel, sliding layers with the window
     decode_steps = sum(n == 1 for n in _STEPS)
-    assert len(counter.decode_calls) == decode_steps * len(types) and fallback_stats() == {}
+    assert counter.decode_q_lens.count(1) == decode_steps * len(types) and fallback_stats() == {}
     assert [w for w in counter.decode_windows if w != (-1, -1)] == \
-        [(W - 1, W - 1)] * decode_steps * types.count("sliding_attention")
+        [(W - 1, W - 1)] * (decode_steps * types.count("sliding_attention") + sliding_short)
 
 
 def _beam_rows_error(x, y, ignore_worst=0):
@@ -756,7 +795,8 @@ def test_untagged_copy_of_builder_mask_still_runs_kernel(monkeypatch):
     counter = KernelCounter(monkeypatch)
     out_tagged, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m)
     out_copy, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, m.clone())
-    assert counter.calls == [(5, 25), (5, 25)] and fallback_stats() == {}
+    # 5 queries after 20 cached keys: short queries on flash_attn_with_kvcache (P6.8)
+    assert counter.decode_calls == [(1, 25), (1, 25)] and counter.decode_q_lens == [5, 5] and fallback_stats() == {}
     torch.testing.assert_close(out_tagged, out_copy, atol=0, rtol=0)
 
 

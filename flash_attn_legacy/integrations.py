@@ -27,6 +27,10 @@ from .utils import SUPPORTED_HEAD_DIMS, fp16_autocast_active, is_compiling
 
 logger = logging.getLogger(__name__)
 
+# Longest query (new tokens against a longer cache) sent to flash_attn_with_kvcache
+# (speculative verification steps are 2-20 tokens; longer chunks are prefills)
+SHORT_Q_MAX = 64
+
 # ---------------------------------------------------------------------------
 # Fallback registry — the single place that lists why a call does not run our
 # kernel. Each reason either falls back to torch SDPA (correct result, no
@@ -454,8 +458,9 @@ def flash_attn_legacy_forward(
     Runs the flash_attn_legacy kernel when _kernel_fallback_reason allows it
     (no mask other than padding, packing or a static cache's valid prefix,
     q_len <= kv_len, supported head_dim, no unsupported kwargs): the flash kernel
-    for q_len > 1, the decode kernel (flash_attn_with_kvcache, the cache read in
-    place) for q_len == 1. Otherwise the reason is recorded in FALLBACK_REASONS
+    for q_len > 1, flash_attn_with_kvcache (the cache read in place) for q_len == 1
+    and for short queries after a longer cache (q_len <= SHORT_Q_MAX: speculative
+    verification steps). Otherwise the reason is recorded in FALLBACK_REASONS
     (see fallback_stats()) and the call runs on PyTorch SDPA (position_bias added
     to its mask), on _eager_attention (softcap / sinks, which SDPA would ignore)
     or raises NotImplementedError.
@@ -560,6 +565,15 @@ def flash_attn_legacy_forward(
         unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
         if unpad is None:
             reason, detail = "attention_mask", " (padding inside a sequence)"
+    # Short queries after a longer cache (verification steps of assisted / speculative
+    # decoding, prompt lookup): flash_attn_with_kvcache reads the cache in place, the decode
+    # kernel up to DECODE_MAX_ROWS query rows per KV head, the forward with key splits
+    # beyond (fp16 there); inference only. Prefill, training, padding stay on the kernels below.
+    short_q = (reason is None and 1 < q_len <= SHORT_Q_MAX and q_len < kv_len and not padding_2d
+               and segments is None
+               and not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
+               and (H_q // key.shape[1] * q_len <= DECODE_MAX_ROWS or query.dtype == key.dtype == torch.float16)
+               and _decode_layout_ok(key) and _decode_layout_ok(value))
 
     attn_output = None
     if reason is None:
@@ -567,8 +581,8 @@ def flash_attn_legacy_forward(
         # scaled into fp16 by the API on the device (any magnitude, no host sync).
         from .flash_attn import flash_attention, flash_attn_varlen_func, flash_attn_with_kvcache
 
-        if q_len == 1:
-            # Decode: the cache [B, H_kv, N, d] read in place as a [B, N, H_kv, d] view
+        if q_len == 1 or short_q:
+            # Decode / short queries: the cache [B, H_kv, N, d] read in place as a [B, N, H_kv, d] view
             attn_output = flash_attn_with_kvcache(
                 query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), cache_seqlens=decode_seqlens,
                 softmax_scale=scaling, causal=is_causal, window_size=window_size, softcap=softcap, sinks=sinks,
