@@ -322,7 +322,8 @@ using TileVolta_d256_64k = FwdTileWmma<64, 16, 256>;   // 56 KB
 // for one 16-row block per SM (P100), so its warps split the columns (P5):
 // kSplit 1 / 2 / 4 / 8 = 288 / 153 / 130 / 120 ms on P100, 99 with the
 // lane-major partial S (no bank conflicts); 1080 Ti 196 -> 121 (SDPA mem-efficient
-// 58 / 1049, eager 110 / 141). kSplit 2 at d=128: P100 -4%, 1080 Ti +5%, not taken.
+// 58 / 1049, eager 110 / 141). kSplit 2 at d=128: P100 -10%, 1080 Ti +11% (4k:
+// 35.8 -> 32.1 / 42.5 -> 47.0 ms), so not one tile for both: a per-SM choice is PLAN P5.5.
 // mma.sync forward tiles (Turing, 64 KB). Measured on T4, forward causal B=2
 // H=16 N=4096, ms (WMMA before): d=32 1.19 (2.74; Bc=128 1.47), d=64 2.14 (3.64;
 // Bc=128 2.16), d=96 2.95 with Bc=64 (6.14; Bc=32 3.41), d=128 4.13 with Bc=48
