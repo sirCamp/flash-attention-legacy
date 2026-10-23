@@ -552,8 +552,18 @@ def flash_attn_legacy_forward(
     sinks = kwargs.get("s_aux")  # [H_q] attention sinks (gpt-oss) or None
     unpad = decode_mask = None
     decode_seqlens = None  # every key slot (a compiled step's growing kv_len is no op argument)
-    if reason is None and q_len == 1:
-        # Decode: the kernel skips the masked keys itself (any padding, no host sync)
+    # Short queries after a longer cache (verification steps of assisted / speculative
+    # decoding, prompt lookup): flash_attn_with_kvcache reads the cache in place, the decode
+    # kernel up to DECODE_MAX_ROWS query rows per KV head, the forward with key splits
+    # beyond (fp16 there), padding as its key mask (no unpad plan, no host sync; padded query
+    # rows attend their visible keys, rows with none output 0 as in the unpad plan); inference only.
+    # Prefill and training stay on the kernels below.
+    short_q = (reason is None and 1 < q_len <= SHORT_Q_MAX and q_len < kv_len and segments is None
+               and not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
+               and (H_q // key.shape[1] * q_len <= DECODE_MAX_ROWS or query.dtype == key.dtype == torch.float16)
+               and _decode_layout_ok(key) and _decode_layout_ok(value))
+    if reason is None and (q_len == 1 or short_q):
+        # The kernel skips the masked keys itself (any padding, no host sync)
         if padding_2d:  # K / V already end at the query (sliced to the mask)
             decode_mask = (key_mask_2d if key_mask_2d.dtype == torch.bool else key_mask_2d != 0).to(query.device)
         elif decode_mask_4d is not None:
@@ -561,23 +571,10 @@ def flash_attn_legacy_forward(
             # A static cache's empty slots follow the query: causal / window aligned to
             # the last kept key, as cache_seqlens computed on the device (no sync)
             decode_seqlens = (decode_mask * torch.arange(1, kv_len + 1, device=query.device)).amax(1).int()
-        if decode_mask is not None and H_q // key.shape[1] > DECODE_MAX_ROWS:
-            # beyond the decode kernel's rows flash_attn_with_kvcache takes no key mask yet
-            reason, detail = "decode", f" ({H_q // key.shape[1]} query heads per KV head with a key mask)"
-            decode_mask = decode_seqlens = None
     elif reason is None and padding_2d:  # the unpad plan's host sync only for the kernel
         unpad = _unpad_plan(key_mask_2d, q_len, is_causal, query.device)
         if unpad is None:
             reason, detail = "attention_mask", " (padding inside a sequence)"
-    # Short queries after a longer cache (verification steps of assisted / speculative
-    # decoding, prompt lookup): flash_attn_with_kvcache reads the cache in place, the decode
-    # kernel up to DECODE_MAX_ROWS query rows per KV head, the forward with key splits
-    # beyond (fp16 there); inference only. Prefill, training, padding stay on the kernels below.
-    short_q = (reason is None and 1 < q_len <= SHORT_Q_MAX and q_len < kv_len and not padding_2d
-               and segments is None
-               and not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
-               and (H_q // key.shape[1] * q_len <= DECODE_MAX_ROWS or query.dtype == key.dtype == torch.float16)
-               and _decode_layout_ok(key) and _decode_layout_ok(value))
 
     attn_output = None
     if reason is None:

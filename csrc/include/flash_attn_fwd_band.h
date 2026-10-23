@@ -56,6 +56,7 @@ struct FwdBlockArgs {
     int rows_per_token;             // the cache kernel: 1, or H_q / H_kv with packed GQA rows
     index_t q_head_stride;
     const float* __restrict__ sinks;  // the cache kernel: sinks of heads h0.. (split 0), else nullptr
+    const bool* __restrict__ key_mask;  // the cache kernel: the row's key mask from key 0 of K, or nullptr
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
@@ -114,6 +115,9 @@ __device__ __forceinline__ void fwd_store_lse(const FwdBlockArgs& a, int row, fl
 // includes keys past the end).
 template <bool kCache>
 __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row, int key) {
+    if constexpr (kCache) {  // and the key mask (padding of any shape, holes included)
+        if (a.key_mask && key < a.seq_len_k && !a.key_mask[key]) return true;
+    }
     return a.window().masked(fwd_token<kCache>(a, q_row), key);
 }
 
@@ -266,7 +270,8 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
         __syncthreads();
         if (kv_blk + 1 < kv_end) fetch(kv_blk + 1);
         if (band_active && kv_start <= band_last_key && kv_start + Bc - 1 >= band_first_key) {  // warp-uniform
-            if (kv_start >= nomask_first && kv_start + Bc - 1 <= nomask_last) step(std::false_type{}, kv_start);
+            if (kv_start >= nomask_first && kv_start + Bc - 1 <= nomask_last && !(kCache && a.key_mask))  // a key mask: every block
+                step(std::false_type{}, kv_start);
             else                                                              step(std::true_type{}, kv_start);
         }
         __syncthreads();  // all warps done with K/V before the next commit
@@ -292,14 +297,28 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             load_tile_g2s<Br, d, NT, LD>(a.Q, a.q_stride, smem_Q, a.valid_q, a.head_dim);
         }
     };
+    // K / V rows of the block from kv_start: the cache kernel with a key mask reads the dropped keys as
+    // zeros (never read, as in the decode kernel: a NaN there would reach O through P = 0 times V)
+    auto kv_rows = [&](const half* src, int stride, int kv_start) {
+        return [=, &a](int r) -> const half* {
+            return a.key_mask && !a.key_mask[kv_start + r] ? nullptr : src + r * stride;
+        };
+    };
     if constexpr (Tile::kPrefetch) {
         TileRegs<Bc, d, NT> next_K, next_V;
         fwd_band_loop<Br, Bc, kCache>(a, band_row0, band_active, load_q,
             [&](int kv_blk) {
                 const int kv_start = kv_blk * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                load_tile_g2r(a.K + kv_start * a.k_stride, a.k_stride, next_K, valid_kv, a.head_dim);
-                load_tile_g2r(a.V + kv_start * a.v_stride, a.v_stride, next_V, valid_kv, a.head_dim);
+                if constexpr (kCache) {
+                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.K + kv_start * a.k_stride, a.k_stride, kv_start),
+                                                        next_K, valid_kv, a.head_dim);
+                    load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.V + kv_start * a.v_stride, a.v_stride, kv_start),
+                                                        next_V, valid_kv, a.head_dim);
+                } else {
+                    load_tile_g2r(a.K + kv_start * a.k_stride, a.k_stride, next_K, valid_kv, a.head_dim);
+                    load_tile_g2r(a.V + kv_start * a.v_stride, a.v_stride, next_V, valid_kv, a.head_dim);
+                }
             },
             [&]() {
                 store_tile_r2s<Bc, d, NT, LD>(next_K, smem_K);
@@ -313,8 +332,15 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             [&]() {
                 const int kv_start = pending * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
-                load_tile_g2s<Bc, d, NT, LD>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
+                if constexpr (kCache) {
+                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.K + kv_start * a.k_stride, a.k_stride, kv_start),
+                                                            smem_K, valid_kv, a.head_dim);
+                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.V + kv_start * a.v_stride, a.v_stride, kv_start),
+                                                            smem_V, valid_kv, a.head_dim);
+                } else {
+                    load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
+                    load_tile_g2s<Bc, d, NT, LD>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
+                }
             },
             step);
     }
@@ -372,6 +398,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.softcap = p.softcap;
         a.sink_log2 = -INFINITY;  // per row: a.sinks (fwd_softmax_init)
         a.sinks = p.sinks && split == 0 ? p.sinks + h0 : nullptr;  // the sink once per row
+        a.key_mask = p.key_mask ? p.key_mask + b_idx * p.mask_batch_stride + start : nullptr;  // key 0 of K = start
         a.window_left = p.window_left;
         a.window_right = p.window_right;
         a.split = split;
@@ -417,6 +444,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.rows_per_token = 1;
         a.q_head_stride = 0;
         a.sinks = nullptr;
+        a.key_mask = nullptr;
     }
     Body::template run<Tile, kCache>(a);
 }
@@ -463,6 +491,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.rows_per_token = 1;
     a.q_head_stride = 0;
     a.sinks = nullptr;
+    a.key_mask = nullptr;
     Body::template run<Tile, false>(a);
 }
 

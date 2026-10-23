@@ -1435,8 +1435,53 @@ class TestKVCache:
         ref_out, _ = self._ref(q, k, v, [200, 511], 1.0 / math.sqrt(64), causal=True)
         torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
 
+    @pytest.mark.parametrize("num_splits", [1, 4], ids=["one_split", "splits4"])
+    def test_forward_rows_key_mask(self, head_dim, num_splits):
+        """key_mask beyond 8 rows per KV head: holes, a row whose kept keys are all masked, with
+        cache_leftpad (the mask indexed by absolute key) and sinks; masked keys never read (NaN)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 5, 8, 2, head_dim, 160, torch.float16, "bshd", seed=5)  # 20 rows per KV head
+        seqlens, leftpad = [160, 120, 60], [0, 20, 10]
+        keep = torch.rand(3, 160, device="cuda") > 0.3
+        keep[2, 10:60] = False  # row 2: nothing to attend
+        k[~keep] = float("nan")
+        v[~keep] = float("nan")
+        sinks = torch.randn(8, device="cuda")
+        cs, lp = (torch.tensor(x, dtype=torch.int32, device="cuda") for x in (seqlens, leftpad))
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, cache_leftpad=lp, key_mask=keep,
+                                               causal=True, num_splits=num_splits, sinks=sinks, return_softmax_lse=True)
+        ref_out, ref_lse = self._ref(q, torch.nan_to_num(k), torch.nan_to_num(v), seqlens, 1.0 / math.sqrt(head_dim),
+                                     causal=True, sinks=sinks, leftpad=leftpad, key_mask=keep)
+        self._check(out, lse, ref_out, ref_lse, torch.float16)
+
+    @pytest.mark.parametrize("case", ["window", "non_causal", "broadcast_mask"])
+    def test_forward_rows_key_mask_cases(self, case):
+        """key_mask beyond 8 rows with a window, non-causal, a stride-0 (expanded) mask, and a row
+        whose keys are all dropped without sinks (lse -inf through the split combine)."""
+        from flash_attn_legacy import flash_attn_with_kvcache
+        q, k, v = self._case(3, 4, 8, 2, 64, 96, torch.float16, "bshd", seed=6)  # 16 rows per KV head
+        seqlens = [96, 70, 40]
+        keep = torch.rand(1 if case == "broadcast_mask" else 3, 96, device="cuda") > 0.25
+        if case != "broadcast_mask":
+            keep[2] = False  # nothing to attend
+        mask = keep.expand(3, -1) if case == "broadcast_mask" else keep
+        kw, ref_kw = {"causal": True}, {"causal": True}
+        if case == "window":
+            kw, ref_kw = {"causal": True, "window_size": (12, 0)}, {"causal": True, "window": (12, 0)}
+        elif case == "non_causal":
+            kw, ref_kw = {"causal": False}, {}
+        cs = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
+        with torch.no_grad():
+            out, lse = flash_attn_with_kvcache(q, k, v, cache_seqlens=cs, key_mask=mask, num_splits=3,
+                                               return_softmax_lse=True, **kw)
+        ref_out, ref_lse = self._ref(q, k, v, seqlens, 1.0 / math.sqrt(64), key_mask=mask, **ref_kw)
+        self._check(out, lse, torch.nan_to_num(ref_out), ref_lse, torch.float16)
+        if case != "broadcast_mask":
+            assert (out[2] == 0).all() and torch.isinf(lse[2]).all()
+
     def test_forward_rows_rejects(self):
-        """Beyond 8 rows per KV head: fp16 and a contiguous cache without leftpad / key_mask for now."""
+        """Beyond 8 rows per KV head: fp16 and a contiguous cache for now."""
         from flash_attn_legacy import flash_attn_with_kvcache
         q, k, v = self._case(2, 4, 8, 2, 64, 64, torch.float16, "bshd")  # 16 rows per KV head
         with torch.no_grad():
@@ -1445,8 +1490,6 @@ class TestKVCache:
             kb, vb, table = self._paged(k, v, 16)
             with pytest.raises(NotImplementedError, match="contiguous"):
                 flash_attn_with_kvcache(q, kb, vb, block_table=table)
-            with pytest.raises(NotImplementedError, match="key_mask"):
-                flash_attn_with_kvcache(q, k, v, key_mask=torch.ones(2, 64, dtype=torch.bool, device="cuda"))
 
     def test_seqlens_beyond_the_cache(self):
         """Tensor cache_seqlens are clamped to [0, max_len] on the GPU (never read

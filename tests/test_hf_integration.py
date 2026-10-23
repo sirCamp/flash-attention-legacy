@@ -98,9 +98,9 @@ def test_decode_on_kernel(monkeypatch, dtype):
 
 @pytest.mark.parametrize("case", ["broadcast_batch", "all_true", "holes", "window", "too_many_rows"])
 def test_decode_4d_mask(monkeypatch, case):
-    """q_len == 1 with a boolean [B or 1, 1, 1, kv] mask: the decode kernel with
-    the mask (holes included); more query heads per KV head than the kernel
-    handles go to SDPA with the mask as it is; all within FP32."""
+    """q_len == 1 with a boolean [B or 1, 1, 1, kv] mask: flash_attn_with_kvcache with
+    the mask (holes included), the decode kernel or, beyond its query heads per KV
+    head, the forward with key splits (P6.8); all within FP32."""
     torch.manual_seed(0)
     B, kv = 3, 40
     rows = integrations.DECODE_MAX_ROWS + 1 if case == "too_many_rows" else 4
@@ -121,10 +121,7 @@ def test_decode_4d_mask(monkeypatch, case):
     out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, mask, scaling=0.125, **kw)
     ref = _reference(q, k, v, 0.125, ref_mask)
     torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
-    kernel = case != "too_many_rows"
-    assert bool(counter.decode_calls) == kernel
-    expected = {} if kernel else {"decode": 1}
-    assert fallback_stats() == expected
+    assert counter.decode_calls and fallback_stats() == {}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -178,6 +175,29 @@ def test_decode_mqa_beyond_decode_rows(monkeypatch, dtype):
         assert counter.decode_calls == [] and fallback_stats() == {"decode": steps * base.config.num_hidden_layers}
     for o, g, n in zip(out.logits, gold.logits, noise.logits):
         assert_close_to_gold(o.float(), g.float(), n.float(), f"MQA 16:1 decode {dtype}")
+
+
+def test_short_queries_with_padding_on_kvcache(monkeypatch):
+    """P6.8: short queries after a longer cache with left padding (2D mask): flash_attn_with_kvcache
+    with the padding as its key mask (no unpad plan), the decode kernel (8 rows per KV head) and the
+    forward with key splits (16); within FP32."""
+    torch.manual_seed(1)
+    B, kv = 3, 48
+    for q_len, layout in ((2, "left"), (4, "left"), (4, "holes")):
+        q = torch.randn(B, 8, q_len, 64, device="cuda", dtype=torch.float16)
+        k, v = (torch.randn(B, 2, kv, 64, device="cuda", dtype=torch.float16) for _ in range(2))
+        pad = torch.ones(B, kv, dtype=torch.long, device="cuda")
+        pad[1, :9] = 0
+        pad[2, :30] = 0
+        if layout == "holes":
+            pad[0, 5:11] = 0
+            pad[1, 20] = 0
+        counter = KernelCounter(monkeypatch)
+        out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad, scaling=0.125)
+        causal = torch.ones(q_len, kv, dtype=torch.bool, device="cuda").tril(kv - q_len)
+        ref = _reference(q, k, v, 0.125, pad[:, None, None, :].bool() & causal)
+        torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+        assert counter.decode_q_lens == [q_len] and counter.varlen_calls == [] and fallback_stats() == {}
 
 
 def test_decode_fp32_falls_back():
@@ -244,7 +264,9 @@ def test_generate_left_padded_batch(monkeypatch, arch, cache_implementation, pad
 
 def test_cross_attention_with_padded_encoder(monkeypatch):
     """Bidirectional 2D mask over the keys only (cross-attention: decoder queries
-    unrelated to the encoder padding): every decoder row must match SDPA."""
+    unrelated to the encoder padding): every decoder row must match SDPA. 8 queries
+    against 24 keys are short queries: flash_attn_with_kvcache with the padding as its
+    key mask (P6.8; no unpad plan)."""
     torch.manual_seed(0)
     q = torch.randn(2, 4, 8, 64, device="cuda", dtype=torch.float16)  # 8 decoder tokens
     k, v = (torch.randn(2, 4, 24, 64, device="cuda", dtype=torch.float16) for _ in range(2))
@@ -253,7 +275,7 @@ def test_cross_attention_with_padded_encoder(monkeypatch):
     counter = KernelCounter(monkeypatch)
     out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=False), q, k, v, pad)
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=pad[:, None, None, :])
-    assert len(counter.varlen_calls) == 1 and fallback_stats() == {}
+    assert counter.decode_q_lens == [8] and counter.varlen_calls == [] and fallback_stats() == {}
     torch.testing.assert_close(out.transpose(1, 2), ref, atol=2e-3, rtol=2e-3)
 
 

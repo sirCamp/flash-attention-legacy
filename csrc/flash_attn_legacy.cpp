@@ -769,9 +769,6 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
                     "key_mask must be bool [B, max_len] = [", B, ", ", max_len, "] on q's device");
         if (mask.stride(1) != 1) mask = mask.contiguous();  // any batch stride (0: broadcast)
     }
-    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || !mask.defined(),
-                "flash_attn_with_kvcache with more than ", flash_attn_decode_max_rows(),
-                " query rows per KV head: key_mask is not supported yet");
 
     torch::Tensor out = torch::empty_like(q);
     torch::Tensor lse = torch::empty({B, H_q, q_len}, q.options().dtype(torch::kFloat32));
@@ -794,6 +791,8 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         f.seq_len_k = uniform_seqlen >= 0 ? int(uniform_seqlen) : max_len;
         f.seqlens_k = seqlens.defined() ? seqlens.data_ptr<int>() : nullptr;
         f.leftpad_k = leftpad.defined() ? leftpad.data_ptr<int>() : nullptr;
+        f.key_mask = mask.defined() ? mask.data_ptr<bool>() : nullptr;
+        f.mask_batch_stride = mask.defined() ? mask.stride(0) : 0;
         f.q_batch_stride = q.stride(0); f.q_seq_stride = q.stride(1); f.q_head_stride = q.stride(2);
         f.k_batch_stride = k_cache.stride(0); f.k_seq_stride = k_cache.stride(1); f.k_head_stride = k_cache.stride(2);
         f.v_batch_stride = v_cache.stride(0); f.v_seq_stride = v_cache.stride(1); f.v_head_stride = v_cache.stride(2);

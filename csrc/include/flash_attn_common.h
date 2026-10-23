@@ -91,6 +91,8 @@ struct FlashAttnParams {
     // (flash_attn_split.h layout, rows (b, h, query) of N_q queries) for the combine.
     const int* __restrict__ seqlens_k;
     const int* __restrict__ leftpad_k;
+    const bool* __restrict__ key_mask;  // [B, N_kv] (True = attend; row b at b * mask_batch_stride), or nullptr
+    index_t mask_batch_stride;
     int num_splits;
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
@@ -546,8 +548,9 @@ struct TileRegs {
 
 // Vector idx of a tile copy: row idx / kVecPerRow, 8 halves at column 8 * (idx % kVecPerRow); row r
 // starts at row_ptr(r) (rows of one stride: src + r * stride, the common case below; packed GQA
-// rows of the cache forward: a token and a head offset).
-template <typename R, typename RowPtr>
+// rows of the cache forward: a token and a head offset). kNullRows: row_ptr may return nullptr for
+// a row read as zeros (keys a key mask drops: never read).
+template <typename R, bool kNullRows = false, typename RowPtr>
 __device__ __forceinline__ uint4 tile_vec_load_rows(RowPtr&& row_ptr, int idx, int num_valid_rows,
                                                     int num_valid_cols) {
     const int row = idx / R::kVecPerRow;
@@ -555,7 +558,11 @@ __device__ __forceinline__ uint4 tile_vec_load_rows(RowPtr&& row_ptr, int idx, i
     if ((R::kVecs % R::kThreads != 0 && idx >= R::kVecs) || row >= num_valid_rows || col >= num_valid_cols) {
         return make_uint4(0u, 0u, 0u, 0u);
     }
-    return *reinterpret_cast<const uint4*>(row_ptr(row) + col);
+    const half* src = row_ptr(row);
+    if constexpr (kNullRows) {
+        if (src == nullptr) return make_uint4(0u, 0u, 0u, 0u);
+    }
+    return *reinterpret_cast<const uint4*>(src + col);
 }
 
 template <typename R>
@@ -611,17 +618,25 @@ __device__ __forceinline__ void tile_vec_store(float* __restrict__ dst, int idx,
     }
 }
 
+template <int ROWS, int COLS, int NUM_THREADS, bool kNullRows = false, typename RowPtr>
+__device__ __forceinline__ void load_tile_g2r_rows(
+    RowPtr&& row_ptr, TileRegs<ROWS, COLS, NUM_THREADS>& regs, int num_valid_rows, int num_valid_cols = COLS
+) {
+    using R = TileRegs<ROWS, COLS, NUM_THREADS>;
+    #pragma unroll
+    for (int i = 0; i < R::kPerThread; i++) {
+        regs.v[i] = tile_vec_load_rows<R, kNullRows>(row_ptr, threadIdx.x + i * NUM_THREADS, num_valid_rows,
+                                                     num_valid_cols);
+    }
+}
+
 template <int ROWS, int COLS, int NUM_THREADS>
 __device__ __forceinline__ void load_tile_g2r(
     const half* __restrict__ src, int src_row_stride,
     TileRegs<ROWS, COLS, NUM_THREADS>& regs, int num_valid_rows, int num_valid_cols = COLS
 ) {
-    using R = TileRegs<ROWS, COLS, NUM_THREADS>;
-    #pragma unroll
-    for (int i = 0; i < R::kPerThread; i++) {
-        regs.v[i] = tile_vec_load<R>(src, src_row_stride, threadIdx.x + i * NUM_THREADS, num_valid_rows,
-                                     num_valid_cols);
-    }
+    load_tile_g2r_rows<ROWS, COLS, NUM_THREADS>([&](int row) { return src + row * src_row_stride; }, regs,
+                                                num_valid_rows, num_valid_cols);
 }
 
 template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
@@ -636,7 +651,8 @@ __device__ __forceinline__ void store_tile_r2s(
 }
 
 // One vector at a time (no tile-sized register buffer); rows at row_ptr(r) (see tile_vec_load_rows).
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT, typename RowPtr>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, bool kNullRows = false, typename DstT,
+          typename RowPtr>
 __device__ __forceinline__ void load_tile_g2s_rows(
     RowPtr&& row_ptr, DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
 ) {
@@ -644,7 +660,8 @@ __device__ __forceinline__ void load_tile_g2s_rows(
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
         const int idx = threadIdx.x + i * NUM_THREADS;
-        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load_rows<R>(row_ptr, idx, num_valid_rows, num_valid_cols));
+        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load_rows<R, kNullRows>(row_ptr, idx, num_valid_rows,
+                                                                                 num_valid_cols));
     }
 }
 

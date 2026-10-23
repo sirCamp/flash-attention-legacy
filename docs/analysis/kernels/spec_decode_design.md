@@ -163,7 +163,13 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
 - HF decode (q_len 1) with more than 8 query heads per KV head (MQA, GQA 12:1 / 16:1) goes to `flash_attn_with_kvcache` (the
   packed forward) in FP16 without a padding mask; BF16 or a key mask keep the SDPA fallback (`decode` reason, recorded). Test:
   an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
-- Still open (beyond 8 rows): BF16, `key_mask`, paged caches (P6.9). Sinks with packed rows done: `fwd_softmax_init`
+- `key_mask` beyond 8 rows done: the cache kernel masks the keys the mask drops in the masked step (every block takes it with a
+  mask) and its K / V loaders read them as zeros (`kNullRows`: never read, so a NaN there cannot reach O through P = 0 times
+  V); HF short queries with padding go there with the padding as key mask (no unpad plan, no host sync), and MQA / GQA > 8:1
+  decode with padding too. Possible refinement: the mask byte is read per score element and per 16-byte vector, and blocks or
+  splits whose keys are all dropped still run (the decode kernel shrinks its splits to the kept keys): a per-block bitmask in
+  shared memory and split bounds from the mask.
+- Still open (beyond 8 rows): BF16, paged caches (P6.9). Sinks with packed rows done: `fwd_softmax_init`
   gives each row of the cache kernel its query head's sink (split 0; the plain forward keeps the head's one). `cache_leftpad` done: the cache
   kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 
