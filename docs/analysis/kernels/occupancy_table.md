@@ -280,30 +280,46 @@
 | decode | d=256, R=8, paged | 4 | sm_70 | 211 | 0 | 0/0 | 0 (0.0) | 2 | 8/64 | by regs=2, by smem=2 |
 | decode | d=256, R=8 | 4 | sm_75 | 207 | 0 | 0/0 | 0 (0.0) | 1 | 4/32 | by regs=2, by smem=1 |
 | decode | d=256, R=8, paged | 4 | sm_75 | 209 | 0 | 0/0 | 0 (0.0) | 1 | 4/32 | by regs=2, by smem=1 |
-| decode_combine | - | 8 | sm_60 | 38 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
-| decode_combine | - | 8 | sm_61 | 38 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
-| decode_combine | - | 8 | sm_70 | 40 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
-| decode_combine | - | 8 | sm_75 | 36 | 0 | 0/0 | 0 (0.0) | 4 | 32/32 | by regs=6, by smem=inf |
-| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_60 | 101 | 0 | 0/0 | 42496 (41.5) | 1 | 8/64 | by regs=2, by smem=1 |
-| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_61 | 101 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_70 | 103 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_75 | 103 | 0 | 0/0 | 42496 (41.5) | 1 | 8/32 | by regs=2, by smem=1 |
-| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_60 | 174 | 0 | 0/0 | 26624 (26.0) | 2 | 4/64 | by regs=5, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_61 | 174 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
-| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_70 | 176 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
-| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_75 | 176 | 0 | 0/0 | 26624 (26.0) | 2 | 4/32 | by regs=4, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_60 | 103 | 0 | 0/0 | 42496 (41.5) | 1 | 8/64 | by regs=2, by smem=1 |
+| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_61 | 103 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_70 | 104 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_75 | 104 | 0 | 0/0 | 42496 (41.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_60 | 173 | 0 | 0/0 | 26624 (26.0) | 2 | 4/64 | by regs=5, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_61 | 173 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
+| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_70 | 175 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
+| fwd_pascal | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_75 | 175 | 0 | 0/0 | 26624 (26.0) | 2 | 4/32 | by regs=4, by smem=2 |
 | fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_60 | 128 | 8 | 8/8 | 31232 (30.5) | 2 | 8/64 | by regs=4, by smem=2 |
 | fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_61 | 128 | 8 | 8/8 | 31232 (30.5) | 3 | 12/64 | by regs=4, by smem=3 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_70 | 138 | 0 | 0/0 | 31232 (30.5) | 3 | 12/64 | by regs=3, by smem=3 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_75 | 138 | 0 | 0/0 | 31232 (30.5) | 2 | 8/32 | by regs=3, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_60 | 168 | 0 | 0/0 | 43520 (42.5) | 1 | 4/64 | by regs=3, by smem=1 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_61 | 168 | 0 | 0/0 | 43520 (42.5) | 2 | 8/64 | by regs=3, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_70 | 168 | 16 | 24/20 | 43520 (42.5) | 2 | 8/64 | by regs=3, by smem=2 |
-| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_75 | 168 | 16 | 12/12 | 43520 (42.5) | 1 | 4/32 | by regs=3, by smem=1 |
-| fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_60 | 122 | 0 | 0/0 | 28672 (28.0) | 2 | 8/64 | by regs=4, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_70 | 136 | 0 | 0/0 | 31232 (30.5) | 3 | 12/64 | by regs=3, by smem=3 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_75 | 136 | 0 | 0/0 | 31232 (30.5) | 2 | 8/32 | by regs=3, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_60 | 167 | 0 | 0/0 | 43520 (42.5) | 1 | 4/64 | by regs=3, by smem=1 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_61 | 167 | 0 | 0/0 | 43520 (42.5) | 2 | 8/64 | by regs=3, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_70 | 168 | 16 | 12/12 | 43520 (42.5) | 2 | 8/64 | by regs=3, by smem=2 |
+| fwd_pascal | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_75 | 168 | 8 | 8/8 | 43520 (42.5) | 1 | 4/32 | by regs=3, by smem=1 |
+| fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_60 | 128 | 0 | 0/0 | 28672 (28.0) | 2 | 8/64 | by regs=4, by smem=2 |
 | fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_61 | 128 | 0 | 0/0 | 28672 (28.0) | 3 | 12/64 | by regs=4, by smem=3 |
-| fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_70 | 142 | 0 | 0/0 | 28672 (28.0) | 3 | 12/64 | by regs=3, by smem=3 |
+| fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_70 | 146 | 0 | 0/0 | 28672 (28.0) | 3 | 12/64 | by regs=3, by smem=3 |
 | fwd_pascal | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_75 | 136 | 0 | 0/0 | 28672 (28.0) | 2 | 8/32 | by regs=3, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_60 | 101 | 0 | 0/0 | 42496 (41.5) | 1 | 8/64 | by regs=2, by smem=1 |
+| fwd_pascal_cache | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_61 | 102 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_70 | 103 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_75 | 103 | 0 | 0/0 | 42496 (41.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_pascal_cache | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_60 | 171 | 0 | 0/0 | 26624 (26.0) | 2 | 4/64 | by regs=5, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_61 | 172 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_70 | 174 | 0 | 0/0 | 26624 (26.0) | 3 | 6/64 | by regs=4, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;32, 8, 128, 1> | 2 | sm_75 | 174 | 0 | 0/0 | 26624 (26.0) | 2 | 4/32 | by regs=4, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_60 | 133 | 0 | 0/0 | 31232 (30.5) | 2 | 8/64 | by regs=3, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_61 | 133 | 0 | 0/0 | 31232 (30.5) | 3 | 12/64 | by regs=3, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_70 | 139 | 0 | 0/0 | 31232 (30.5) | 3 | 12/64 | by regs=3, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 64, 1> | 4 | sm_75 | 139 | 0 | 0/0 | 31232 (30.5) | 2 | 8/32 | by regs=3, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_60 | 168 | 0 | 0/0 | 43520 (42.5) | 1 | 4/64 | by regs=3, by smem=1 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_61 | 168 | 0 | 0/0 | 43520 (42.5) | 2 | 8/64 | by regs=3, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_70 | 181 | 0 | 0/0 | 43520 (42.5) | 2 | 8/64 | by regs=2, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 16, 96, 1> | 4 | sm_75 | 181 | 0 | 0/0 | 43520 (42.5) | 1 | 4/32 | by regs=2, by smem=1 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_60 | 122 | 0 | 0/0 | 28672 (28.0) | 2 | 8/64 | by regs=4, by smem=2 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_61 | 128 | 0 | 0/0 | 28672 (28.0) | 3 | 12/64 | by regs=4, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_70 | 142 | 0 | 0/0 | 28672 (28.0) | 3 | 12/64 | by regs=3, by smem=3 |
+| fwd_pascal_cache | FwdTileSimt&lt;64, 32, 32, 1> | 4 | sm_75 | 144 | 0 | 0/0 | 28672 (28.0) | 2 | 8/32 | by regs=3, by smem=2 |
 | fwd_pascal_varlen | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_60 | 94 | 0 | 0/0 | 42496 (41.5) | 1 | 8/64 | by regs=2, by smem=1 |
 | fwd_pascal_varlen | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_61 | 99 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
 | fwd_pascal_varlen | FwdTileSimt&lt;16, 8, 256, 8> | 8 | sm_70 | 101 | 0 | 0/0 | 42496 (41.5) | 2 | 16/64 | by regs=2, by smem=2 |
@@ -330,45 +346,71 @@
 | fwd_turing | FwdTileMma&lt;128, 64, 64> | 8 | sm_75 | 178 | 0 | 0/0 | 36864 (36.0) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing | FwdTileMma&lt;128, 64, 80> | 8 | sm_75 | 209 | 0 | 0/0 | 45056 (44.0) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing | FwdTileMma&lt;128, 64, 96> | 8 | sm_75 | 221 | 0 | 0/0 | 53248 (52.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_turing_cache | FwdTileMma&lt;64, 16, 256> | 4 | sm_75 | 255 | 56 | 60/84 | 50688 (49.5) | 1 | 4/32 | by regs=2, by smem=1 |
+| fwd_turing_cache | FwdTileMma&lt;128, 48, 128> | 8 | sm_75 | 255 | 8 | 4/8 | 60928 (59.5) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_turing_cache | FwdTileMma&lt;128, 64, 32> | 8 | sm_75 | 128 | 0 | 0/0 | 20480 (20.0) | 2 | 16/32 | by regs=2, by smem=3 |
+| fwd_turing_cache | FwdTileMma&lt;128, 64, 64> | 8 | sm_75 | 181 | 0 | 0/0 | 36864 (36.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_turing_cache | FwdTileMma&lt;128, 64, 80> | 8 | sm_75 | 212 | 0 | 0/0 | 45056 (44.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_turing_cache | FwdTileMma&lt;128, 64, 96> | 8 | sm_75 | 226 | 0 | 0/0 | 53248 (52.0) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing_varlen | FwdTileMma&lt;64, 16, 256> | 4 | sm_75 | 255 | 56 | 60/72 | 50688 (49.5) | 1 | 4/32 | by regs=2, by smem=1 |
 | fwd_turing_varlen | FwdTileMma&lt;128, 48, 128> | 8 | sm_75 | 255 | 0 | 0/0 | 60928 (59.5) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing_varlen | FwdTileMma&lt;128, 64, 32> | 8 | sm_75 | 128 | 0 | 0/0 | 20480 (20.0) | 2 | 16/32 | by regs=2, by smem=3 |
 | fwd_turing_varlen | FwdTileMma&lt;128, 64, 64> | 8 | sm_75 | 192 | 0 | 0/0 | 36864 (36.0) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing_varlen | FwdTileMma&lt;128, 64, 80> | 8 | sm_75 | 227 | 0 | 0/0 | 45056 (44.0) | 1 | 8/32 | by regs=1, by smem=1 |
 | fwd_turing_varlen | FwdTileMma&lt;128, 64, 96> | 8 | sm_75 | 233 | 0 | 0/0 | 53248 (52.0) | 1 | 8/32 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;64, 16, 256> | 4 | sm_70 | 255 | 24 | 26/24 | 57088 (55.8) | 1 | 4/64 | by regs=2, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;64, 16, 256> | 4 | sm_75 | 255 | 88 | 98/220 | 57088 (55.8) | 1 | 4/32 | by regs=2, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 80> | 8 | sm_70 | 128 | 16 | 14/16 | 40960 (40.0) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 80> | 8 | sm_75 | 123 | 0 | 0/0 | 40960 (40.0) | 1 | 8/32 | by regs=2, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 96> | 8 | sm_70 | 128 | 0 | 0/0 | 46080 (45.0) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 96> | 8 | sm_75 | 136 | 0 | 0/0 | 46080 (45.0) | 1 | 8/32 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 128> | 8 | sm_70 | 164 | 0 | 0/0 | 56320 (55.0) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 128> | 8 | sm_75 | 150 | 0 | 0/0 | 56320 (55.0) | 1 | 8/32 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 256> | 8 | sm_70 | 248 | 0 | 0/0 | 97280 (95.0) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 16, 256> | 8 | sm_75 | 250 | 0 | 0/0 | 97280 (95.0) | - | - | FAIL(smem>64KB) |
-| fwd_volta | FwdTileWmma&lt;128, 32, 32> | 8 | sm_70 | 126 | 0 | 0/0 | 36352 (35.5) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta | FwdTileWmma&lt;128, 32, 32> | 8 | sm_75 | 110 | 0 | 0/0 | 36352 (35.5) | 1 | 8/32 | by regs=2, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 32, 64> | 8 | sm_70 | 128 | 0 | 0/0 | 48640 (47.5) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta | FwdTileWmma&lt;128, 32, 64> | 8 | sm_75 | 126 | 0 | 0/0 | 48640 (47.5) | 1 | 8/32 | by regs=2, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 32, 128> | 8 | sm_70 | 171 | 0 | 0/0 | 73216 (71.5) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta | FwdTileWmma&lt;128, 32, 128> | 8 | sm_75 | 182 | 0 | 0/0 | 73216 (71.5) | - | - | FAIL(smem>64KB) |
-| fwd_volta_varlen | FwdTileWmma&lt;64, 16, 256> | 4 | sm_70 | 255 | 8 | 2/4 | 57088 (55.8) | 1 | 4/64 | by regs=2, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;64, 16, 256> | 4 | sm_75 | 255 | 88 | 98/220 | 57088 (55.8) | 1 | 4/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;64, 16, 256> | 4 | sm_70 | 255 | 16 | 10/12 | 57088 (55.8) | 1 | 4/64 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;64, 16, 256> | 4 | sm_75 | 255 | 88 | 96/228 | 57088 (55.8) | 1 | 4/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 80> | 8 | sm_70 | 128 | 0 | 0/0 | 40960 (40.0) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 80> | 8 | sm_75 | 124 | 0 | 0/0 | 40960 (40.0) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 96> | 8 | sm_70 | 162 | 0 | 0/0 | 46080 (45.0) | 1 | 8/64 | by regs=1, by smem=2 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 96> | 8 | sm_75 | 123 | 0 | 0/0 | 46080 (45.0) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 128> | 8 | sm_70 | 166 | 0 | 0/0 | 56320 (55.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 128> | 8 | sm_75 | 156 | 0 | 0/0 | 56320 (55.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 256> | 8 | sm_70 | 247 | 0 | 0/0 | 97280 (95.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 16, 256> | 8 | sm_75 | 249 | 0 | 0/0 | 97280 (95.0) | - | - | FAIL(smem>64KB) |
+| fwd_volta | FwdTileWmma&lt;128, 32, 32> | 8 | sm_70 | 125 | 0 | 0/0 | 36352 (35.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta | FwdTileWmma&lt;128, 32, 32> | 8 | sm_75 | 105 | 0 | 0/0 | 36352 (35.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 32, 64> | 8 | sm_70 | 128 | 8 | 6/8 | 48640 (47.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta | FwdTileWmma&lt;128, 32, 64> | 8 | sm_75 | 128 | 0 | 0/0 | 48640 (47.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 32, 128> | 8 | sm_70 | 202 | 0 | 0/0 | 73216 (71.5) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta | FwdTileWmma&lt;128, 32, 128> | 8 | sm_75 | 183 | 0 | 0/0 | 73216 (71.5) | - | - | FAIL(smem>64KB) |
+| fwd_volta_cache | FwdTileWmma&lt;64, 16, 256> | 4 | sm_70 | 255 | 24 | 18/20 | 57088 (55.8) | 1 | 4/64 | by regs=2, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;64, 16, 256> | 4 | sm_75 | 255 | 64 | 62/120 | 57088 (55.8) | 1 | 4/32 | by regs=2, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 80> | 8 | sm_70 | 128 | 0 | 0/0 | 40960 (40.0) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 80> | 8 | sm_75 | 135 | 0 | 0/0 | 40960 (40.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 96> | 8 | sm_70 | 163 | 0 | 0/0 | 46080 (45.0) | 1 | 8/64 | by regs=1, by smem=2 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 96> | 8 | sm_75 | 128 | 0 | 0/0 | 46080 (45.0) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 128> | 8 | sm_70 | 164 | 0 | 0/0 | 56320 (55.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 128> | 8 | sm_75 | 158 | 0 | 0/0 | 56320 (55.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 256> | 8 | sm_70 | 253 | 0 | 0/0 | 97280 (95.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 16, 256> | 8 | sm_75 | 251 | 0 | 0/0 | 97280 (95.0) | - | - | FAIL(smem>64KB) |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 32> | 8 | sm_70 | 128 | 0 | 0/0 | 36352 (35.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 32> | 8 | sm_75 | 119 | 0 | 0/0 | 36352 (35.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 64> | 8 | sm_70 | 128 | 8 | 4/4 | 48640 (47.5) | 2 | 16/64 | by regs=2, by smem=2 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 64> | 8 | sm_75 | 128 | 0 | 0/0 | 48640 (47.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 128> | 8 | sm_70 | 202 | 0 | 0/0 | 73216 (71.5) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta_cache | FwdTileWmma&lt;128, 32, 128> | 8 | sm_75 | 180 | 0 | 0/0 | 73216 (71.5) | - | - | FAIL(smem>64KB) |
+| fwd_volta_varlen | FwdTileWmma&lt;64, 16, 256> | 4 | sm_70 | 255 | 16 | 18/16 | 57088 (55.8) | 1 | 4/64 | by regs=2, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;64, 16, 256> | 4 | sm_75 | 255 | 40 | 46/168 | 57088 (55.8) | 1 | 4/32 | by regs=2, by smem=1 |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 16, 80> | 8 | sm_70 | 128 | 0 | 0/0 | 40960 (40.0) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 80> | 8 | sm_75 | 122 | 0 | 0/0 | 40960 (40.0) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 80> | 8 | sm_75 | 123 | 0 | 0/0 | 40960 (40.0) | 1 | 8/32 | by regs=2, by smem=1 |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 16, 96> | 8 | sm_70 | 128 | 0 | 0/0 | 46080 (45.0) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 96> | 8 | sm_75 | 136 | 0 | 0/0 | 46080 (45.0) | 1 | 8/32 | by regs=1, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 128> | 8 | sm_70 | 161 | 0 | 0/0 | 56320 (55.0) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 128> | 8 | sm_75 | 151 | 0 | 0/0 | 56320 (55.0) | 1 | 8/32 | by regs=1, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 256> | 8 | sm_70 | 247 | 0 | 0/0 | 97280 (95.0) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 256> | 8 | sm_75 | 243 | 0 | 0/0 | 97280 (95.0) | - | - | FAIL(smem>64KB) |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 96> | 8 | sm_75 | 144 | 0 | 0/0 | 46080 (45.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 128> | 8 | sm_70 | 164 | 0 | 0/0 | 56320 (55.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 128> | 8 | sm_75 | 150 | 0 | 0/0 | 56320 (55.0) | 1 | 8/32 | by regs=1, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 256> | 8 | sm_70 | 248 | 0 | 0/0 | 97280 (95.0) | 1 | 8/64 | by regs=1, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 16, 256> | 8 | sm_75 | 245 | 0 | 0/0 | 97280 (95.0) | - | - | FAIL(smem>64KB) |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 32, 32> | 8 | sm_70 | 122 | 0 | 0/0 | 36352 (35.5) | 2 | 16/64 | by regs=2, by smem=2 |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 32, 32> | 8 | sm_75 | 100 | 0 | 0/0 | 36352 (35.5) | 1 | 8/32 | by regs=2, by smem=1 |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 32, 64> | 8 | sm_70 | 128 | 0 | 0/0 | 48640 (47.5) | 2 | 16/64 | by regs=2, by smem=2 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 32, 64> | 8 | sm_75 | 125 | 0 | 0/0 | 48640 (47.5) | 1 | 8/32 | by regs=2, by smem=1 |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 32, 64> | 8 | sm_75 | 126 | 0 | 0/0 | 48640 (47.5) | 1 | 8/32 | by regs=2, by smem=1 |
 | fwd_volta_varlen | FwdTileWmma&lt;128, 32, 128> | 8 | sm_70 | 172 | 0 | 0/0 | 73216 (71.5) | 1 | 8/64 | by regs=1, by smem=1 |
-| fwd_volta_varlen | FwdTileWmma&lt;128, 32, 128> | 8 | sm_75 | 183 | 0 | 0/0 | 73216 (71.5) | - | - | FAIL(smem>64KB) |
+| fwd_volta_varlen | FwdTileWmma&lt;128, 32, 128> | 8 | sm_75 | 182 | 0 | 0/0 | 73216 (71.5) | - | - | FAIL(smem>64KB) |
 | precompute_D | - | 8 | sm_60 | 42 | 0 | 0/0 | 0 (0.0) | 5 | 40/64 | by regs=5, by smem=inf |
 | precompute_D | - | 8 | sm_61 | 43 | 0 | 0/0 | 0 (0.0) | 5 | 40/64 | by regs=5, by smem=inf |
 | precompute_D | - | 8 | sm_70 | 46 | 0 | 0/0 | 0 (0.0) | 5 | 40/64 | by regs=5, by smem=inf |
 | precompute_D | - | 8 | sm_75 | 60 | 0 | 0/0 | 0 (0.0) | 4 | 32/32 | by regs=4, by smem=inf |
+| split_combine | - | 8 | sm_60 | 39 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
+| split_combine | - | 8 | sm_61 | 39 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
+| split_combine | - | 8 | sm_70 | 40 | 0 | 0/0 | 0 (0.0) | 6 | 48/64 | by regs=6, by smem=inf |
+| split_combine | - | 8 | sm_75 | 40 | 0 | 0/0 | 0 (0.0) | 4 | 32/32 | by regs=6, by smem=inf |

@@ -165,6 +165,12 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
 - Still open (beyond 8 rows): BF16, `cache_leftpad` / `key_mask`, paged caches (P6.9), sinks with packed rows.
 
+## Step (d), done
+- `benchmarks/speculative.py` (kernel: one verification call per path; generate: plain / prompt lookup / assisted end to end),
+  results of the five GPUs in `docs/bench/speculative.md`; `occupancy_table.md` regenerated (`*_cache` rows: the cache kernel).
+- Measured there: on short caches (1k) the T4's cache path is a little slower than the plain forward at q_len 8-16 (fp32
+  partials and the combine also for one split): a possible refinement (write O directly when one split is chosen).
+
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache
   read) on SM 7.x; on Pascal the larger of that and the fp32 compute floor (4 d R N H_kv FLOP: q_len 16, GQA 4, 4k, d 128,

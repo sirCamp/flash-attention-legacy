@@ -259,6 +259,11 @@ Instruct on the V100 with lm-evaluation-harness, every document scored with each
 Ours changes as many answers relative to eager as SDPA does (2-21 per task: fp16 near-ties), all within a fraction of the
 standard error.
 
+Speculative / assisted decoding (`python benchmarks/speculative.py`, [`docs/bench/speculative.md`](docs/bench/speculative.md)):
+a verification step of 16 tokens on a 16k cache costs one layer 181 us on the V100 (the plain forward 1205, SDPA 1293), 296 on
+the T4 (592 / 1195), 1184 on the P100 (7547 / 4577); HF prompt lookup and assisted generation run fastest with our backend
+on every GPU.
+
 Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
 results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
 
