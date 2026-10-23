@@ -244,6 +244,20 @@ layers in 4, here on transformers' PyTorch reference) run at parity or a little 
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
 
+Task accuracy is unchanged (`python benchmarks/tasks.py`, [`docs/bench/tasks.md`](docs/bench/tasks.md)): Llama 3.1 8B
+Instruct on the V100 with lm-evaluation-harness, every document scored with each implementation:
+
+| | ours | SDPA | eager |
+|---|---|---|---|
+| ARC-Easy, acc (2376) | 0.8220 | 0.8215 | 0.8224 |
+| ARC-Challenge, acc_norm (1172) | 0.5589 | 0.5589 | 0.5589 |
+| HellaSwag, acc_norm (10042) | 0.7950 | 0.7953 | 0.7953 |
+| GSM8K 5-shot, exact match (1319) | 0.7733 | 0.7741 | 0.7756 |
+| Passkey retrieval at 4k / 8k / 16k / 32k tokens | 1.00 / 1.00 / 1.00 / 1.00 | 1.00 / OOM / OOM / OOM | 1.00 / OOM / OOM / OOM |
+
+Ours changes as many answers relative to eager as SDPA does (2-21 per task: fp16 near-ties), all within a fraction of the
+standard error.
+
 Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
 results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
 
