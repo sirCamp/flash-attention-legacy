@@ -31,10 +31,14 @@ namespace flash_attn_legacy {
 constexpr int kBandRows = 16;  // query rows per band (of one or more warps)
 
 // One Q block: its rows start at Q / O / L (row strides q_stride / o_stride /
-// l_stride); K and V start at key 0 of the sequence. With key splits
-// (num_splits > 1) the block takes split `split` of its visible K/V blocks and
-// writes the split's partial rows at O_part (fp32, row stride head_dim) and
-// L_part (log2) instead of O / L.
+// l_stride); K and V start at key 0 of the sequence. The cache kernel (kCache)
+// takes split `split` of the block's visible K/V blocks and writes the split's
+// partial rows at O_part (fp32, row stride head_dim) and L_part (log2) instead of
+// O / L; there Q, O_part and L_part start at token 0 of query head h0, and with
+// packed GQA rows (rows_per_token = H_q / H_kv) block row r is token
+// (q_row_start + r) / rows_per_token of query head h0 + (q_row_start + r) %
+// rows_per_token (Q: token stride q_stride, head stride q_head_stride; partial
+// row (head offset) * seq_len_q + token); seq_len_q counts tokens.
 struct FwdBlockArgs {
     const half* __restrict__ Q; index_t q_stride;
     const half* __restrict__ K; index_t k_stride;
@@ -49,6 +53,8 @@ struct FwdBlockArgs {
     int split, num_splits;          // num_splits 1: no split
     float* __restrict__ O_part;
     float* __restrict__ L_part;
+    int rows_per_token;             // the cache kernel: 1, or H_q / H_kv with packed GQA rows
+    index_t q_head_stride;
 
     __device__ __forceinline__ KeyWindow window() const {
         return KeyWindow(window_left, window_right, seq_len_q, seq_len_k);
@@ -56,15 +62,33 @@ struct FwdBlockArgs {
     __device__ __forceinline__ ScoreMap score_map() const { return ScoreMap(softmax_scale, softcap); }
 };
 
+// Token and query-head offset (from h0) of an absolute row of the cache kernel's
+// rows (packed GQA rows; unpacked: the row itself and 0). The one place rows split.
+struct FwdRow { int token, head; };
+__device__ __forceinline__ FwdRow fwd_row(const FwdBlockArgs& a, int abs_row) {
+    return {abs_row / a.rows_per_token, abs_row % a.rows_per_token};
+}
+
+// Token of an absolute row: the cache kernel's split, or the row itself.
+template <bool kCache>
+__device__ __forceinline__ int fwd_token(const FwdBlockArgs& a, int abs_row) {
+    return kCache ? fwd_row(a, abs_row).token : abs_row;
+}
+
+// Partial row (the cache kernel) of block row `row`: (head offset) * seq_len_q + token.
+__device__ __forceinline__ index_t fwd_part_row(const FwdBlockArgs& a, int row) {
+    const FwdRow r = fwd_row(a, a.q_row_start + row);
+    return index_t(r.head) * a.seq_len_q + r.token;
+}
+
 // The final values of N consecutive columns from `col` of block row `row` (O
-// already multiplied by the row's inv): half into O, or with kPartial (the
-// kCache kernel) fp32 into the split's partial. Every family writes its output
-// through these two.
-template <bool kPartial, int N>
+// already multiplied by the row's inv): half into O, or with kCache fp32 into
+// the split's partial. Every family writes its output through these two.
+template <bool kCache, int N>
 __device__ __forceinline__ void fwd_store_o(const FwdBlockArgs& a, int row, int col, const float (&v)[N]) {
     static_assert(N == 2 || N == 4 || N == 8, "2, 4 or 8 columns");
-    if constexpr (kPartial) {  // fp32, 8-byte aligned (col even, head_dim % 8 == 0)
-        float* dst = a.O_part + index_t(row) * a.head_dim + col;
+    if constexpr (kCache) {  // fp32, 8-byte aligned (col even, head_dim % 8 == 0)
+        float* dst = a.O_part + fwd_part_row(a, row) * a.head_dim + col;
         #pragma unroll
         for (int i = 0; i < N; i += 2) *reinterpret_cast<float2*>(dst + i) = make_float2(v[i], v[i + 1]);
     } else {
@@ -79,22 +103,24 @@ __device__ __forceinline__ void fwd_store_o(const FwdBlockArgs& a, int row, int 
 }
 
 // lse: natural log (BandSoftmax::finalize); the split partial keeps it in log2.
-template <bool kPartial>
+template <bool kCache>
 __device__ __forceinline__ void fwd_store_lse(const FwdBlockArgs& a, int row, float lse) {
-    if constexpr (kPartial) a.L_part[row] = lse * kLog2e;  // -inf stays -inf
-    else                    a.L[row * a.l_stride] = lse;
+    if constexpr (kCache) a.L_part[fwd_part_row(a, row)] = lse * kLog2e;  // -inf stays -inf
+    else                  a.L[row * a.l_stride] = lse;
 }
 
-// Key `key` is not visible to sequence row `q_row` (KeyWindow; includes keys
-// past the end).
+// Key `key` is not visible to sequence row `q_row` (KeyWindow over the tokens;
+// includes keys past the end).
+template <bool kCache>
 __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row, int key) {
-    return a.window().masked(q_row, key);
+    return a.window().masked(fwd_token<kCache>(a, q_row), key);
 }
 
 // Raw scores s[r][c] of a block -> log2-domain logits (ScoreMap), -inf for keys
 // outside the KeyWindow when kMask (masked after the map: c * tanh(-inf) would be
-// finite). row(r) / key(c): sequence row / key of s[r][c].
-template <bool kMask, int R, int C, typename RowOf, typename KeyOf>
+// finite). row(r) / key(c): absolute row of the block's rows (a sequence row, or
+// a packed GQA row of the cache kernel) / key of s[r][c].
+template <bool kMask, bool kCache, int R, int C, typename RowOf, typename KeyOf>
 __device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][C], RowOf&& row, KeyOf&& key) {
     a.score_map().log2_logits(s);
     if constexpr (kMask) {
@@ -102,7 +128,7 @@ __device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][
         for (int r = 0; r < R; r++) {
             #pragma unroll
             for (int c = 0; c < C; c++) {
-                if (fwd_key_masked(a, row(r), key(c))) s[r][c] = -INFINITY;
+                if (fwd_key_masked<kCache>(a, row(r), key(c))) s[r][c] = -INFINITY;
             }
         }
     }
@@ -185,14 +211,16 @@ struct BandSoftmax {
 // by step() for block j is not rewritten by step() for block j + 1 before every
 // warp is done with block j: the block-wide barrier closing each iteration
 // (the column-split Pascal forward relies on it for its partial S).
-template <int Br, int Bc, typename LoadQ, typename Fetch, typename Commit, typename Step>
+template <int Br, int Bc, bool kCache, typename LoadQ, typename Fetch, typename Commit, typename Step>
 __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_row0, bool band_active,
                                               LoadQ&& load_q, Fetch&& fetch, Commit&& commit, Step&& step) {
-    // First / last key of a row grow with the row: the Q block sees keys
-    // [first_key(first row), last_key(last row)], a band likewise, and a block
-    // inside [first_key(last row), last_key(first row)] of the band needs no mask.
+    // First / last key of a row grow with the row (its token: packed GQA rows of
+    // a token share them): the Q block sees keys [first_key(first row),
+    // last_key(last row)], a band likewise, and a block inside
+    // [first_key(last row), last_key(first row)] of the band needs no mask.
     const KeyWindow w = a.window();
-    const int q_first = a.q_row_start, q_last = a.q_row_start + a.valid_q - 1;
+    const int q_first = fwd_token<kCache>(a, a.q_row_start);
+    const int q_last = fwd_token<kCache>(a, a.q_row_start + a.valid_q - 1);
     int kv_begin = w.first_key(q_first) / Bc;
     const int last_key = w.last_key(q_last);
     int kv_end = last_key < 0 ? 0 : last_key / Bc + 1;
@@ -201,7 +229,8 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
         kv_begin += a.split * chunk;
         kv_end = min(kv_end, kv_begin + chunk);
     }
-    const int band_first = a.q_row_start + band_row0, band_last = band_first + kBandRows - 1;
+    const int band_first = fwd_token<kCache>(a, a.q_row_start + band_row0);
+    const int band_last = fwd_token<kCache>(a, a.q_row_start + band_row0 + kBandRows - 1);
     const int band_first_key = w.first_key(band_first), band_last_key = w.last_key(band_last);
     const int nomask_first = w.first_key(band_last), nomask_last = w.last_key(band_first);
     if (kv_begin < kv_end) fetch(kv_begin);  // in flight while Q is loaded
@@ -224,14 +253,23 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
 // cores: converted once, when stored). With Tile::kPrefetch the next K/V block
 // is loaded into registers while the current one is computed; otherwise each
 // block is copied straight to shared memory at its turn.
-template <typename Tile, int LD, typename DstT, typename Step>
+template <typename Tile, int LD, bool kCache, typename DstT, typename Step>
 __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row0, bool band_active,
                                              DstT* smem_Q, DstT* smem_K, DstT* smem_V, Step&& step) {
     constexpr int Br = Tile::Br, Bc = Tile::Bc, d = Tile::d, NT = Tile::kNumWarps * 32;
-    auto load_q = [&]() { load_tile_g2s<Br, d, NT, LD>(a.Q, a.q_stride, smem_Q, a.valid_q, a.head_dim); };
+    auto load_q = [&]() {
+        if constexpr (kCache) {  // rows from token 0 of head h0: (token, head offset), packed or not
+            load_tile_g2s_rows<Br, d, NT, LD>([&](int r) {
+                const FwdRow x = fwd_row(a, a.q_row_start + r);
+                return a.Q + index_t(x.token) * a.q_stride + index_t(x.head) * a.q_head_stride;
+            }, smem_Q, a.valid_q, a.head_dim);
+        } else {
+            load_tile_g2s<Br, d, NT, LD>(a.Q, a.q_stride, smem_Q, a.valid_q, a.head_dim);
+        }
+    };
     if constexpr (Tile::kPrefetch) {
         TileRegs<Bc, d, NT> next_K, next_V;
-        fwd_band_loop<Br, Bc>(a, band_row0, band_active, load_q,
+        fwd_band_loop<Br, Bc, kCache>(a, band_row0, band_active, load_q,
             [&](int kv_blk) {
                 const int kv_start = kv_blk * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
@@ -245,7 +283,7 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             step);
     } else {
         int pending = 0;  // block the next commit() loads
-        fwd_band_loop<Br, Bc>(a, band_row0, band_active, load_q,
+        fwd_band_loop<Br, Bc, kCache>(a, band_row0, band_active, load_q,
             [&](int kv_blk) { pending = kv_blk; },
             [&]() {
                 const int kv_start = pending * Bc;
@@ -270,45 +308,84 @@ __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_batched_kernel(FlashAttnParams p) {
     // Flat grid: x = (batch * heads) * q_blocks + q_block (no 65535 limit on
     // B * H; the Q blocks of one head are adjacent, sharing its K/V in L2), y =
-    // key split (the query heads of a KV head adjacent within a split).
-    const int q_blocks = cdiv(p.seq_len_q, Tile::Br);
-    const int split = blockIdx.y;
-    const int bh_idx = blockIdx.x / q_blocks;
-    const int b_idx = bh_idx / p.num_heads;
-    const int h_idx = bh_idx % p.num_heads;
-    const int kv_h_idx = h_idx / (p.num_heads / p.num_heads_k);
-    const int q_row_start = (blockIdx.x % q_blocks) * Tile::Br;
-    if (q_row_start >= p.seq_len_q) return;
-
+    // key split (the cache kernel). The cache kernel with packed GQA rows: heads =
+    // KV heads, rows = q_len * (H_q / H_kv) (token, query head of the group);
+    // unpacked, the query heads of a KV head are adjacent within a split.
     FwdBlockArgs a;
-    a.Q = p.Q + b_idx * p.q_batch_stride + h_idx * p.q_head_stride + q_row_start * p.q_seq_stride;
-    a.q_stride = p.q_seq_stride;
-    a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride;
-    a.k_stride = p.k_seq_stride;
-    a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride;
-    a.v_stride = p.v_seq_stride;
-    a.O = p.O + b_idx * p.o_batch_stride + h_idx * p.o_head_stride + q_row_start * p.o_seq_stride;
-    a.o_stride = p.o_seq_stride;
-    a.L = p.L + b_idx * p.l_batch_stride + h_idx * p.l_head_stride + q_row_start;
-    a.l_stride = 1;
-    a.q_row_start = q_row_start;
-    a.valid_q = min(Tile::Br, p.seq_len_q - q_row_start);
-    a.seq_len_q = p.seq_len_q;
-    a.seq_len_k = kCache && p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
-    a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
-    a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
-    a.softcap = p.softcap;
-    a.sink_log2 = p.sinks && (!kCache || split == 0) ? p.sinks[h_idx] * kLog2e : -INFINITY;  // once per row
-    a.window_left = p.window_left;
-    a.window_right = p.window_right;
-    a.split = kCache ? split : 0;
-    a.num_splits = kCache ? max(p.num_splits, 1) : 1;
-    a.O_part = nullptr;
-    a.L_part = nullptr;
-    if constexpr (kCache) {  // partial rows (split, b, h, query) of the combine
-        const index_t prow = (index_t(split) * p.batch_size * p.num_heads + bh_idx) * p.seq_len_q + q_row_start;
+    if constexpr (kCache) {
+        const int rpt = gqa_rows_per_token(p.pack_gqa, p.num_heads, p.num_heads_k);
+        const int heads = p.num_heads / rpt, rows = p.seq_len_q * rpt;
+        const int q_blocks = cdiv(rows, Tile::Br);
+        const int split = blockIdx.y;
+        const int bh_idx = blockIdx.x / q_blocks;
+        const int b_idx = bh_idx / heads;
+        const int h0 = (bh_idx % heads) * rpt;  // first query head of the block's rows
+        const int kv_h_idx = h0 / (p.num_heads / p.num_heads_k);
+        const int q_row_start = (blockIdx.x % q_blocks) * Tile::Br;
+        if (q_row_start >= rows) return;
+        a.Q = p.Q + b_idx * p.q_batch_stride + h0 * p.q_head_stride;  // token 0 (rows: fwd_band_run)
+        a.q_stride = p.q_seq_stride;
+        a.q_head_stride = p.q_head_stride;
+        a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride;
+        a.k_stride = p.k_seq_stride;
+        a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride;
+        a.v_stride = p.v_seq_stride;
+        a.O = nullptr;
+        a.o_stride = 0;
+        a.L = nullptr;
+        a.l_stride = 0;
+        a.q_row_start = q_row_start;
+        a.valid_q = min(Tile::Br, rows - q_row_start);
+        a.seq_len_q = p.seq_len_q;  // tokens
+        a.seq_len_k = p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
+        a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
+        a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
+        a.softcap = p.softcap;
+        a.sink_log2 = p.sinks && split == 0 ? p.sinks[h0] * kLog2e : -INFINITY;  // once per row (no packing with sinks)
+        a.window_left = p.window_left;
+        a.window_right = p.window_right;
+        a.split = split;
+        a.num_splits = max(p.num_splits, 1);
+        a.rows_per_token = rpt;
+        // partials of the split from (b, h0, token 0): rows (head offset) * q_len + token
+        const index_t prow = (index_t(split) * p.batch_size + b_idx) * p.num_heads * p.seq_len_q + index_t(h0) * p.seq_len_q;
         a.O_part = p.O_part + prow * p.head_dim;
         a.L_part = p.L_part + prow;
+    } else {
+        const int q_blocks = cdiv(p.seq_len_q, Tile::Br);
+        const int bh_idx = blockIdx.x / q_blocks;
+        const int b_idx = bh_idx / p.num_heads;
+        const int h_idx = bh_idx % p.num_heads;
+        const int kv_h_idx = h_idx / (p.num_heads / p.num_heads_k);
+        const int q_row_start = (blockIdx.x % q_blocks) * Tile::Br;
+        if (q_row_start >= p.seq_len_q) return;
+
+        a.Q = p.Q + b_idx * p.q_batch_stride + h_idx * p.q_head_stride + q_row_start * p.q_seq_stride;
+        a.q_stride = p.q_seq_stride;
+        a.K = p.K + b_idx * p.k_batch_stride + kv_h_idx * p.k_head_stride;
+        a.k_stride = p.k_seq_stride;
+        a.V = p.V + b_idx * p.v_batch_stride + kv_h_idx * p.v_head_stride;
+        a.v_stride = p.v_seq_stride;
+        a.O = p.O + b_idx * p.o_batch_stride + h_idx * p.o_head_stride + q_row_start * p.o_seq_stride;
+        a.o_stride = p.o_seq_stride;
+        a.L = p.L + b_idx * p.l_batch_stride + h_idx * p.l_head_stride + q_row_start;
+        a.l_stride = 1;
+        a.q_row_start = q_row_start;
+        a.valid_q = min(Tile::Br, p.seq_len_q - q_row_start);
+        a.seq_len_q = p.seq_len_q;
+        a.seq_len_k = p.seq_len_k;
+        a.head_dim = tile_valid_cols<Tile::d>(p.head_dim);
+        a.softmax_scale = p.score_scale ? p.softmax_scale * __ldg(p.score_scale) : p.softmax_scale;
+        a.softcap = p.softcap;
+        a.sink_log2 = p.sinks ? p.sinks[h_idx] * kLog2e : -INFINITY;
+        a.window_left = p.window_left;
+        a.window_right = p.window_right;
+        a.split = 0;
+        a.num_splits = 1;
+        a.O_part = nullptr;
+        a.L_part = nullptr;
+        a.rows_per_token = 1;
+        a.q_head_stride = 0;
     }
     Body::template run<Tile, kCache>(a);
 }
@@ -352,6 +429,8 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.num_splits = 1;
     a.O_part = nullptr;
     a.L_part = nullptr;
+    a.rows_per_token = 1;
+    a.q_head_stride = 0;
     Body::template run<Tile, false>(a);
 }
 
@@ -361,7 +440,8 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
 template <typename Tile, typename Body>
 void launch_fwd(FlashAttnParams& params, cudaStream_t stream) {
     constexpr int smem = Tile::smem_bytes();
-    const int64_t blocks = int64_t(cdiv(params.seq_len_q, Tile::Br)) * params.batch_size * params.num_heads;
+    const int rpt = gqa_rows_per_token(params.O_part && params.pack_gqa, params.num_heads, params.num_heads_k);
+    const int64_t blocks = int64_t(cdiv(params.seq_len_q * rpt, Tile::Br)) * params.batch_size * (params.num_heads / rpt);
     if (blocks > INT32_MAX) throw std::runtime_error("flash_attn_legacy: batch * heads * query blocks exceeds the grid limit");
     const dim3 grid(static_cast<unsigned>(blocks), max(params.num_splits, 1));
     auto launch = [&](auto cache) {

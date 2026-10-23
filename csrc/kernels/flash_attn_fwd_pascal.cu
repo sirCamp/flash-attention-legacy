@@ -22,7 +22,7 @@
 namespace flash_attn_legacy {
 
 struct PascalFwd {
-template <typename Tile, bool kPartial>
+template <typename Tile, bool kCache>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -117,7 +117,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             // smem_S is rewritten only in the next K/V block, after fwd_band_loop's
             // block-wide barrier (its contract)
         }
-        fwd_logits<kMask>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
+        fwd_logits<kMask, kCache>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
                           [&](int j) { return kv_start + cg + 8 * j; });
         float alpha[4];
         softmax.update(s, alpha);
@@ -157,7 +157,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         __syncwarp();  // P^T reads done before the next block overwrites it
     };
 
-    fwd_band_run<Tile, LDF>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDF, kCache>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     float inv[4], lse[4];
@@ -166,12 +166,12 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     for (int i = 0; i < 4; i++) {
         const int row = row0 + i;
         if (row >= a.valid_q) break;
-        if (cg == 0 && part == 0) fwd_store_lse<kPartial>(a, row, lse[i]);
+        if (cg == 0 && part == 0) fwd_store_lse<kCache>(a, row, lse[i]);
         #pragma unroll
         for (int t = 0; t < TD; t++) {
             const int col = col0 + 4 * cg + 32 * t;
             if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
-                fwd_store_o<kPartial>(a, row, col, {O[i][t].x * inv[i], O[i][t].y * inv[i], O[i][t].z * inv[i],
+                fwd_store_o<kCache>(a, row, col, {O[i][t].x * inv[i], O[i][t].y * inv[i], O[i][t].z * inv[i],
                                           O[i][t].w * inv[i]});
             }
         }

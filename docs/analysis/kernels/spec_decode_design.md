@@ -68,8 +68,9 @@ The decode kernel stays for R <= 8 (bandwidth bound, measured near the floor); t
   writes of the three families, the fp32 partial stores) and the Q loader gets a row-offset functor (one loader, not a second
   one); rows_per_token = 1 keeps today's addressing. `KeyWindow` is built over q_len tokens (its offset is seq_len_k - seq_len_q
   in tokens); each lane's rows are fixed over the K/V loop, so their tokens are computed once before it, and `fwd_band_loop`'s
-  q_first / q_last / band bounds become tokens. Sinks per row (sinks[kv * rep + r % rep]): `BandSoftmax::init` takes one value
-  per row. L / lse stay in the natural [B, H_q, q_len] order. Its value is mostly band compute on Pascal (q_len 2, rep 4: four
+  q_first / q_last / band bounds become tokens. Sinks (one per query head) would need one value per row in
+  `BandSoftmax::init`: calls with sinks keep the unpacked layout (a block per query head; gpt-oss at q_len 1 is within the
+  decode kernel's 8 rows). L / lse stay in the natural [B, H_q, q_len] order. Its value is mostly band compute on Pascal (q_len 2, rep 4: four
   bands become one) and K/V read once per KV head: measured against (a) before it is merged.
 - **Not in scope:** backward with splits or packing (inference only, as decode); paged K/V in the forward (P6.9); a packed varlen
   batch of mixed q_len (P6.9); bf16 / leftpad / key_mask with R > 8 (later, if measured useful).
@@ -80,7 +81,7 @@ a. Shared combine header (decode unchanged, bit-identical). Then split-KV in the
    Tests: every family (forced Pascal too) against SDPA math with num_splits 1..16 forced and more splits than Bc blocks,
    causal / window / softcap / sinks, q_len 1..64 against N up to 32k, per-batch cache_seqlens tensors, d = 72 / 80 padded
    columns, CUDA-graph capture; num_splits = 1 bit-identical and the existing forward's speed unchanged.
-b. Packed GQA rows. Tests as (a) with rep 1..16, including 6, 7, 12 (Br % rep != 0), MQA, and sinks with packing.
+b. Packed GQA rows (no sinks). Tests as (a) with rep 1..16, including 3, 7, 12 (Br % rep != 0), MQA; sinks run unpacked.
 c. HF: q_len == 1 with rep > 8 to the packed path; the "decode (N query heads per KV head)" fallback reason disappears. Tests: HF
    assisted generate / prompt lookup / a rep-12 model identical to plain greedy and to SDPA within noise.
 d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README / PLAN.
@@ -128,6 +129,35 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   a 1.5k prompt; the draft / lookup acceptance decides). V100: a first run (ours 24.2 / 36.9 tok/s, behind SDPA / eager) was the
   shared box's load (load average 16): measured again alternated, the row above (and the campaign's decode, 32.8 vs 28.6 / 29.8).
   Host time per attention call of a decode step on the V100 (Qwen2.5-3B shapes): ours 61 us, HF's SDPA 175, eager 147.
+
+## Step (b), done
+- Packed GQA rows in the cache kernel (`FlashAttnParams::pack_gqa`, `gqa_rows_per_token`: one rule for the host, the launcher
+  and the kernel): a block covers rows (token, query head of the group) of one KV head, token-major; `fwd_row` is the one place
+  rows split into (token, head offset): the Q loader (`load_tile_g2s_rows`, the tile loader with a row-address function; the
+  one-stride loader is its wrapper), the KeyWindow masks and the band / block key bounds (`fwd_token<kCache>`), the partial rows
+  (`fwd_part_row`). Calls with sinks run unpacked (one sink per query head; `BandSoftmax::init` takes one per thread).
+- Split count, measured on packed shapes (`split_sweep.py`): the cap of step (a), partials within 1/4 of the K / V read, kept
+  too few splits once packing shrank the grid (GQA 16/2, 1.5k cache, q_len 11: 2 KV heads x 1-3 blocks; P100 351 us at the
+  automatic count against 68 with 16 splits). Now at least max(128, rows) keys per split (partials within ~2x of the read) and
+  4 resident blocks per SM on Pascal (compute bound, small tiles), 1 on SM 7.x: that shape 351 -> 82 us (P100), 59 -> 26 (T4),
+  109 -> 33 (V100), 257 -> 86 (1080 Ti); decode unchanged (rows <= 8).
+- One layer, d=128, B=1, us: HF's path before P6.8 -> step (a) -> step (b) (one-token decode x q_len for reference):
+
+| GPU | GQA 32/8, 16k, q_len 16 | GQA 32/8, 4k, q_len 4 | GQA 24/2, 4k, q_len 1 (SDPA before) | GQA 24/2, 4k, q_len 8 |
+|---|---|---|---|---|
+| V100 | 1202 -> 628 -> 181 (1819) | 307 -> 170 -> 58 (193) | 326 -> 157 -> 23 | 306 -> 161 -> 47 |
+| T4 | 592 -> 602 -> 296 (4359) | 154 -> 168 -> 92 (346) | 283 -> 123 -> 34 | 154 -> 130 -> 70 |
+| 2080 Ti | 721 -> 447 -> 165 (2192) | 186 -> 122 -> 56 (178) | 225 -> 91 -> 17 | 186 -> 96 -> 39 |
+| P100 | 7547 -> 3306 -> 1184 (3039) | 1894 -> 850 -> 195 (275) | 1130 -> 666 -> 70 | 1896 -> 684 -> 160 |
+| 1080 Ti | 5435 -> 2632 -> 1296 (3670) | 1364 -> 671 -> 198 (360) | 7218 -> 444 -> 68 | 1386 -> 455 -> 197 |
+
+  A verification step of 16 tokens now costs 1.1-1.6x the one-token decode on SM 7.x (the cache read once per KV head); on
+  Pascal it is compute bound (fp32 FMA: q_len 16, GQA 4, 16k is ~4.3 GFLOP, ~0.46 ms at the P100's peak, 1.18 ms measured).
+- Plain forward against a HEAD build, alternated on each box: within noise on V100, T4, 1080 Ti, 2080 Ti; P100 d=64 +1.4%, d=256
+  +1.1%, d=128 -0.7% (the generalised tile loader's inlining, the only change on that path).
+- End to end (as above, 1.5k prompt) ours / SDPA / eager, prompt lookup tok/s: V100 46.6 / 42.8 / 42.6, T4 39.8 / 33.2 / 34.5,
+  2080 Ti 56.2 / 49.7 / 50.2, P100 23.3 / 19.1 / 21.1, 1080 Ti 16.2 / 9.5 / 14.8: ours fastest everywhere, outputs identical to
+  plain greedy, no fallback (at 1.5k the attention is a small part of the step; the kernel gains grow with the cache).
 
 ## Acceptance
 - A verification step (q_len 2-16, cache 4-16k, GQA 4 and 12) within ~1.5x of its floor: the one-token decode time (the cache

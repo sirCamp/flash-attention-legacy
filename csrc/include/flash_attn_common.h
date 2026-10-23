@@ -92,6 +92,7 @@ struct FlashAttnParams {
     int num_splits;
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
+    int pack_gqa;                 // rows of the H_q / H_kv query heads of a KV head in one block (no sinks)
 };
 
 // ---------------------------------------------------------------------------
@@ -506,6 +507,13 @@ __host__ __device__ __forceinline__ int cdiv(int a, int b) {
     return (a + b - 1) / b;
 }
 
+// Query rows per token of a block of the cache forward (FlashAttnParams::pack_gqa):
+// the H_q / H_kv heads of a KV head packed, or one. One rule for the host's grid and
+// split count, the launcher and the kernel.
+__host__ __device__ __forceinline__ int gqa_rows_per_token(bool packed, int num_heads, int num_heads_k) {
+    return packed ? num_heads / num_heads_k : 1;
+}
+
 // ---------------------------------------------------------------------------
 // Device helpers shared by every kernel (one implementation each).
 // ---------------------------------------------------------------------------
@@ -534,16 +542,25 @@ struct TileRegs {
     uint4 v[kPerThread];
 };
 
-// Vector idx of a tile copy: row idx / kVecPerRow, 8 halves at column 8 * (idx % kVecPerRow).
-template <typename R>
-__device__ __forceinline__ uint4 tile_vec_load(const half* __restrict__ src, int src_row_stride,
-                                               int idx, int num_valid_rows, int num_valid_cols) {
+// Vector idx of a tile copy: row idx / kVecPerRow, 8 halves at column 8 * (idx % kVecPerRow); row r
+// starts at row_ptr(r) (rows of one stride: src + r * stride, the common case below; packed GQA
+// rows of the cache forward: a token and a head offset).
+template <typename R, typename RowPtr>
+__device__ __forceinline__ uint4 tile_vec_load_rows(RowPtr&& row_ptr, int idx, int num_valid_rows,
+                                                    int num_valid_cols) {
     const int row = idx / R::kVecPerRow;
     const int col = (idx % R::kVecPerRow) * 8;
     if ((R::kVecs % R::kThreads != 0 && idx >= R::kVecs) || row >= num_valid_rows || col >= num_valid_cols) {
         return make_uint4(0u, 0u, 0u, 0u);
     }
-    return *reinterpret_cast<const uint4*>(src + row * src_row_stride + col);
+    return *reinterpret_cast<const uint4*>(row_ptr(row) + col);
+}
+
+template <typename R>
+__device__ __forceinline__ uint4 tile_vec_load(const half* __restrict__ src, int src_row_stride,
+                                               int idx, int num_valid_rows, int num_valid_cols) {
+    return tile_vec_load_rows<R>([&](int row) { return src + row * src_row_stride; }, idx, num_valid_rows,
+                                 num_valid_cols);
 }
 
 template <typename R, int DST_STRIDE>
@@ -616,19 +633,26 @@ __device__ __forceinline__ void store_tile_r2s(
     }
 }
 
-// One vector at a time (no tile-sized register buffer).
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
-__device__ __forceinline__ void load_tile_g2s(
-    const half* __restrict__ src, int src_row_stride,
-    DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
+// One vector at a time (no tile-sized register buffer); rows at row_ptr(r) (see tile_vec_load_rows).
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT, typename RowPtr>
+__device__ __forceinline__ void load_tile_g2s_rows(
+    RowPtr&& row_ptr, DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
         const int idx = threadIdx.x + i * NUM_THREADS;
-        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load<R>(src, src_row_stride, idx, num_valid_rows,
-                                                                 num_valid_cols));
+        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load_rows<R>(row_ptr, idx, num_valid_rows, num_valid_cols));
     }
+}
+
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
+__device__ __forceinline__ void load_tile_g2s(
+    const half* __restrict__ src, int src_row_stride,
+    DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
+) {
+    load_tile_g2s_rows<ROWS, COLS, NUM_THREADS, DST_STRIDE>([&](int row) { return src + row * src_row_stride; },
+                                                             dst, num_valid_rows, num_valid_cols);
 }
 
 // ---------------------------------------------------------------------------

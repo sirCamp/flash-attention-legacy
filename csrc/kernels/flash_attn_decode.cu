@@ -297,15 +297,18 @@ int flash_attn_max_splits() { return kMaxSplits; }
 
 // Key splits (decode kernel, forward against a cache) for a grid of `blocks`
 // blocks without splits, `resident` of them per SM (decode: 4 blocks of 4
-// warps), on `sms` SMs, over a cache of max_len keys of which each block reads
-// K / V for `rows` query rows (no device read: CUDA-graph friendly): ~2 waves of
-// blocks; at least 128 keys per split, and few enough splits that their partials
-// (8 * rows * d bytes per split, written and read) stay within ~1/4 of the K / V
-// read (4 * max_len * d bytes); at most kMaxSplits. Sized by the capacity: a
-// large preallocated cache holding few keys gets more (empty) splits than it needs.
+// warps; the cache forward: 4 on Pascal, compute bound on small tiles, 1 on SM
+// 7.x, bandwidth bound on large ones), on `sms` SMs, over a cache of max_len keys
+// of which each block reads K / V for `rows` query rows (no device read:
+// CUDA-graph friendly): ~2 waves of blocks; at least max(128, rows) keys per
+// split (the partials, 8 * rows * d bytes per split written and read, stay
+// within ~2x of the K / V read, 4 * max_len * d: filling the GPU pays more, as
+// measured on packed speculative shapes); at most kMaxSplits. Sized by the
+// capacity: a large preallocated cache holding few keys gets more (empty)
+// splits than it needs.
 int flash_attn_num_splits(int blocks, int sms, int resident, int max_len, int rows) {
     const int want = cdiv(2 * sms * resident, blocks);
-    const int by_len = max(max_len / max(128, 8 * rows), 1);
+    const int by_len = max(max_len / max(128, rows), 1);
     return max(1, min(min(want, by_len), kMaxSplits));
 }
 

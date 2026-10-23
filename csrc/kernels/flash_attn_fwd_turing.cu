@@ -24,7 +24,7 @@ namespace flash_attn_legacy {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 
 struct TuringFwd {
-template <typename Tile, bool kPartial>
+template <typename Tile, bool kCache>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -106,7 +106,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             s[0][2 * n] = S[n][0]; s[0][2 * n + 1] = S[n][1];
             s[1][2 * n] = S[n][2]; s[1][2 * n + 1] = S[n][3];
         }
-        fwd_logits<kMask>(a, s, [&](int r) { return a.q_row_start + band_row0 + g + 8 * r; },
+        fwd_logits<kMask, kCache>(a, s, [&](int r) { return a.q_row_start + band_row0 + g + 8 * r; },
                           [&](int c) { return kv_start + 8 * (c / 2) + 2 * t + (c & 1); });
         float alpha[2];
         softmax.update(s, alpha);
@@ -138,7 +138,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         }
     };
 
-    fwd_band_run<Tile, LDH>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDH, kCache>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     float inv[2], lse[2];
@@ -147,12 +147,12 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     for (int r = 0; r < 2; r++) {
         const int row = band_row0 + g + 8 * r;  // within the Q block
         if (row >= a.valid_q) continue;
-        if (t == 0) fwd_store_lse<kPartial>(a, row, lse[r]);
+        if (t == 0) fwd_store_lse<kCache>(a, row, lse[r]);
         #pragma unroll
         for (int n = 0; n < ON; n++) {
             const int col = 8 * n + 2 * t;
             if (col < a.head_dim) {  // not a zero-padded column (d=72/80)
-                fwd_store_o<kPartial>(a, row, col, {O[n][2 * r] * inv[r], O[n][2 * r + 1] * inv[r]});
+                fwd_store_o<kCache>(a, row, col, {O[n][2 * r] * inv[r], O[n][2 * r + 1] * inv[r]});
             }
         }
     }
@@ -164,7 +164,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // Stub body for older device code — never launched there: the host selects the
 // family from the arch of the code that runs (compiled_arch_for).
 struct TuringFwd {
-    template <typename Tile, bool kPartial>
+    template <typename Tile, bool kCache>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 

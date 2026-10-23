@@ -802,10 +802,15 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         f.softcap = logit_softcap(softcap);
         f.sinks = data_or_null(sink);
         std::tie(f.window_left, f.window_right) = key_window(is_causal, window_left, window_right, q_len, max_len);
-        // Splits: each block reads its KV head's cache for its own q_len rows (resident: ~1 large block per SM)
-        const int blocks = cdiv(q_len, fwd_block_rows(sm, d)) * B * H_q;
+        // Packed GQA rows: the q_len tokens x H_q / H_kv query heads of a KV head in one block (its K / V
+        // read once for them); not with sinks (one per query head; those calls keep a block per head)
+        f.pack_gqa = !sink.defined() && H_q > H_kv;
+        const int rpt = gqa_rows_per_token(f.pack_gqa, H_q, H_kv);
+        // Splits: each block reads its KV head's cache for its q_len * rpt rows (resident blocks per SM: 4 on
+        // Pascal, compute bound on small tiles; 1 on SM 7.x, bandwidth bound on large ones)
+        const int blocks = cdiv(q_len * rpt, fwd_block_rows(sm, d)) * B * (H_q / rpt);
         f.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_max_splits()))
-                                      : flash_attn_num_splits(blocks, sms, 1, max_len, q_len);
+                                      : flash_attn_num_splits(blocks, sms, sm < 70 ? 4 : 1, max_len, q_len * rpt);
         // Partials of every split, even of one (the kernel variant of the cache; see fwd_batched_kernel)
         torch::Tensor o_part = torch::empty({f.num_splits, B, H_q, q_len, d}, q.options().dtype(torch::kFloat32));
         torch::Tensor lse_part = torch::empty({f.num_splits, B, H_q, q_len}, q.options().dtype(torch::kFloat32));
