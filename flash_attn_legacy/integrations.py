@@ -153,9 +153,6 @@ def _kernel_fallback_reason(module, query, key, value, attention_mask, dropout, 
     if q_len == 1:  # the decode kernel (flash_attn_with_kvcache) reads the cache in place
         if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype:
             return "decode", f" ({query.dtype})"
-        rows = query.shape[1] // key.shape[1]
-        if rows > DECODE_MAX_ROWS and query.dtype != torch.float16:  # beyond: the forward with key splits, fp16
-            return "decode", f" ({rows} query heads per KV head, {query.dtype})"
         if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
             return "decode", " (gradients)"
         if not (_decode_layout_ok(key) and _decode_layout_ok(value)):
@@ -555,12 +552,12 @@ def flash_attn_legacy_forward(
     # Short queries after a longer cache (verification steps of assisted / speculative
     # decoding, prompt lookup): flash_attn_with_kvcache reads the cache in place, the decode
     # kernel up to DECODE_MAX_ROWS query rows per KV head, the forward with key splits
-    # beyond (fp16 there), padding as its key mask (no unpad plan, no host sync; padded query
+    # beyond (bf16 on its CUDA-core body), padding as its key mask (no unpad plan, no host sync; padded query
     # rows attend their visible keys, rows with none output 0 as in the unpad plan); inference only.
     # Prefill and training stay on the kernels below.
     short_q = (reason is None and 1 < q_len <= SHORT_Q_MAX and q_len < kv_len and segments is None
                and not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
-               and (H_q // key.shape[1] * q_len <= DECODE_MAX_ROWS or query.dtype == key.dtype == torch.float16)
+               and query.dtype == key.dtype and query.dtype in (torch.float16, torch.bfloat16)
                and _decode_layout_ok(key) and _decode_layout_ok(value))
     if reason is None and (q_len == 1 or short_q):
         # The kernel skips the masked keys itself (any padding, no host sync)

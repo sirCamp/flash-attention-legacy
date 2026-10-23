@@ -127,9 +127,8 @@ def test_decode_4d_mask(monkeypatch, case):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_short_queries_on_kvcache(monkeypatch, dtype):
     """P6.8: the verification steps of prompt lookup (q_len 2..6 after a longer cache)
-    read the cache through flash_attn_with_kvcache, never through the forward (bf16 with
-    more than DECODE_MAX_ROWS rows per KV head stays on the forward); output identical to
-    plain greedy, no fallback."""
+    read the cache through flash_attn_with_kvcache, never through the forward (fp16 and
+    bf16 alike); output identical to plain greedy, no fallback."""
     base = tiny_llama(n_heads=8, n_kv_heads=2)  # 4 query heads per KV head: q_len 3+ beyond 8 rows
     model = load_impl(base, "flash_attn_legacy", dtype)
     torch.manual_seed(0)
@@ -141,22 +140,16 @@ def test_short_queries_on_kvcache(monkeypatch, dtype):
         counter = KernelCounter(monkeypatch)
         out = model.generate(ids, prompt_lookup_num_tokens=5, **kw)
     assert torch.equal(out, plain)
-    short_on_forward = [(q, kv) for q, kv in counter.calls if 1 < q < kv]
-    rows_per_kv = 4
-    if dtype == torch.float16:
-        assert short_on_forward == []
-    else:  # bf16: only the steps with more than 8 rows per KV head
-        assert all(q * rows_per_kv > integrations.DECODE_MAX_ROWS for q, _ in short_on_forward)
-    if dtype == torch.float16:  # some verification steps ran here (bf16: all beyond 8 rows, on the forward)
-        assert max(counter.decode_q_lens) > 1
+    assert [(q, kv) for q, kv in counter.calls if 1 < q < kv] == []
+    assert max(counter.decode_q_lens) > 1  # some verification steps ran here
     assert fallback_stats() == {}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_decode_mqa_beyond_decode_rows(monkeypatch, dtype):
-    """P6.8: 16 query heads per KV head at q_len 1 (beyond the decode kernel's 8 rows): fp16 on
-    flash_attn_with_kvcache (the forward with key splits), every step within the noise of FP32
-    eager; bf16 there falls back (recorded)."""
+    """P6.8: 16 query heads per KV head at q_len 1 (beyond the decode kernel's 8 rows) on
+    flash_attn_with_kvcache (the forward with key splits; bf16 on its CUDA-core body), every
+    step within the noise of FP32 eager."""
     base = tiny_llama(n_heads=16, n_kv_heads=1)
     ids = torch.randint(0, base.config.vocab_size, (1, 40), device="cuda")
     kw = dict(max_new_tokens=6, min_new_tokens=6, do_sample=False, return_dict_in_generate=True, output_logits=True)
@@ -169,23 +162,21 @@ def test_decode_mqa_beyond_decode_rows(monkeypatch, dtype):
     counter = KernelCounter(monkeypatch)
     out = gen("flash_attn_legacy", dtype)
     steps = kw["max_new_tokens"] - 1
-    if dtype == torch.float16:
-        assert len(counter.decode_calls) == steps * base.config.num_hidden_layers and fallback_stats() == {}
-    else:
-        assert counter.decode_calls == [] and fallback_stats() == {"decode": steps * base.config.num_hidden_layers}
+    assert len(counter.decode_calls) == steps * base.config.num_hidden_layers and fallback_stats() == {}
     for o, g, n in zip(out.logits, gold.logits, noise.logits):
         assert_close_to_gold(o.float(), g.float(), n.float(), f"MQA 16:1 decode {dtype}")
 
 
-def test_short_queries_with_padding_on_kvcache(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_short_queries_with_padding_on_kvcache(monkeypatch, dtype):
     """P6.8: short queries after a longer cache with left padding (2D mask): flash_attn_with_kvcache
     with the padding as its key mask (no unpad plan), the decode kernel (8 rows per KV head) and the
-    forward with key splits (16); within FP32."""
+    forward with key splits (16); within FP32 (bf16: within its output rounding)."""
     torch.manual_seed(1)
     B, kv = 3, 48
     for q_len, layout in ((2, "left"), (4, "left"), (4, "holes")):
-        q = torch.randn(B, 8, q_len, 64, device="cuda", dtype=torch.float16)
-        k, v = (torch.randn(B, 2, kv, 64, device="cuda", dtype=torch.float16) for _ in range(2))
+        q = torch.randn(B, 8, q_len, 64, device="cuda", dtype=dtype)
+        k, v = (torch.randn(B, 2, kv, 64, device="cuda", dtype=dtype) for _ in range(2))
         pad = torch.ones(B, kv, dtype=torch.long, device="cuda")
         pad[1, :9] = 0
         pad[2, :30] = 0
@@ -196,7 +187,8 @@ def test_short_queries_with_padding_on_kvcache(monkeypatch):
         out, _ = integrations.flash_attn_legacy_forward(_Attn(is_causal=True), q, k, v, pad, scaling=0.125)
         causal = torch.ones(q_len, kv, dtype=torch.bool, device="cuda").tril(kv - q_len)
         ref = _reference(q, k, v, 0.125, pad[:, None, None, :].bool() & causal)
-        torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=2e-3, rtol=2e-3)
+        tol = 2e-3 if dtype == torch.float16 else 1e-2
+        torch.testing.assert_close(out.transpose(1, 2).float(), ref, atol=tol, rtol=tol)
         assert counter.decode_q_lens == [q_len] and counter.varlen_calls == [] and fallback_stats() == {}
 
 

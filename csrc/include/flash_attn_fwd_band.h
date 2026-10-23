@@ -286,13 +286,13 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
 // cores: converted once, when stored). With Tile::kPrefetch the next K/V block
 // is loaded into registers while the current one is computed; otherwise each
 // block is copied straight to shared memory at its turn.
-template <typename Tile, int LD, bool kCache, typename DstT, typename Step>
+template <typename Tile, int LD, bool kCache, bool kBf16 = false, typename DstT, typename Step>
 __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row0, bool band_active,
                                              DstT* smem_Q, DstT* smem_K, DstT* smem_V, Step&& step) {
     constexpr int Br = Tile::Br, Bc = Tile::Bc, d = Tile::d, NT = Tile::kNumWarps * 32;
     auto load_q = [&]() {
         if constexpr (kCache) {  // rows from token 0 of head h0: (token, head offset), packed or not
-            load_tile_g2s_rows<Br, d, NT, LD>([&](int r) {
+            load_tile_g2s_rows<Br, d, NT, LD, false, kBf16>([&](int r) {
                 const FwdRow x = fwd_row(a, a.q_row_start + r);
                 return a.Q + index_t(x.token) * a.q_stride + index_t(x.head) * a.q_head_stride;
             }, smem_Q, a.valid_q, a.head_dim);
@@ -328,8 +328,8 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
                 }
             },
             [&]() {
-                store_tile_r2s<Bc, d, NT, LD>(next_K, smem_K);
-                store_tile_r2s<Bc, d, NT, LD>(next_V, smem_V);
+                store_tile_r2s<Bc, d, NT, LD, kBf16>(next_K, smem_K);
+                store_tile_r2s<Bc, d, NT, LD, kBf16>(next_V, smem_V);
             },
             step);
     } else {
@@ -340,13 +340,13 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
                 const int kv_start = pending * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
                 if (kCache && (a.block_table || a.key_mask)) {  // per-row addresses only when needed (uniform)
-                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
+                    load_tile_g2s_rows<Bc, d, NT, LD, true, kBf16>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
                                                             smem_K, valid_kv, a.head_dim);
-                    load_tile_g2s_rows<Bc, d, NT, LD, true>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
+                    load_tile_g2s_rows<Bc, d, NT, LD, true, kBf16>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
                                                             smem_V, valid_kv, a.head_dim);
                 } else {
-                    load_tile_g2s<Bc, d, NT, LD>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
-                    load_tile_g2s<Bc, d, NT, LD>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
+                    load_tile_g2s<Bc, d, NT, LD, kBf16>(a.K + kv_start * a.k_stride, a.k_stride, smem_K, valid_kv, a.head_dim);
+                    load_tile_g2s<Bc, d, NT, LD, kBf16>(a.V + kv_start * a.v_stride, a.v_stride, smem_V, valid_kv, a.head_dim);
                 }
             },
             step);
@@ -361,7 +361,7 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
 // plain forward carries none of it (a runtime branch or even the per-batch
 // length load made the compiler lay the kernel out differently: Pascal d=128
 // +23% on the P100, d=64 +9% on the 1080 Ti).
-template <typename Tile, typename Body, bool kCache>
+template <typename Tile, typename Body, bool kCache, bool kBf16 = false>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_batched_kernel(FlashAttnParams p) {
     // Flat grid: x = (batch * heads) * q_blocks + q_block (no 65535 limit on
@@ -464,7 +464,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.key_mask = nullptr;
         a.block_table = nullptr;
     }
-    Body::template run<Tile, kCache>(a);
+    Body::template run<Tile, kCache, kBf16>(a);
 }
 
 template <typename Tile, typename Body>
@@ -511,7 +511,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.sinks = nullptr;
     a.key_mask = nullptr;
     a.block_table = nullptr;
-    Body::template run<Tile, false>(a);
+    Body::template run<Tile, false, false>(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,13 +524,20 @@ void launch_fwd(FlashAttnParams& params, cudaStream_t stream) {
     const int64_t blocks = int64_t(cdiv(params.seq_len_q * rpt, Tile::Br)) * params.batch_size * (params.num_heads / rpt);
     if (blocks > INT32_MAX) throw std::runtime_error("flash_attn_legacy: batch * heads * query blocks exceeds the grid limit");
     const dim3 grid(static_cast<unsigned>(blocks), max(params.num_splits, 1));
-    auto launch = [&](auto cache) {
-        const auto kernel = fwd_batched_kernel<Tile, Body, decltype(cache)::value>;
+    auto launch = [&](auto cache, auto bf16) {
+        const auto kernel = fwd_batched_kernel<Tile, Body, decltype(cache)::value, decltype(bf16)::value>;
         FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
     };
-    if (params.O_part) launch(std::true_type{});  // flash_attn_with_kvcache: partials, even of one split
-    else               launch(std::false_type{});
+    if (!params.O_part) {
+        launch(std::false_type{}, std::false_type{});
+    } else if (!params.bf16) {  // flash_attn_with_kvcache: partials, even of one split
+        launch(std::true_type{}, std::false_type{});
+    } else if constexpr (Body::kBf16Inputs) {  // bf16 inputs: CUDA-core bodies (fp32 tiles)
+        launch(std::true_type{}, std::true_type{});
+    } else {
+        throw std::runtime_error("flash_attn_legacy: bf16 inputs need the CUDA-core forward");
+    }
 }
 
 template <typename Tile, typename Body>

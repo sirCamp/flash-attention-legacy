@@ -101,6 +101,7 @@ struct FlashAttnParams {
     float* __restrict__ O_part;   // [splits, B, H_q, N_q, d] fp32, normalized
     float* __restrict__ L_part;   // [splits, B, H_q, N_q], log2 domain
     int pack_gqa;                 // rows of the H_q / H_kv query heads of a KV head in one block
+    int bf16;                     // Q / K / V bf16 (read as fp32 by the CUDA-core body)
 };
 
 // ---------------------------------------------------------------------------
@@ -576,8 +577,9 @@ __device__ __forceinline__ uint4 tile_vec_load(const half* __restrict__ src, int
                                  num_valid_cols);
 }
 
-template <typename R, int DST_STRIDE>
+template <typename R, int DST_STRIDE, bool kBf16 = false>
 __device__ __forceinline__ void tile_vec_store(half* __restrict__ dst, int idx, uint4 v) {
+    static_assert(!kBf16, "bf16 tiles are converted to fp32 (CUDA-core bodies only)");
     static_assert(DST_STRIDE % 8 == 0, "128-bit tile copies need DST_STRIDE % 8 == 0");
     if (R::kVecs % R::kThreads == 0 || idx < R::kVecs) {
         *reinterpret_cast<uint4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
@@ -616,19 +618,28 @@ __device__ __forceinline__ int varlen_seq_of_block(const int* __restrict__ offse
     return lo;
 }
 
-// fp32 destination: the 8 halves are converted once, when stored (the CUDA-core
-// kernels compute in fp32 from shared memory).
-template <typename R, int DST_STRIDE>
+// fp32 destination: the 8 elements are converted once, when stored (the CUDA-core
+// kernels compute in fp32 from shared memory): half, or with kBf16 bf16 (the cache
+// forward's bf16 inputs; bf16 -> fp32 is a shift, exact).
+template <typename R, int DST_STRIDE, bool kBf16 = false>
 __device__ __forceinline__ void tile_vec_store(float* __restrict__ dst, int idx, uint4 v) {
     static_assert(DST_STRIDE % 4 == 0, "128-bit tile copies need DST_STRIDE % 4 == 0 (floats)");
     if (R::kVecs % R::kThreads == 0 || idx < R::kVecs) {
-        const half2* h = reinterpret_cast<const half2*>(&v);
-        const float2 f0 = __half22float2(h[0]), f1 = __half22float2(h[1]);
-        const float2 f2 = __half22float2(h[2]), f3 = __half22float2(h[3]);
         float4* d4 = reinterpret_cast<float4*>(dst + (idx / R::kVecPerRow) * DST_STRIDE
                                                + (idx % R::kVecPerRow) * 8);
-        d4[0] = make_float4(f0.x, f0.y, f1.x, f1.y);
-        d4[1] = make_float4(f2.x, f2.y, f3.x, f3.y);
+        if constexpr (kBf16) {
+            const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+            d4[0] = make_float4(__uint_as_float(w[0] << 16), __uint_as_float(w[0] & 0xffff0000u),
+                                __uint_as_float(w[1] << 16), __uint_as_float(w[1] & 0xffff0000u));
+            d4[1] = make_float4(__uint_as_float(w[2] << 16), __uint_as_float(w[2] & 0xffff0000u),
+                                __uint_as_float(w[3] << 16), __uint_as_float(w[3] & 0xffff0000u));
+        } else {
+            const half2* h = reinterpret_cast<const half2*>(&v);
+            const float2 f0 = __half22float2(h[0]), f1 = __half22float2(h[1]);
+            const float2 f2 = __half22float2(h[2]), f3 = __half22float2(h[3]);
+            d4[0] = make_float4(f0.x, f0.y, f1.x, f1.y);
+            d4[1] = make_float4(f2.x, f2.y, f3.x, f3.y);
+        }
     }
 }
 
@@ -653,20 +664,20 @@ __device__ __forceinline__ void load_tile_g2r(
                                                 num_valid_rows, num_valid_cols);
 }
 
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, bool kBf16 = false, typename DstT>
 __device__ __forceinline__ void store_tile_r2s(
     const TileRegs<ROWS, COLS, NUM_THREADS>& regs, DstT* __restrict__ dst
 ) {
     using R = TileRegs<ROWS, COLS, NUM_THREADS>;
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
-        tile_vec_store<R, DST_STRIDE>(dst, threadIdx.x + i * NUM_THREADS, regs.v[i]);
+        tile_vec_store<R, DST_STRIDE, kBf16>(dst, threadIdx.x + i * NUM_THREADS, regs.v[i]);
     }
 }
 
 // One vector at a time (no tile-sized register buffer); rows at row_ptr(r) (see tile_vec_load_rows).
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, bool kNullRows = false, typename DstT,
-          typename RowPtr>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, bool kNullRows = false, bool kBf16 = false,
+          typename DstT, typename RowPtr>
 __device__ __forceinline__ void load_tile_g2s_rows(
     RowPtr&& row_ptr, DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
 ) {
@@ -674,18 +685,18 @@ __device__ __forceinline__ void load_tile_g2s_rows(
     #pragma unroll
     for (int i = 0; i < R::kPerThread; i++) {
         const int idx = threadIdx.x + i * NUM_THREADS;
-        tile_vec_store<R, DST_STRIDE>(dst, idx, tile_vec_load_rows<R, kNullRows>(row_ptr, idx, num_valid_rows,
-                                                                                 num_valid_cols));
+        tile_vec_store<R, DST_STRIDE, kBf16>(dst, idx, tile_vec_load_rows<R, kNullRows>(row_ptr, idx, num_valid_rows,
+                                                                                        num_valid_cols));
     }
 }
 
-template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, typename DstT>
+template <int ROWS, int COLS, int NUM_THREADS, int DST_STRIDE = COLS, bool kBf16 = false, typename DstT>
 __device__ __forceinline__ void load_tile_g2s(
     const half* __restrict__ src, int src_row_stride,
     DstT* __restrict__ dst, int num_valid_rows, int num_valid_cols = COLS
 ) {
-    load_tile_g2s_rows<ROWS, COLS, NUM_THREADS, DST_STRIDE>([&](int row) { return src + row * src_row_stride; },
-                                                             dst, num_valid_rows, num_valid_cols);
+    load_tile_g2s_rows<ROWS, COLS, NUM_THREADS, DST_STRIDE, false, kBf16>(
+        [&](int row) { return src + row * src_row_stride; }, dst, num_valid_rows, num_valid_cols);
 }
 
 // ---------------------------------------------------------------------------

@@ -744,9 +744,6 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     // verification, MQA): the forward kernels with key splits, on the same cache
     const int rows = H_q / H_kv * q_len;
     const bool on_forward = rows > flash_attn_decode_max_rows();
-    TORCH_CHECK_NOT_IMPLEMENTED(!on_forward || q.dtype() == torch::kFloat16,
-                "flash_attn_with_kvcache with (num_heads_q / num_heads_kv) * q_len = ", rows, " > ",
-                flash_attn_decode_max_rows(), " query rows per KV head: float16 only for now");
     int block_shift = -1;  // log2(block_size) for a power of 2: shifts instead of divisions
     if (paged && (k_cache.size(1) & (k_cache.size(1) - 1)) == 0) {
         block_shift = 0;
@@ -786,10 +783,14 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
     TORCH_CHECK(num_splits >= 0, "num_splits must be >= 0 (0 = automatic)");
     if (on_forward) {  // q, out [B, q_len, H_q, d] and the cache [B, max_len, H_kv, d] read through their strides
         FlashAttnParams f = {};
-        f.Q = reinterpret_cast<const half*>(q.data_ptr<at::Half>());
-        f.K = reinterpret_cast<const half*>(k_cache.data_ptr<at::Half>());
-        f.V = reinterpret_cast<const half*>(v_cache.data_ptr<at::Half>());
-        f.O = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+        // fp16, or bf16 read as fp32 by the CUDA-core body (exact: no fp16 range limit) on any GPU
+        const bool bf16 = q.dtype() == torch::kBFloat16;
+        f.bf16 = bf16;
+        const int fam = bf16 ? 60 : sm;  // the kernel family that runs
+        f.Q = reinterpret_cast<const half*>(q.data_ptr());
+        f.K = reinterpret_cast<const half*>(k_cache.data_ptr());
+        f.V = reinterpret_cast<const half*>(v_cache.data_ptr());
+        f.O = nullptr;  // the cache kernel writes partials; the combine writes out
         f.L = lse.data_ptr<float>();
         f.batch_size = B; f.num_heads = H_q; f.num_heads_k = H_kv; f.head_dim = d;
         f.seq_len_q = q_len;
@@ -817,17 +818,17 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_with_kvcache(
         const int rpt = gqa_rows_per_token(f.pack_gqa, H_q, H_kv);
         // Splits: each block reads its KV head's cache for its q_len * rpt rows (resident blocks per SM: 4 on
         // Pascal, compute bound on small tiles; 1 on SM 7.x, bandwidth bound on large ones)
-        const int blocks = cdiv(q_len * rpt, fwd_block_rows(sm, d)) * B * (H_q / rpt);
+        const int blocks = cdiv(q_len * rpt, fwd_block_rows(fam, d)) * B * (H_q / rpt);
         f.num_splits = num_splits > 0 ? int(std::min<int64_t>(num_splits, flash_attn_max_splits()))
-                                      : flash_attn_num_splits(blocks, sms, sm < 70 ? 4 : 1, max_len, q_len * rpt);
+                                      : flash_attn_num_splits(blocks, sms, fam < 70 ? 4 : 1, max_len, q_len * rpt);
         // Partials of every split, even of one (the kernel variant of the cache; see fwd_batched_kernel)
         torch::Tensor o_part = torch::empty({f.num_splits, B, H_q, q_len, d}, q.options().dtype(torch::kFloat32));
         torch::Tensor lse_part = torch::empty({f.num_splits, B, H_q, q_len}, q.options().dtype(torch::kFloat32));
         f.O_part = o_part.data_ptr<float>();
         f.L_part = lse_part.data_ptr<float>();
-        run_fwd(f, sm, stream);
+        run_fwd(f, fam, stream);
         flash_attn_split_combine({f.O_part, f.L_part, out.data_ptr(), lse.data_ptr<float>(), out.stride(0),
-                                  out.stride(1), out.stride(2), B, q_len, H_q, d, f.num_splits}, false, stream);
+                                  out.stride(1), out.stride(2), B, q_len, H_q, d, f.num_splits}, bf16, stream);
         FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
         return {out, lse};
     }

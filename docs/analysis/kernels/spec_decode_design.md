@@ -174,7 +174,24 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   paged cache (a uniform branch per tile): on contiguous unmasked caches the one-stride loader, as fast as before (the per-row
   function on every 16-byte vector cost up to 22% on the P100). Equal bit for bit to the same cache contiguous (NHD, HND,
   vLLM layouts; block sizes 16 / 32 / 48 / 64).
-- Still open (beyond 8 rows): BF16. Sinks with packed rows done: `fwd_softmax_init`
+- BF16 beyond 8 rows done: the cache kernel of the CUDA-core (Pascal) body, compiled for every architecture, reads bf16
+  Q / K / V tiles exactly as fp32 (a shift of the 16-bit word, no fp16 range); the tensor-core bodies stay fp16-only
+  (`kBf16Inputs`). Before: SDPA for MQA / GQA > 8:1 bf16 decode (20-60x slower than fp16) and the plain forward for bf16
+  verification steps (5-10x slower than the fp16 cache path). One layer, d=128, B=1, us, fp16 cache path / bf16 now /
+  bf16 before (plain forward, scaled) / bf16 SDPA:
+
+  | GPU | 32/8, 16k, q_len 16 | 24/2, 16k, q_len 1 (decode) |
+  |---|---|---|
+  | P100 | 1331 / 1311 / 8970 / 8063 | 208 / 208 / SDPA 4702 |
+  | 1080 Ti | 1498 / 1502 / 6528 / 9065 | 244 / 242 / SDPA 5804 |
+  | V100 | 182 / 721 / 1867 / 3809 | 56 / 127 / SDPA 1942 |
+  | T4 | 301 / 1727 / 1892 / 13203 | 98 / 211 / SDPA 6142 |
+  | 2080 Ti | 170 / 936 / 1380 / 6007 | 60 / 90 / SDPA 2780 |
+
+  On Pascal bf16 costs as fp16 (the same body). On SM 7.x the CUDA-core body is compute bound for 64 rows per KV head
+  (the split count is near the best of a sweep on the T4): a bf16 path on the tensor-core bodies (bf16 -> fp16 with a
+  power-of-2 scale in the loader) is the open refinement.
+- Sinks with packed rows done: `fwd_softmax_init`
   gives each row of the cache kernel its query head's sink (split 0; the plain forward keeps the head's one). `cache_leftpad` done: the cache
   kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 

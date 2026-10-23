@@ -40,8 +40,10 @@ namespace flash_attn_legacy {
 // (wmma_acc_layout).
 // ---------------------------------------------------------------------------
 struct VoltaFwd {
-template <typename Tile, bool kCache>
+static constexpr bool kBf16Inputs = false;  // bf16 Q / K / V (the cache forward): not on tensor cores
+template <typename Tile, bool kCache, bool kBf16>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
+    static_assert(!kBf16, "bf16 inputs run on the CUDA-core forward");
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int d  = Tile::d;
@@ -201,7 +203,8 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // Stub body for SM < 7.0 device code — never launched there: the host selects the
 // family from the arch of the code that runs (compiled_arch_for).
 struct VoltaFwd {
-    template <typename Tile, bool kCache>
+    static constexpr bool kBf16Inputs = false;
+    template <typename Tile, bool kCache, bool kBf16>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 

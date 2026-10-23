@@ -111,8 +111,8 @@ The integration decides **per attention call** whether our kernel can run, and n
 | BF16 / FP32 inference | kernel (FP16 compute, inputs scaled into range on the GPU) |
 | Mixed precision training / inference under FP16 `torch.autocast` | kernel (FP16, as SDPA under autocast) |
 | Decode (`q_len == 1`): dynamic / static caches, left padding, sliding window, softcap, sinks, FP16 or BF16 caches | decode kernel (`flash_attn_with_kvcache`, split-KV, the cache read in place) |
-| Short queries after a longer cache (assisted / speculative decoding and prompt lookup verification steps, q_len 2-64), MQA / GQA > 8:1 decode | `flash_attn_with_kvcache`: the decode kernel up to 8 query rows per KV head, beyond it the forward kernels with key splits and packed GQA rows (FP16, no padding) |
-| Padding with holes inside a row (prefill; decode handles it on the kernel), unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast, FP32 decode, more than 8 query rows per KV head in BF16 or with a padding mask | SDPA fallback |
+| Short queries after a longer cache (assisted / speculative decoding and prompt lookup verification steps, q_len 2-64), MQA / GQA > 8:1 decode | `flash_attn_with_kvcache`: the decode kernel up to 8 query rows per KV head, beyond it the forward kernels with key splits and packed GQA rows (FP16 on the architecture's body, BF16 on the CUDA-core one, read as FP32; padding as a key mask) |
+| Padding with holes inside a row (prefill; decode handles it on the kernel), unsupported head_dim, attention dropout, BF16/FP32 training outside FP16 autocast, FP32 decode | SDPA fallback |
 | Logit softcapping (Gemma 2) | kernel (`softcap`) |
 | Attention sinks (gpt-oss `s_aux`) | kernel (`sinks`, trainable) |
 | Additive position bias (T5 family: T5, mT5, LongT5, UDOP, Switch Transformers, ...) | SDPA fallback (the bias in SDPA's mask, as HF's SDPA) |

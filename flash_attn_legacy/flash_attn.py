@@ -575,8 +575,8 @@ def flash_attn_with_kvcache(
     Inference only. Up to DECODE_MAX_ROWS (8) query rows per KV head
     ((H_q / H_kv) * q_len) the split-KV decode kernel on CUDA cores (every
     supported GPU); beyond (speculative verification, MQA / GQA > 8:1) the
-    forward kernels with key splits and packed GQA rows on the same cache (float16
-    and a contiguous cache for now; docs/analysis/kernels/spec_decode_design.md).
+    forward kernels with key splits and packed GQA rows on the same cache (bf16 on
+    the CUDA-core forward, read as fp32; docs/analysis/kernels/spec_decode_design.md).
 
     Args:
         q: [B, q_len, H_q, d] float16 or bfloat16 (q_len small: decode, speculation)

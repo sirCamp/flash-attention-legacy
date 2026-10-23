@@ -24,8 +24,10 @@ namespace flash_attn_legacy {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 
 struct TuringFwd {
-template <typename Tile, bool kCache>
+static constexpr bool kBf16Inputs = false;  // bf16 Q / K / V (the cache forward): not on tensor cores
+template <typename Tile, bool kCache, bool kBf16>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
+    static_assert(!kBf16, "bf16 inputs run on the CUDA-core forward");
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
     constexpr int d  = Tile::d;
@@ -164,7 +166,8 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // Stub body for older device code — never launched there: the host selects the
 // family from the arch of the code that runs (compiled_arch_for).
 struct TuringFwd {
-    template <typename Tile, bool kCache>
+    static constexpr bool kBf16Inputs = false;
+    template <typename Tile, bool kCache, bool kBf16>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 

@@ -22,7 +22,8 @@
 namespace flash_attn_legacy {
 
 struct PascalFwd {
-template <typename Tile, bool kCache>
+static constexpr bool kBf16Inputs = true;  // bf16 Q / K / V (the cache forward)
+template <typename Tile, bool kCache, bool kBf16>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -157,7 +158,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         __syncwarp();  // P^T reads done before the next block overwrites it
     };
 
-    fwd_band_run<Tile, LDF, kCache>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDF, kCache, kBf16>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     float inv[4], lse[4];
