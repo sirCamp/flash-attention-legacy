@@ -57,7 +57,8 @@ q_len (that re-reads K/V).
   / split 0 starts as (m = sink, l = 1), every other at (-inf, 0); split 0 never exits early when sinks are present.
 - Keys: by range. The split ranges cover the rows' visible range (intersection of [leftpad, seqlens) with the union of the R rows'
   KeyWindow), chunk = ceil(range / splits) rounded to the warp key step, computed on the device; per-element masks only at the
-  range edges. Paged: key j at block_table[b][j / block_size] * block_size + j % block_size (`kPaged`), else the strided address.
+  range edges. Paged: key j at block_table[b][j / block_size] * block_size + j % block_size (`kPaged`), else the strided address;
+  each lane reads the table once per block (its keys step through a block), not once per key.
 - num_splits on the host without syncs (CUDA graph friendly): from B * H_kv, the SM count and the cache capacity (or a max_seqlen
   hint): target ~2 waves, chunk >= 128 keys, cap 128; 1 for short contexts. num_splits == 1 writes O / lse directly; otherwise
   normalized fp32 O_s and lse_s go to a workspace and the combine computes lse = M + log sum exp(lse_s - M) (M == -inf: O = 0,
@@ -124,4 +125,22 @@ h. Done: latency of the key step. The rows of a step ran one after another (per-
    | B=1 d=64 GQA 32/4 (R=8) 1k | 77.0 -> 20.7 | 72.5 -> 20.8 | 98.0 -> 28.4 | 86.8 -> 33.9 |
 
    V100 now reaches 600-680 GB/s on the large cases (~75% of the peak), T4 stays at its ~250 GB/s bound; small grids
-   (B = 1, few KV heads) remain latency bound (fixed cost per block). Open: prefetch of the paged block indices.
+   (B = 1, few KV heads) remain latency bound (fixed cost per block).
+i. Done: paged addressing (P6.9 step b found it in transformers' continuous batching, where every decode step is paged).
+   Each lane re-read its key's block-table entry before every K / V load (a dependent load per key; the next key's
+   prefetch waited on it); now the lane keeps its block index and K / V bases and reads the table only when its key
+   enters a new block. Paged decode, pages of 256 shuffled, kernel + combine us, HEAD -> new (min of two alternated
+   runs; the contiguous path unchanged within noise on every GPU):
+
+   | case (fp16, d=128 unless noted) | V100 | T4 | P100 | 2080 Ti | 1080 Ti |
+   |---|---|---|---|---|---|
+   | B=8 GQA 2/2 (R=1) 16k | 195 -> 190 | 523 -> 527 | 380 -> 309 | 240 -> 245 | 462 -> 400 |
+   | B=8 GQA 8/2 (R=4) 16k | 204 -> 198 | 534 -> 528 | 507 -> 365 | 250 -> 249 | 589 -> 409 |
+   | B=8 GQA 16/2 (R=8) 16k | 305 -> 281 | 647 -> 600 | 688 -> 596 | 300 -> 280 | 936 -> 815 |
+   | B=1 GQA 32/8 (R=4) 16k | 118 -> 115 | 282 -> 274 | 269 -> 188 | 135 -> 134 | 311 -> 228 |
+   | B=16 d=64 GQA 32/8 (R=4) 4k | 207 -> 202 | 557 -> 549 | 547 -> 379 | 255 -> 251 | 622 -> 460 |
+   | B=16 d=64 GQA 64/8 (R=8) 16k | 1030 -> 932 | 3139 -> 2983 | 2657 -> 2298 | 1376 -> 1274 | 3844 -> 3394 |
+
+   Pascal gained most (P100 and 1080 Ti up to 31-33%) (the table load was on the critical path of its fp32 key step); SM 7.x up to 10% at R = 8.
+   Tried again, not kept: C = 2 / 4 keys per group and step with one rescale per step (as in g): the P100 does not gain
+   consistently, C = 4 is slower everywhere (registers), the T4 / 2080 Ti gain only at R = 8 with large grids.

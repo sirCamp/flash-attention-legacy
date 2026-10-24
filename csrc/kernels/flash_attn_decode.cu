@@ -99,9 +99,26 @@ decode_kernel(DecodeParams p) {
     const typename Elem::T* V = static_cast<const typename Elem::T*>(p.v) + hk * p.v_head_stride +
                                 (kPaged ? 0 : b * p.v_batch_stride);
     const int* table = kPaged ? p.block_table + index_t(b) * p.max_blocks : nullptr;
-    auto key_offset = [&](int j, index_t batch_stride, index_t seq_stride) -> index_t {
-        if constexpr (kPaged) return paged_row_offset(table, j, p.block_size, p.block_shift, batch_stride, seq_stride);
-        else return j * seq_stride;
+    // Paged: the lane's keys step through a block, so its K / V bases are read from
+    // the table once per block (not per key: a dependent load before each K row)
+    int cur_block = -1;
+    index_t k_base = 0, v_base = 0;
+    auto key_offsets = [&](int j, index_t& ko, index_t& vo) {
+        if constexpr (kPaged) {
+            const int blk = paged_block(j, p.block_size, p.block_shift);
+            if (blk != cur_block) {
+                const index_t page = table[blk];
+                k_base = page * p.k_batch_stride;
+                v_base = page * p.v_batch_stride;
+                cur_block = blk;
+            }
+            const int slot = j - blk * p.block_size;
+            ko = k_base + slot * p.k_seq_stride;
+            vo = v_base + slot * p.v_seq_stride;
+        } else {
+            ko = j * p.k_seq_stride;
+            vo = j * p.v_seq_stride;
+        }
     };
     // The rows see keys [first_key(0), last_key(q_len - 1)] (causal / window
     // aligned to the end, seqlen), none before the left padding; this split takes
@@ -149,8 +166,10 @@ decode_kernel(DecodeParams p) {
             in_range = j <= key_end && (mrow == nullptr || mrow[j]);
             ku = make_uint4(0, 0, 0, 0); vu = make_uint4(0, 0, 0, 0);
             if (active && in_range) {
-                ku = *reinterpret_cast<const uint4*>(K + key_offset(j, p.k_batch_stride, p.k_seq_stride) + 8 * li);
-                vu = *reinterpret_cast<const uint4*>(V + key_offset(j, p.v_batch_stride, p.v_seq_stride) + 8 * li);
+                index_t ko, vo;
+                key_offsets(j, ko, vo);
+                ku = *reinterpret_cast<const uint4*>(K + ko + 8 * li);
+                vu = *reinterpret_cast<const uint4*>(V + vo + 8 * li);
             }
         };
         bool next_in_range;
