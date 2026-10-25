@@ -209,14 +209,14 @@ saved against the smaller of their peaks; "only ours" = SDPA and eager run out o
 
 | | V100 32 GB | T4 16 GB | P100 16 GB | 1080 Ti 11 GB | 2080 Ti 11 GB |
 |---|---|---|---|---|---|
-| Prefill, TinyLlama 1.1B, 4k tokens | **3.42x**, -3.9 GiB | **3.89x**, -3.9 GiB | **1.72x**, -3.9 GiB | **1.71x**, -3.9 GiB | **3.28x**, -3.9 GiB |
-| Prefill, Qwen2.5-3B, 8k tokens | **2.30x**, -7.7 GiB | only ours | only ours | only ours | only ours |
-| Decode, Qwen2.5-3B, B=8, 2k prompt | 1.17x, -3.2 GiB | **2.20x**, -3.2 GiB | **1.75x**, -3.2 GiB | only ours | only ours |
-| Decode, compiled static cache, TinyLlama, B=8, 2k | **1.96x**, -8.2 GiB | **3.20x**, -9.0 GiB | - | - | only ours |
-| Training step, TinyLlama, 1k tokens | **1.34x**, -3.0 GiB | **1.45x**, -3.0 GiB | 1.07x, -3.0 GiB | 1.01x, -3.0 GiB | **1.70x**, -3.0 GiB |
-| Training, gradient checkpointing, TinyLlama, 4k | **2.72x**, -5.9 GiB | **3.22x**, -5.9 GiB | **1.47x**, -5.9 GiB | only ours | only ours |
-| Training, checkpointing, padded batch B=4, TinyLlama, 2k | **1.38x** | **1.40x** | **1.39x** | **5.67x** | **1.33x** |
-| LoRA r=16, checkpointing, Qwen2.5-3B, 2k | **1.34x** | **1.41x** | 1.03x | 1.02x | only ours |
+| Prefill, TinyLlama 1.1B, 4k tokens | **3.38x**, -3.9 GiB | **3.97x**, -3.9 GiB | **1.71x**, -3.9 GiB | **1.72x**, -3.9 GiB | **3.21x**, -3.9 GiB |
+| Prefill, Qwen2.5-3B, 8k tokens | **2.33x**, -7.7 GiB | only ours | only ours | only ours | only ours |
+| Decode, Qwen2.5-3B, B=8, 2k prompt | 1.20x, -3.2 GiB | **2.19x**, -3.2 GiB | **1.77x**, -3.2 GiB | only ours | only ours |
+| Decode, compiled static cache, TinyLlama, B=8, 2k | **1.93x**, -8.2 GiB | **3.24x**, -9.0 GiB | - | - | only ours |
+| Training step, TinyLlama, 1k tokens | **1.34x**, -3.0 GiB | **1.43x**, -3.0 GiB | 1.07x, -3.0 GiB | 1.01x, -3.0 GiB | **1.71x**, -3.0 GiB |
+| Training, gradient checkpointing, TinyLlama, 4k | **2.72x**, -5.9 GiB | **3.19x**, -5.9 GiB | **1.47x**, -5.9 GiB | only ours | only ours |
+| Training, checkpointing, padded batch B=4, TinyLlama, 2k | **1.37x** | **1.38x** | **1.37x** | **5.65x** | **1.32x** |
+| LoRA r=16, checkpointing, Qwen2.5-3B, 2k | **1.33x** | **1.40x** | 1.03x | 1.01x | only ours |
 
 Longest sequence that fits (ours / the better of SDPA and eager; ">=" = no longer length measured):
 
@@ -241,7 +241,7 @@ difference 0.0026). With gradient checkpointing on the large-vocabulary models (
 full-vocabulary fp32 logits of HF's loss take most of the memory, so the length gain shrinks (LoRA on the V100: Qwen2.5-3B 8k
 for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.53x V100, 2.69x T4); on TinyLlama (32k
 vocabulary) checkpointing with our kernel trains 4-8x longer sequences. On the 1080 Ti SDPA with a padding mask runs its fp16
-kernel, which sm_61 executes at 1/64 rate: hence 5.67x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
+kernel, which sm_61 executes at 1/64 rate: hence 5.65x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
 layers in 4, here on transformers' PyTorch reference) run at parity or a little faster (compiled decode 1.02-1.31x), with the memory saving. Decode reads the cache in place with
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
@@ -261,22 +261,26 @@ Ours changes as many answers relative to eager as SDPA does (2-21 per task: fp16
 standard error.
 
 Speculative / assisted decoding (`python benchmarks/speculative.py`, [`docs/bench/speculative.md`](docs/bench/speculative.md)):
-a verification step of 16 tokens on a 16k cache costs one layer 181 us on the V100 (the plain forward 1205, SDPA 1293), 296 on
-the T4 (592 / 1195), 1184 on the P100 (7547 / 4577); HF prompt lookup and assisted generation run fastest with our backend
+a verification step of 16 tokens on a 16k cache costs one layer 186 us on the V100 (the plain forward 1376, SDPA 1269), 297 on
+the T4 (594 / 1196), 1164 on the P100 (7506 / 4577); HF prompt lookup and assisted generation run fastest with our backend
 on every GPU.
+
+Serving with transformers' continuous batching (`model.generate_batch`, paged cache; `python benchmarks/serving.py`,
+[`docs/bench/serving.md`](docs/bench/serving.md)): generated tokens/s 4.9-16x SDPA's best on V100, T4, P100 and 2080 Ti
+(Qwen2.5-0.5B and 3B, up to 8 x 8192-token prompts), 31-117x on the 1080 Ti; `paged|eager` runs out of memory.
 
 Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
 results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
 
 | | fwd d=64 | fwd d=128 | fwd d=256 | fwd+bwd d=64 | fwd+bwd d=128 | fwd+bwd d=256 |
 |---|---|---|---|---|---|---|
-| V100 | 0.92 | 1.12 | 0.66 | 0.95 | 1.04 | 1.01 |
-| T4 | 0.55 | 0.53 | 0.57 | 0.80 | 0.77 | 0.90 |
-| 2080 Ti | 0.68 | 0.68 | 0.61 | 0.83 | 0.77 | 0.97 |
-| P100 | 0.79 | 1.25 | 1.79 | 0.66 | 0.70 | 0.94 |
+| V100 | 0.92 | 1.06 | 0.66 | 0.95 | 1.03 | 1.01 |
+| T4 | 0.54 | 0.54 | 0.59 | 0.81 | 0.78 | 0.90 |
+| 2080 Ti | 0.70 | 0.67 | 0.60 | 0.83 | 0.76 | 0.97 |
+| P100 | 0.80 | 1.24 | 1.81 | 0.66 | 0.70 | 0.91 |
 | 1080 Ti | 0.06 | 0.08 | 0.12 | 0.08 | 0.09 | 0.10 |
 
-Above 1: the V100 at d=128 (forward 1.12, fwd+bwd 1.04) and d=256 fwd+bwd (1.01), and the P100 forward at d=128 / 256 (no
+Above 1: the V100 at d=128 (forward 1.06, fwd+bwd 1.03) and d=256 fwd+bwd (1.01), and the P100 forward at d=128 / 256 (no
 tensor cores on Pascal: fp32 FMAs); the
 1080 Ti gap comes from the arithmetic: SDPA computes in fp16, which sm_61 runs at 1/64 of the fp32 rate, the kernel in fp32.
 
