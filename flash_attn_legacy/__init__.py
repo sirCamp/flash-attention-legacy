@@ -26,7 +26,7 @@ Quick start:
     >>> out_gqa = flash_attention(q, k_gqa, v_gqa, causal=True)
 """
 
-__version__ = "0.5.0"
+__version__ = "1.0.0"
 
 from .flash_attn import (
     flash_attention,
