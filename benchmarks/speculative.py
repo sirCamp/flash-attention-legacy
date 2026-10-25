@@ -110,7 +110,9 @@ def run_generate_impl(args):
             dt = time.perf_counter() - t
         new = out[0, ids.shape[1]:]
         ref = new if ref is None else ref
-        same = "yes" if torch.equal(new, ref) else "no"
+        # fp16 near-ties: a verification step (q_len > 1) may round a logit differently than one-token decode
+        differ = (new != ref).nonzero()
+        same = "yes" if differ.numel() == 0 else f"first {differ[0].item()} tokens"
         print(f"| {args.impl} | {ids.shape[1]} | {name} | {args.new_tokens / dt:.1f} | {same} |", flush=True)
     stats = flash_attn_legacy.fallback_stats()
     if stats:
@@ -142,7 +144,7 @@ def main():
     import torch
     print(f"#### {torch.cuda.get_device_name()}: {args.model}, fp16, {args.new_tokens} new tokens (decode tok/s)\n")
     print("| implementation | prompt tokens | mode | tok/s | output = plain greedy |")
-    print("|---|---|---|---|---|")
+    print("|---|---|---|---|---|", flush=True)  # before the workers' rows
     failed = False
     for impl in args.impls:
         if subprocess.run([sys.executable, __file__, *sys.argv[1:], "--impl", impl]).returncode:
