@@ -141,6 +141,7 @@ i. Done: paged addressing (P6.9 step b found it in transformers' continuous batc
    | B=16 d=64 GQA 32/8 (R=4) 4k | 207 -> 202 | 557 -> 549 | 547 -> 379 | 255 -> 251 | 622 -> 460 |
    | B=16 d=64 GQA 64/8 (R=8) 16k | 1030 -> 932 | 3139 -> 2983 | 2657 -> 2298 | 1376 -> 1274 | 3844 -> 3394 |
 
-   Pascal gained most (P100 and 1080 Ti up to 31-33%) (the table load was on the critical path of its fp32 key step); SM 7.x up to 10% at R = 8.
+   Pascal gained most, up to 31-33% (the table load was on the critical path of its fp32 key step); SM 7.x up to 10% at
+   R = 8.
    Tried again, not kept: C = 2 / 4 keys per group and step with one rescale per step (as in g): the P100 does not gain
    consistently, C = 4 is slower everywhere (registers), the T4 / 2080 Ti gain only at R = 8 with large grids.
