@@ -1,6 +1,6 @@
 # End-to-end benchmarks on HuggingFace models
 
-`python benchmarks/models.py` (raw results: `models_<gpu>.jsonl` in this folder; these tables: `--report`). transformers 5.20.2,
+`python benchmarks/models.py --models <hf id> ... --save` (raw results: `models_<gpu>.jsonl` in this folder; these tables: `--report`). transformers 5.20.2,
 torch 2.7.1, fp16 weights, kernels at commit 5d1da96 (the earlier runs, at 5ad45ca, agree within the noise: median time
 ratio new / old 0.995-1.014 per GPU and backend). GPUs: V100 32 GB, T4 16 GB, P100 16 GB, GTX 1080 Ti 11 GB, RTX 2080 Ti 11 GB. Models: TinyLlama 1.1B, Qwen2.5-3B / 14B, Gemma 2 2B, Mistral 7B,
 Llama 3.1 8B, Qwen3.5 2B / 4B / 9B (not every model on every GPU). Each model and implementation runs in its own processes (one
@@ -17,7 +17,7 @@ memory at the next length), `>= N` means no longer N was measured.
   `generate_static_compiled` = a reused StaticCache with HF's compiled decode step (SM >= 7.0: inductor needs Triton). Every
   compiled step is one graph, no graph break, for all three backends.
 - train: one AdamW step, fp16 autocast + GradScaler; trainable in fp32 the attention projections (`train`), or rank-16 LoRA
-  adapters on them (`train_lora`, peft), the rest frozen in fp16; `_ckpt` = gradient checkpointing. B=1 is one full row;
+  adapters on them (`--lora 16`, peft; run with checkpointing only), the rest frozen in fp16; `_ckpt` = gradient checkpointing. B=1 is one full row;
   B=4 is a padded batch (lengths N down to N/2, right padding, attention mask: our varlen path), tokens/s counting real tokens.
 - Beyond the main lengths (16k prefill, 8k prompts, 8k train), our kernel alone was run up to 128k prefill, 64k prompts (the
   compiled decode too) and 64k train with checkpointing, one repetition each, to find its limit.
@@ -40,7 +40,7 @@ What bounds the length.
   the full-vocabulary logits and the loss in fp32, several GiB at 8k, so where all three backends fit their peaks are nearly
   equal and the length gain shrinks (LoRA on the V100: Qwen2.5-3B 8k for all, Llama 3.1 8B 8k against 4k). A chunked
   cross-entropy would move that limit; it is in the model, not in the attention. The speedup remains (LoRA Qwen2.5-3B 4k:
-  1.53x on the V100, 2.69x on the T4).
+  1.54x on the V100, 2.68x on the T4).
 - Weights: Qwen2.5-14B (27.75 GiB) leaves no room for LoRA training on 32 GB, Llama 3.1 8B (14.97 GiB) almost none on 16 GB.
 
 Reading the numbers.

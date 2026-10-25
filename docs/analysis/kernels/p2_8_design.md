@@ -1,21 +1,21 @@
 # P2.8 design: FA2-style warp-band forward
 
-Status: steps 0, 1, 2 and 5 done (see the step list); the code is the reference where this design differs. Baseline: `docs/bench/*.json` in git history (commit 81e45f9); current numbers in the same files.
+Status: steps 0, 1, 2, 3, 5 and 6 done (see the step list; step 3 as P7.3); the code is the reference where this design differs. Baseline: `docs/bench/*.json` in git history (commit 81e45f9); current numbers in the same files.
 
-**As implemented** (differs from the original plan below): the shared part is `csrc/include/flash_attn_fwd_band.h` (`FwdBlockArgs`, batched/varlen kernels, `fwd_key_masked`, `BandSoftmax<ROWS, ROW_LANES>`, `fwd_band_loop`, `fwd_band_run` with the Q/K/V copies and optional K/V register prefetch, host launchers). Each family is a `Body` with `run<Tile>(const FwdBlockArgs&)`: `VoltaFwd` (WMMA, staged S/P) and `PascalFwd` (fp32 register micro-tile), instead of a per-op `Mma` policy. Tiles: `TileVolta_*` / `TilePascal_*` in `flash_attn_common.h`, chosen by measurement (comments there).
+**As implemented** (differs from the original plan below): the shared part is `csrc/include/flash_attn_fwd_band.h` (`FwdBlockArgs`, batched/varlen kernels, `fwd_key_masked`, `BandSoftmax<ROWS, ROW_LANES>`, `fwd_band_loop`, `fwd_band_run` with the Q/K/V copies and optional K/V register prefetch, `fwd_batched_kernel` / `fwd_varlen_kernel`, host launchers). Each family is a `Body` with `run<Tile>(const FwdBlockArgs&)` (now `run<Tile, kCache, kBf16, kRows>`): `TuringFwd` (`mma.sync` m16n8k8, `flash_attn_fwd_turing.cu`, step 3), `VoltaFwd` (WMMA, staged S/P) and `PascalFwd` (fp32 register micro-tile), instead of a per-op `Mma` policy. Tiles: `TileTuring_*` / `TileVolta_*` / `TilePascal_*` in `flash_attn_common.h`, chosen by measurement (comments there).
 
-## Constraints from the current code
-- One block body per family (`volta_fwd_block`, `pascal_fwd_block`) shared by the batched and varlen kernels; today they return a per-thread lse (thread = row).
-- Varlen `block_offsets` come from `flash_attn_fwd_{volta,pascal}_block_rows(d)` on the host: any new family must go through the same selection.
+## Constraints from the code of the time (original plan)
+- One block body per family (`volta_fwd_block`, `pascal_fwd_block`; now the `VoltaFwd` / `PascalFwd` bodies) shared by the batched and varlen kernels; today they return a per-thread lse (thread = row).
+- Varlen `block_offsets` come from `flash_attn_fwd_{volta,pascal}_block_rows(d)` on the host: any new family must go through the same selection (now also `flash_attn_fwd_turing_block_rows`, selected by `fwd_block_rows(sm, d)` in `csrc/flash_attn_legacy.cpp`).
 - `FLASH_ATTN_LEGACY_FORCE_ARCH=volta` runs the WMMA path on a T4; an `mma.sync m16n8k8` path runs only on sm_75+.
 - lse convention: natural log, scale applied, `row_max + logf(fmaxf(row_sum, 1e-20f))`; fully masked rows: lse = -inf, O = 0. The backward depends on it.
 
 ## Architecture: one body, three MMA policies
-`fwd_band_block<Tile, Mma>` in `csrc/include/flash_attn_fwd_block.h`. Each warp owns a band of 16 query rows (`Br = 16 * warps`). The body owns block geometry, the K/V loop (with register prefetch), the unmasked/masked causal split, the online softmax (log2 domain, as FA2), and the L write (`L_ptr`, `l_stride`: 1 batched, `num_heads` varlen). The policy provides the fragments and `qk`, `for_each_s(row, col, float&)`, `make_p`, `rescale_o`, `pv`, `store_o`, plus `kRowsPerThread` / `kRowLanes` for the generic xor-shuffle row reductions. `row_sum` stays a per-thread partial and is reduced once at the end.
+`fwd_band_block<Tile, Mma>` in `csrc/include/flash_attn_fwd_block.h` (original plan; now `fwd_band_run` / `fwd_band_loop` / `fwd_batched_kernel` in `csrc/include/flash_attn_fwd_band.h`, one `Body` per family). Each warp owns a band of 16 query rows (`Br = 16 * warps`). The body owns block geometry, the K/V loop (with register prefetch), the unmasked/masked causal split, the online softmax (log2 domain, as FA2), and the L write (`L_ptr`, `l_stride`: 1 batched, `num_heads` varlen). The policy provides the fragments and `qk`, `for_each_s(row, col, float&)`, `make_p`, `rescale_o`, `pv`, `store_o`, plus `kRowsPerThread` / `kRowLanes` for the generic xor-shuffle row reductions. `row_sum` stays a per-thread partial and is reduced once at the end.
 
 Softmax: `scale_log2 = scale * log2(e)`; per KV block `m_new = max(m_old, rowmax)`, `m_use = m_new == -inf ? 0 : m_new`, `alpha = exp2(m_old - m_use)`, `p = exp2(s*scale_log2 - m_use)`; final `lse = m*ln2 + log(max(sum, 1e-20))`. Output is no longer bit-identical to the old kernel (tests use tolerances).
 
-### Turing: `MmaSm75` (mma.sync.m16n8k8 f32.f16.f16.f32 + ldmatrix)
+### Turing: `MmaSm75` (original plan; now `TuringFwd`) (mma.sync.m16n8k8 f32.f16.f16.f32 + ldmatrix)
 Lane `g = lane>>2`, `t = lane&3`: per 8-column n-tile a thread holds rows g, g+8, cols 2t, 2t+1 (c0,c1 / c2,c3); `kRowsPerThread = 2`, `kRowLanes = 4`. S = Bc/2 regs, O = d/2 regs, Q in registers (`ldmatrix.x4`, d/4 regs; Q kept in smem at d=256). K via `ldmatrix` (no trans), V via `ldmatrix.trans`. P as the A operand straight from S: for k-step kk, `A = {half2(S[kk].c0,c1), half2(S[kk].c2,c3)}` (the m16n8k8 C layout equals the A layout; the reason to use k8 rather than k16). Smem rows stride d+8 halves.
 
 ### Volta: `MmaWmmaStaged` (WMMA 16x16x16 with per-warp staging)
@@ -46,16 +46,16 @@ for j:
 ```
 
 ## Causal: masking only on diagonal blocks
-`fwd_kv_nomask_limit(causal, q_row_start, Bc, seq_len_q, seq_len_k) = min(seq_len_k / Bc, causal ? max(0, (q_row_start + seq_len_k - seq_len_q + 1) / Bc) : INT_MAX)` next to `fwd_kv_limit`; `iter<false>` then `iter<true>` (one source, two instantiations). Masked: `col >= seq_len_k`, `causal && col > row + seq_len_k - seq_len_q`. Fully masked bands keep m = -inf (O = 0, lse = -inf) and still hit every barrier.
+`fwd_kv_nomask_limit(causal, q_row_start, Bc, seq_len_q, seq_len_k) = min(seq_len_k / Bc, causal ? max(0, (q_row_start + seq_len_k - seq_len_q + 1) / Bc) : INT_MAX)` next to `fwd_kv_limit`; `iter<false>` then `iter<true>` (one source, two instantiations) (original plan; now `fwd_band_loop`'s `nomask_first` / `nomask_last` from `KeyWindow::first_key` / `last_key`, masked and unmasked steps of one loop). Masked: `col >= seq_len_k`, `causal && col > row + seq_len_k - seq_len_q`. Fully masked bands keep m = -inf (O = 0, lse = -inf) and still hit every barrier.
 
 ## Implementation order (one change at a time; tests on all GPUs, benchmark, ptxas, review)
-0. Groundwork, behaviour neutral: (a) shared WMMA helpers in `flash_attn_wmma.h` (forward + backward); (b) g2r/r2s split; (c) blocks write L; (d) `fwd_kv_nomask_limit` + split loop in the current kernels; (e) tests: raw lse vs FP32, unaligned N (15, 17, 63, 65, 127), causal n_q >> n_k (200, 5), varlen segments 1/15/17/65, d=256 N=4096.
+0. **Done**: groundwork, behaviour neutral: (a) shared WMMA helpers in `flash_attn_wmma.h` (forward + backward); (b) g2r/r2s split; (c) blocks write L; (d) `fwd_kv_nomask_limit` + split loop in the current kernels; (e) tests: raw lse vs FP32, unaligned N (15, 17, 63, 65, 127), causal n_q >> n_k (200, 5), varlen segments 1/15/17/65, d=256 N=4096.
 1. **Done**: warp-band WMMA body (staged) for sm_70/75 replaces the thread-per-row `volta_fwd_block` (V100 fwd N=4096 d=64 9.5 -> 5.6 ms, d=128 24.2 -> 11.6; T4 26.1 -> 14.0, 48.6 -> 27.9). The `Mma` policy split (shared `fwd_band_block` in its own header) is deliberately done in step 3, when the second policy exists, instead of abstracting around a single user; the loop, masking and softmax must then live once in the shared body.
-2. Register prefetch in the body.
-3. `MmaSm75` (Turing); `FORCE_ARCH=volta` keeps WMMA testable on T4; `sm` passed to `*_block_rows` so launch and varlen offsets share one selection.
+2. **Done**: register prefetch in the body.
+3. **Done** (P7.3): `MmaSm75` (Turing; now `TuringFwd`, `flash_attn_fwd_turing.cu`); `FORCE_ARCH=volta` keeps WMMA testable on T4; `sm` passed to `*_block_rows` so launch and varlen offsets share one selection.
 4. Tuning (staged O stores, per-warp n-tile skipping on the diagonal, tile sweep). Acceptance: forward N=4096 within 1.5x of SDPA mem-efficient on V100 and T4.
 5. **Done**: `PascalFwd` (fp32 register micro-tile, fp32 shared memory) replaces the thread-per-row forward, inside the shared band header (P2.1 for the forward). N=4096 causal, P100 / 1080 Ti: d=64 27 -> 12.2 / 74 -> 15.4 ms (P100 now 0.78x SDPA mem-efficient), d=128 81 -> 52 / 176 -> 41, d=256 1768 -> 285 (P100). Open: d=128/256 on Pascal (TN=1 tiles are shared-memory bound, d=256 runs one-warp blocks).
-6. Cleanup (old bodies and tiles), PLAN §1b/§3b, regenerate `occupancy_table.md`.
+6. **Done**: cleanup (old bodies and tiles), PLAN §1b/§3b, regenerate `occupancy_table.md`.
 7. Optional: Volta `mma.m8n8k4`.
 
 ## Risks

@@ -18,11 +18,12 @@ the pybind kernels `forward` (7), `locals()` in `flash_attn_with_kvcache` (5), `
 
 ## Decisions
 1. **Ops registered natively** with `TORCH_LIBRARY(flash_attn_legacy, m)` + `TORCH_LIBRARY_IMPL(..., CUDA, m)` in the
-   extension: `forward`, `backward`, `forward_varlen`, `backward_varlen`, `with_kvcache`. Python calls `torch.ops.flash_attn_legacy.*`;
+   extension: `forward`, `backward`, `forward_varlen`, `backward_varlen`, `with_kvcache` (at P6.5 time; `kvcache_append`
+   added in P6.9). Python calls `torch.ops.flash_attn_legacy.*`;
    fake (meta) implementations in Python with `torch.library.register_fake` (shapes only). Measured on T4: a Python
    `torch.library.custom_op` adds ~32 us of host time per call (11.7 -> 43.7 us for a decode call), the dispatcher entry of a
    C++ op ~1-2 us. The pybind entries of the kernels are removed (one way to call them); pybind keeps the helpers
-   (`compiled_archs`, `decode_max_rows`, `decode_num_splits`).
+   (`compiled_archs`, `decode_max_rows`, `num_splits`).
    - Schema types: float -> double, int -> int64_t; `bwd` always returns 4 tensors (dsinks `[0]` fp32 without sinks: no
      undefined tensors in outputs, which fake tensors / functionalization reject).
    - Autograd stays in the `torch.autograd.Function`s (dynamo traces them; their forward / backward call the ops).
@@ -62,13 +63,15 @@ a. Native op registration + fake implementations + traceable wrappers. Tests: `t
    flash_attn_with_kvcache, equal to eager; host overhead of a decode call unchanged.
 b. Decode key mask in the kernel; HF decode path without host syncs.
 c. Mask builder without host reads under tracing / static caches.
-d. Measure (probe above, end-to-end generate on a real model on P100 / T4), docs.
+d. Measure (probe above, end-to-end generate on real models: results on V100 / T4 / 2080 Ti, inductor does not run on
+   Pascal), docs.
 
 ## Results (step c, T4, tiny Llama, B=2, 64 new tokens, one StaticCache reused across calls)
 | | eager | compiled (HF generate, inductor) |
 |---|---|---|
 | sdpa | 254 ms | 102 ms |
 | flash_attn_legacy | 259 ms | 103 ms |
+
 No graph break in a compiled decode step (as SDPA), logits within fp16 noise of eager. The gain comes from step b (the
 static cache's 4D decode mask on the kernel, no host sync) and the import moved out of the builder. Note: `generate` with
 `cache_implementation="static"` allocates a new cache per call and recompiles on every call (guards on the cache tensors'
@@ -97,4 +100,4 @@ the 4D mask run a single query row with little parallelism over the keys and rea
 - No graph break from flash_attn_legacy in a compiled decode step with a static cache (`torch._dynamo` counters), and a
   compiled static-cache generate not slower than the eager one on the probe model and on a real model.
 - Compiled training step: no graph break from the attention calls (without padding).
-- Eager host time per call: +6 us per kernel call (dispatcher), accepted; all suites green on the 4 GPUs.
+- Eager host time per call: +6 us per kernel call (dispatcher), accepted; all suites green on the 5 GPUs (V100, T4, P100, 1080 Ti, 2080 Ti).

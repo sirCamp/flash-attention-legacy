@@ -10,8 +10,9 @@
             repeated, a boolean causal mask)
   generate  HF greedy generate of --new-tokens after a long prompt (a piece of this repository's code
             to rewrite, so prompt lookup finds candidates): plain, assisted (--draft model) and prompt
-            lookup, per attention implementation (the draft uses the same one), decode tokens/s and
-            whether the output equals plain greedy; each implementation in its own process
+            lookup, per attention implementation (the draft uses the same one), new tokens over the whole
+            generate time (prefill included) and whether the output equals plain greedy; each
+            implementation in its own process
 
 Usage:
     python benchmarks/speculative.py kernel
@@ -142,7 +143,7 @@ def main():
     if args.impl:
         return run_generate_impl(args)
     import torch
-    print(f"#### {torch.cuda.get_device_name()}: {args.model}, fp16, {args.new_tokens} new tokens (decode tok/s)\n")
+    print(f"#### {torch.cuda.get_device_name()}: {args.model}, fp16, {args.new_tokens} new tokens (tok/s, prefill included)\n")
     print("| implementation | prompt tokens | mode | tok/s | output = plain greedy |")
     print("|---|---|---|---|---|", flush=True)  # before the workers' rows
     failed = False

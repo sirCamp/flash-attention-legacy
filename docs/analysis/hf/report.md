@@ -1,7 +1,9 @@
 # flash_attn_legacy vs HF transformers 5.20.2: how attention is dispatched, and where we fall short
 
+> **Snapshot before P0** (transformers 5.20.2 at the time). The R-items and recommendations are resolved, see `docs/PLAN.md` (§1, §3); each row carries its resolving entry. The present tense below describes the code at the time.
+
 Paths are relative to `/workspace/venv/lib/python3.12/site-packages/transformers/`. Line numbers are from 5.20.2.
-Evidence comes from two sources: reading the code, and a CPU-only probe in `/workspace/analysis/hf/` (`probe.py`, `scenarios.py`, `scenarios2.py`, `scenarios3.py`).
+Evidence comes from two sources: reading the code, and a CPU-only probe in `/workspace/analysis/hf/` (tracked in `docs/analysis/hf/`) (`probe.py`, `scenarios.py`, `scenarios2.py`, `scenarios3.py`).
 - The probe reproduces the decision logic of `integrations.py` (mask builder + attention function). A pure-torch stand-in replaces the CUDA kernel: plain bottom-right causal or full attention with GQA, ignoring every extra kwarg, which is what the kernel path does today.
 - Each result is compared with `eager` on tiny random models.
 - Anything marked UNVERIFIED was not checked.
@@ -129,29 +131,29 @@ Root cause: when our builder hands off to `sdpa_mask`, a returned `None` carries
 
 | # | Case | Mechanism | Severity | Probe result |
 |---|---|---|---|---|
-| **R1** | **StaticCache prefill** (`generate(cache_implementation="static")`) | kv_length=max_cache_len (cache_utils.py:480-484). Our offset check hands off to sdpa, and sdpa returns None because q_offset==0 (masking_utils.py:276-279). The kernel then runs bottom-right causal over q=12, kv=32, including 20 empty slots. The cache of later layers is corrupted too. | **CRITICAL**, silent | prefill max\|d\|=0.91; generate(static) tokens differ; generate(dynamic) matches |
-| **R2** | Gemma2 softcap (gemma2:274) | Ignored on both paths. HF sdpa ignores it too; FA2 and eager honor it. | HIGH for Gemma2 | softcap=2 with scaled q/k: 0.89 (same as HF sdpa) |
-| **R3** | VLM vision encoders under a "flash" name | `mask=None` plus `cu_seq_lens` (qwen2_vl:406-422). We attend across all images, and over the whole image where Qwen2.5-VL expects windows (qwen2_5_vl:442-473). | **CRITICAL** for VLMs | WRONG under `flash_attn_legacy`; exact (0) under `legacy_attn` |
-| **R4** | gpt_oss sinks (gpt_oss:321) | Ignored on both paths. `_supports_sdpa=False`, and our patch bypasses the compatible-fallback. | **CRITICAL** for gpt-oss | 0.75 |
-| R5 | Packing through `cu_seq_lens` only (collator `return_flash_attn_kwargs=True, return_position_ids=False`) | The builder returns None and `cu_seq_lens` is ignored, so attention crosses sequences. Same as eager/sdpa; FA2 handles it. | MEDIUM (FA2 parity gap) | 0.86 |
-| R6 | Packed `position_ids` plus an all-ones mask | Packing detection is skipped when a mask is present (masking_utils.py:840). Same as eager/sdpa; FA2 handles it. | MEDIUM (FA2 parity gap) | 0.86 (eager: 0.86) |
-| R7 | Packed, no mask (default collator) | Correct via a 4D mask and SDPA, with O(N^2) memory. | perf | ok |
-| R8 | Padding (causal or bidirectional) | Correct via SDPA. | perf | ok |
-| R9 | Sliding window (mistral/qwen3/gemma/modernbert) | Correct. Kernel only when kv < window. | ok | ok |
+| **R1** (resolved: P0.2) | **StaticCache prefill** (`generate(cache_implementation="static")`) | kv_length=max_cache_len (cache_utils.py:480-484). Our offset check hands off to sdpa, and sdpa returns None because q_offset==0 (masking_utils.py:276-279). The kernel then runs bottom-right causal over q=12, kv=32, including 20 empty slots. The cache of later layers is corrupted too. | **CRITICAL**, silent | prefill max\|d\|=0.91; generate(static) tokens differ; generate(dynamic) matches |
+| **R2** (resolved: P0.3, P4.2) | Gemma2 softcap (gemma2:274) | Ignored on both paths. HF sdpa ignores it too; FA2 and eager honor it. | HIGH for Gemma2 | softcap=2 with scaled q/k: 0.89 (same as HF sdpa) |
+| **R3** (resolved: P0.4, P3.3) | VLM vision encoders under a "flash" name | `mask=None` plus `cu_seq_lens` (qwen2_vl:406-422). We attend across all images, and over the whole image where Qwen2.5-VL expects windows (qwen2_5_vl:442-473). | **CRITICAL** for VLMs | WRONG under `flash_attn_legacy`; exact (0) under `legacy_attn` |
+| **R4** (resolved: P0.3, P4.3) | gpt_oss sinks (gpt_oss:321) | Ignored on both paths. `_supports_sdpa=False`, and our patch bypasses the compatible-fallback. | **CRITICAL** for gpt-oss | 0.75 |
+| R5 (resolved: P0.4, P3.2) | Packing through `cu_seq_lens` only (collator `return_flash_attn_kwargs=True, return_position_ids=False`) | The builder returns None and `cu_seq_lens` is ignored, so attention crosses sequences. Same as eager/sdpa; FA2 handles it. | MEDIUM (FA2 parity gap) | 0.86 |
+| R6 (resolved: P3.2) | Packed `position_ids` plus an all-ones mask | Packing detection is skipped when a mask is present (masking_utils.py:840). Same as eager/sdpa; FA2 handles it. | MEDIUM (FA2 parity gap) | 0.86 (eager: 0.86) |
+| R7 (resolved: P3.2) | Packed, no mask (default collator) | Correct via a 4D mask and SDPA, with O(N^2) memory. | perf | ok |
+| R8 (resolved: P3.1) | Padding (causal or bidirectional) | Correct via SDPA. | perf | ok |
+| R9 (resolved: P4.1) | Sliding window (mistral/qwen3/gemma/modernbert) | Correct. Kernel only when kv < window. | ok | ok |
 | R10 | DynamicCache chunked prefill / decode | Correct. | ok | ok |
-| R11 | dtype | bf16/fp32 are cast to fp16 (integrations.py:80-91). bf16 models such as Gemma can overflow fp16. | MEDIUM | UNVERIFIED on GPU |
-| R12 | v_head_dim != d (MLA) | No padding of V. | LOW-MED | UNVERIFIED |
-| R13 | `position_bias` (sdpa_attention.py:89, 164-168) | Ignored. | LOW | which models use it: UNVERIFIED |
+| R11 (resolved: P0.5, superseded by P6.2) | dtype | bf16/fp32 are cast to fp16 (integrations.py:80-91; the cast was replaced by power-of-2 scaling on the GPU in P6.2). bf16 models such as Gemma can overflow fp16. | MEDIUM | UNVERIFIED on GPU |
+| R12 (resolved: P0.3, SDPA) | v_head_dim != d (MLA) | No padding of V. | LOW-MED | UNVERIFIED |
+| R13 (resolved: P0.3, P4.4) | `position_bias` (sdpa_attention.py:89, 164-168) | Ignored. | LOW | which models use it: UNVERIFIED |
 | R14 | `or_mask_function`, `and_mask_function`, `block_sequence_ids` | Correct: they force a 4D mask and the SDPA fallback. | ok | - |
 
 ## 5. Recommendations
 
-1. **Fix R1.** After handing off, if sdpa returned None while `q_length > 1 and q_length != kv_length`, call it again with `allow_is_causal_skip=False`. Add StaticCache and static-generate tests.
-2. **Fix R2/R4/R12/R13.**
+1. (resolved: P0.2) **Fix R1.** After handing off, if sdpa returned None while `q_length > 1 and q_length != kv_length`, call it again with `allow_is_causal_skip=False`. Add StaticCache and static-generate tests.
+2. (resolved: P0.3; softcap / sinks in the kernel P4.2 / P4.3, `position_bias` P4.4) **Fix R2/R4/R12/R13.**
    - If softcap, s_aux or position_bias is present, or V's head dim differs from Q's, use an eager-style fallback that builds the mask itself (bottom-right causal plus padding).
    - Later, add softcap and sinks to the kernel.
-3. **Rename** to a name without "flash", and keep `flash_attn_legacy` as a deprecated alias. This drops the monkey-patch, fixes R3 and the Llama4 raise, and stops FA-only inputs. The head_dim check is already done per call.
-4. **Native padding/packing (option B).**
+3. (superseded: P0.9, name `flash_attn_legacy` kept; R3 fixed by P0.4 instead) **Rename** to a name without "flash", and keep `flash_attn_legacy` as a deprecated alias. This drops the monkey-patch, fixes R3 and the Llama4 raise, and stops FA-only inputs. The head_dim check is already done per call.
+4. (resolved: P0.4, P2.4, P3.1, P3.2, P4.1) **Native padding/packing (option B).**
    - **Mask builder:**
      - None when the mask is plain, fully valid and end-aligned.
      - A 2D `(B,kv)` mask when the only deviation is padding. Require: plain `mask_function`, int offsets, `kv_offset==0`, no active window, and mask length equal to kv_length.
@@ -167,9 +169,9 @@ Root cause: when our builder hands off to `sdpa_mask`, a returned `None` carries
      - GQA
      - **native varlen backward** (no `.item()` loop)
      - optional `window_size`
-5. **Training.**
+5. (packing resolved: P3.2; attention dropout still open, P6.4) **Training.**
    - Gradient checkpointing only forces `use_cache=False` and `past=None` (modeling_layers.py:82-111). The kwargs are unchanged, and the attention function is called twice (forward and recompute).
    - Attention dropout defaults to 0.0 for llama, qwen2/3, mistral, gemma2/3, phi3, gpt_oss and modernbert. It is **0.1** for bert, roberta, xlm-roberta and gpt2, so those currently train through the SDPA fallback.
    - The collator defaults to `return_position_ids=True, return_flash_attn_kwargs=False` (data/data_collator.py:1298-1302), so packed training hits R7.
    - Trainer has no flash logic. TRL: UNVERIFIED.
-6. **Tests.** Turn every R-row into an eager-equivalence test. The probe scripts in this directory can serve as templates.
+6. (resolved: P0.8b) **Tests.** Turn every R-row into an eager-equivalence test. The probe scripts in this directory can serve as templates.

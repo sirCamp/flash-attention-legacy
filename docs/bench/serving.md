@@ -38,22 +38,22 @@ workload with SDPA and graphs on was stopped by the 2-hour limit of the run (the
 |---|---|---|---|---|---|---|---|---|---|
 | Qwen2.5-0.5B | 64 | 512 | 128 | 1,623 (5.0) | 3,210 (2.5) | 392 (20.9) | 310 (26.4) | 8.2x | OOM |
 | Qwen2.5-3B | 32 | 1024 | 128 | 499 (8.2) | 508 (8.1) | 103 (39.8) | 77 (52.9) | 4.9x | OOM |
-| Qwen2.5-3B | 8 | 8192 | 64 | 124 (4.1) | 126 (4.0) | 15 (34.4) | 12 (41.2) | 8.4x | OOM |
+| Qwen2.5-3B | 8 | 8192 | 64 | 124 (4.1) | 126 (4.0) | 15 (34.4) | 12 (41.2) | 8.5x | OOM |
 
 #### Tesla P100-PCIE-16GB: generated tokens/s (wall s)
 
 | model | requests | prompt | new | ours, graphs off | ours, graphs on | SDPA, graphs off | SDPA, graphs on | ours / SDPA | eager |
 |---|---|---|---|---|---|---|---|---|---|
 | Qwen2.5-0.5B | 64 | 512 | 128 | 1,798 (4.6) | 1,865 (4.4) | 162 (50.5) | 125 (65.3) | 11.5x | OOM |
-| Qwen2.5-3B | 32 | 1024 | 128 | 353 (11.6) | 356 (11.5) | 52 (79.4) | 39 (105.7) | 6.8x | OOM |
-| Qwen2.5-3B | 8 | 8192 | 64 | 69 (7.4) | 69 (7.4) | 7 (73.5) | 6 (81.3) | 9.9x | OOM |
+| Qwen2.5-3B | 32 | 1024 | 128 | 353 (11.6) | 356 (11.5) | 52 (79.4) | 39 (105.7) | 6.9x | OOM |
+| Qwen2.5-3B | 8 | 8192 | 64 | 69 (7.4) | 69 (7.4) | 7 (73.5) | 6 (81.3) | 10.0x | OOM |
 
 #### NVIDIA GeForce GTX 1080 Ti: generated tokens/s (wall s)
 
 | model | requests | prompt | new | ours, graphs off | ours, graphs on | SDPA, graphs off | SDPA, graphs on | ours / SDPA | eager |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | 64 | 512 | 128 | 1,042 (7.9) | 1,569 (5.2) | 26 (309.6) | 20 (407.8) | 60.3x | OOM |
-| Qwen2.5-3B | 32 | 1024 | 128 | 267 (15.3) | 280 (14.6) | 9 (477.3) | 4 (1001.3) | 31.1x | OOM |
+| Qwen2.5-0.5B | 64 | 512 | 128 | 1,042 (7.9) | 1,569 (5.2) | 26 (309.6) | 20 (407.8) | 59.3x | OOM |
+| Qwen2.5-3B | 32 | 1024 | 128 | 267 (15.3) | 280 (14.6) | 9 (477.3) | 4 (1001.3) | 32.6x | OOM |
 | Qwen2.5-3B | 8 | 8192 | 64 | 56 (9.2) | 56 (9.2) | 0.5 (1073.0) | stopped (2 h limit) | 117x | not run |
 
 #### NVIDIA GeForce RTX 2080 Ti: generated tokens/s (wall s)
@@ -61,5 +61,5 @@ workload with SDPA and graphs on was stopped by the 2-hour limit of the run (the
 | model | requests | prompt | new | ours, graphs off | ours, graphs on | SDPA, graphs off | SDPA, graphs on | ours / SDPA | eager |
 |---|---|---|---|---|---|---|---|---|---|
 | Qwen2.5-0.5B | 64 | 512 | 128 | 2,226 (3.7) | 5,120 (1.6) | 578 (14.2) | 451 (18.1) | 8.9x | OOM |
-| Qwen2.5-3B | 32 | 1024 | 128 | 765 (5.3) | 992 (4.1) | 179 (22.9) | 137 (29.9) | 5.5x | OOM |
-| Qwen2.5-3B | 8 | 8192 | 64 | 115 (4.5) | 130 (3.9) | 8 (61.2) | 7 (72.4) | 16.2x | OOM |
+| Qwen2.5-3B | 32 | 1024 | 128 | 765 (5.3) | 992 (4.1) | 179 (22.9) | 137 (29.9) | 5.6x | OOM |
+| Qwen2.5-3B | 8 | 8192 | 64 | 115 (4.5) | 130 (3.9) | 8 (61.2) | 7 (72.4) | 15.5x | OOM |

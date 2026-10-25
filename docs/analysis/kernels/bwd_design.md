@@ -2,7 +2,9 @@
 
 Status: step 2 implemented (`BwdMma` in `csrc/kernels/flash_attn_bwd.cu`, primitives in `csrc/include/flash_attn_mma.h`); the code is the
 reference where this text differs. T4 causal B=2 H=16 N=4096, backward kernel: d=64 18.2 -> 16.6 ms, d=128 53.7 -> 32.3, d=256
-167.7 -> 168.4 (`<32,16,256,4>`: every warp of a band recomputes S^T / dP^T, 4x at kSplitD 4 — next step).
+167.7 -> 168.4 (`<32,16,256,4>`: every warp of a band recomputed S^T / dP^T, 4x at kSplitD 4). Then step 2b's S^T / dP^T
+split per query over the warps of a band (P^T / dS^T exchanged in shared memory, `band_barrier`): d=128 26.9, d=256 168 ->
+136, d=64 14.6 (PLAN P7.2).
 
 ## Where the time goes (V100 / T4, causal B=2 H=16 N=4096)
 
@@ -38,7 +40,7 @@ Conclusions:
 - The dQ step costs 27-31% for 20% of the FLOPs; atomics are a small part (T4 1.7 ms): the cost is the step's structure (2-4 MMA
   per output tile, staging, column-major dS loads).
 - T4 d=128 runs the 64 KB fallback tile `<32,32,128,2>`: 4 warps per SM (V100: `<32,64,128,2>`, 8 warps). The per-warp buffers
-  (10 KB) are what keeps `<32,64,128,2>` (67.8 KB) out of 64 KB.
+  (10 KB) are what keeps `<32,64,128,2>` (67840 B, 66.2 KiB) out of 64 KiB.
 - WMMA fragment layouts are opaque (the accumulator layout is probed, the matrix_a layout differs): an accumulator cannot become
   the next MMA's operand without a shared-memory round trip. That is the FA2 trick, and it needs `mma.sync` with known layouts.
 
@@ -61,8 +63,8 @@ Per query block, per warp, all in registers:
 6. dQ [Br, D] += dS K over the whole key block: units of 16 queries x 16 columns spread over the warps, A = dS from dS^T
    (`ldmatrix.trans`), B = K (`ldmatrix.trans`), atomics straight from the accumulators (known rows / columns, no staging).
 
-Shared memory: K, V [Bc, D + 8], Q, dO [Br, D + 8], L, D [Br], dS^T [Bc, Br + 8] (half). No per-warp buffers, no staging, no layout
-probe. d=128: `<32,64,128,2>` = 57 KB fits the T4's 64 KB (8 warps per SM instead of 4). dK / dV leave the registers as half2
+Shared memory: K, V [Bc, D + 8], Q, dO [Br, D + 8], L, D [Br], dS^T [Bc, Br + 8] (half). No per-warp buffers (with kSplitD > 1 P^T / dS^T go through a
+band buffer in shared memory, step 2b), no staging, no layout probe. d=128: `<32,64,128,2>` = 62720 B (61.2 KiB) fits the T4's 64 KiB (8 warps per SM instead of 4). dK / dV leave the registers as half2
 stores at their known positions.
 
 Registers (d=128, `<32,64,128,2>`): S^T + dP^T 32, dK + dV 64 (DP = 64), fragments ~16, addressing ~30: ~150, no spills
@@ -72,7 +74,8 @@ Barriers per query block: two, as today (after Q / dO / L / D are in shared memo
 writes do not race the dQ step (it reads dS and K only); dS is rewritten only after the next first barrier.
 
 Shared parts: `BwdBlockArgs`, the loaders, `KeyWindow`, `ScoreMap`, the dQ fp32 buffer and its conversion are already common. The
-query-block loop is the same in `BwdWmma` and `BwdMma`; factor it (like `fwd_band_loop`) once the second body exists.
+query-block loop is the same in `BwdWmma` and `BwdMma`; factor it (like `fwd_band_loop`) once the second body exists (done:
+`bwd_q_loop` and `bwd_p_ds`, shared by `BwdSimt`, `BwdWmma`, `BwdMma`).
 
 Dispatch: by the arch of the code that runs (`compiled_arch_for`: SASS of the device's major with the highest minor not above it,
 else PTX): >= 75 -> `BwdMma`, 70 -> `BwdWmma`, 6x -> `BwdSimt`; a T4 with a 7.0-only build uses WMMA. `FLASH_ATTN_LEGACY_FORCE_ARCH=volta`
@@ -94,7 +97,8 @@ and S fp16 roundings of the partials before the fp32 sum (instead of one of the 
 ## Steps (one change at a time: tests on all GPUs, benchmark, ptxas, review)
 1. Done: `flash_attn_mma.h`: m16n8k8 MMA, `ldmatrix` x4 (+ trans), half2 packing.
 2. Done: `BwdMma` + tiles + dispatch.
-2b. Design review follow-ups, by measurement: S^T / dP^T split by queries across the warps of a band (no recompute at kSplitD > 1;
+2b. Partly done: the S^T / dP^T split and the shared query-block loop (`bwd_q_loop`); K_band / V_band in registers and dQ
+    strips still open. Design review follow-ups, by measurement: S^T / dP^T split by queries across the warps of a band (no recompute at kSplitD > 1;
     d=256), K_band / V_band A fragments kept in registers (one block per SM: `__launch_bounds__(threads, 1)`), dQ work as 16-query
     strips (A loaded once), the shared query-block loop of `BwdWmma` / `BwdMma` factored like `fwd_band_loop`.
 3. Turing forward on the same primitives (P2.8 step 3): Q in registers, P straight from S.

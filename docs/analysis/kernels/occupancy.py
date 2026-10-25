@@ -111,9 +111,14 @@ for e in entries:
         if dt != "Half":
             continue
         kind, tile, warps, dyn = "decode", "d=%s, R=%s%s" % (d, r, ", paged" if paged == "true" else ""), 4, 0
-    else:
-        body, partial = re.search(r"flash_attn_legacy::(\w+)(?:, (true|false))?>\(", name).groups()
-        kind = BODIES[body] + ("_varlen" if "varlen_kernel" in name else "_cache" if partial == "true" else "")
+    elif "kvcache_append_kernel" in name:  # 128 threads, no shared memory
+        kind, tile, warps, dyn = "kvcache_append", "-", 4, 0
+    else:  # fwd_batched_kernel<Tile, Body, kCache, kBf16, kRows> (1 bool before 209b46d), *_varlen_kernel<Tile, Body>
+        body, flags = re.search(r"flash_attn_legacy::(\w+)((?:, (?:true|false)){0,3})>\(", name).groups()
+        cache, bf16, rows_ = (re.findall(r"true|false", flags) + ["false"] * 3)[:3]
+        kind = BODIES[body] + ("_varlen" if "varlen_kernel" in name else
+                               "_cache" + ("_bf16" if bf16 == "true" else "") + ("_rows" if rows_ == "true" else "")
+                               if cache == "true" else "")
         if int(e["arch"][3:]) < MIN_ARCH.get(BODIES[body], 0):
             continue
         tile = tile_re.search(name).group(1)

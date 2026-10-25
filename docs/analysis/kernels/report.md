@@ -1,12 +1,15 @@
 # flash_attn_legacy: CUDA kernel gap analysis (Pascal / Volta / Turing)
 
-Analysed source: /workspace/analysis/kernels/src, copied from /workspace/fa. Its md5 matches the local working tree for all 7 relevant files.
+**Historical snapshot (before P2.8)**: measurements and code references are of that time; current state in docs/PLAN.md.
+
+Analysed source: /workspace/analysis/kernels/src, copied from /workspace/fa. Its md5 matches the local working tree for all 7 relevant files. (/workspace paths: the test box of the time, not committed.)
 Toolchain: nvcc 12.6. SASS was dumped with the triton-bundled cuobjdump 12.8, because /usr/local/cuda is CUDA 13 and cannot disassemble sm_6x/70.
 No GPU was used.
 
 Legend: [M] = measured (ptxas / SASS / compile timing). [R] = reasoned (arithmetic, CUDA docs, design). Treat [R] performance claims as hypotheses to benchmark.
 
-Artifacts in /workspace/analysis/kernels/:
+Artifacts in /workspace/analysis/kernels/ (on the test box; `sass/`, `ctime/` and `raw/compile_times.txt` are not committed: the
+tracked equivalents are docs/analysis/kernels/raw/ptxas_*.txt and the .txt files in docs/analysis/kernels/):
 
 | file | content |
 |---|---|
@@ -18,7 +21,7 @@ Artifacts in /workspace/analysis/kernels/:
 | turing_tiles.py -> turing_tiles.txt | tile enumeration for sm_75 |
 | ctime/ | per-instantiation compile-time experiment (Pascal fwd, sm_61) |
 
-[M] Build fragility: compiling the .cu files without torch's -D__CUDA_NO_HALF_OPERATORS__/-D__CUDA_NO_HALF_CONVERSIONS__/-D__CUDA_NO_BFLOAT16_CONVERSIONS__/-D__CUDA_NO_HALF2_OPERATORS__ fails in cuda_bf16.h. The cause is "#include <mma.h>" placed inside namespace flash_attn_legacy (fwd_volta.cu:30, bwd.cu:324). Move it to file scope; this matters for BF16 work.
+[M] Build fragility: compiling the .cu files without torch's -D__CUDA_NO_HALF_OPERATORS__/-D__CUDA_NO_HALF_CONVERSIONS__/-D__CUDA_NO_BFLOAT16_CONVERSIONS__/-D__CUDA_NO_HALF2_OPERATORS__ fails in cuda_bf16.h. The cause is "#include <mma.h>" placed inside namespace flash_attn_legacy (fwd_volta.cu:30, bwd.cu:324). Move it to file scope; this matters for BF16 work. (Fixed: file scope in csrc/include/flash_attn_wmma.h.)
 
 ## 1. Registers / spills / smem / occupancy
 
@@ -34,7 +37,7 @@ Occupancy model (cuda_occupancy.h style):
 | sm_70 (V100) | 96 KB | 96 KB opt-in | 64 | 32 |
 | sm_75 (T4) | 64 KB | 64 KB opt-in | 32 | 16 |
 
-Dynamic smem uses exactly the launch-macro formulas. Static smem is 0 everywhere [M]. Volta kernels compiled for sm_6x are stubs and are omitted. Pascal kernels are also built for sm_70/75 (reachable via FORCE_ARCH=pascal). Varlen instantiations are within ±10 registers of the batched ones with identical smem; see occupancy_table.md for all 92 rows.
+Dynamic smem uses exactly the launch-macro formulas. Static smem is 0 everywhere [M]. Volta kernels compiled for sm_6x are stubs and are omitted. Pascal kernels are also built for sm_70/75 (reachable via FORCE_ARCH=pascal). Varlen instantiations are within ±10 registers of the batched ones with identical smem; see occupancy_table.md (92 rows at the time).
 
 | kernel | Br,Bc,d,warps | arch | regs | stack B | spill st/ld B | dyn smem B (KB) | blk/SM | warps/SM | blk limit regs/smem |
 |---|---|---|---|---|---|---|---|---|---|
@@ -110,8 +113,6 @@ T4 MaxSharedMemoryPerBlockOptin = 65536 B. Each of these makes cudaFuncSetAttrib
 | fwd Volta d=64, batched AND varlen | 2*(128*64 + 2*64*64) + 4*128*64 + 2*128*64 = 81920 B (80 KB) |
 | fwd Volta d=128, batched AND varlen | 2*(128*128 + 2*32*128) + 4*128*32 + 2*128*32 = 73728 B (72 KB) |
 | bwd Volta-WMMA d=256 | 2*(4*16*256) + 4*(2*16*256 + 2*16*16) + 2*16*16 = 68096 B (66.5 KB) |
-
-Your expected values are exact.
 
 Everything else fits on T4: fwd d32 36 KB, d96 60 KB, d256 54 KB; bwd d32–128 26–42 KB; forced Pascal kernels at most 40 KB. But all of them run at only 1 block/SM.
 
@@ -337,7 +338,7 @@ Quick wins:
 
 ### Other items [M/R]
 
-- Move #include <mma.h> out of the namespace.
+- Move #include <mma.h> out of the namespace (fixed).
 - No K/V prefetch / double buffering (register-staged prefetch is possible on all archs; no cp.async before sm_80).
 - 32-bit half2 global loads; 128-bit loads would cut instructions 4×.
 - O is stored row-per-thread with a 128–512 B lane stride (uncoalesced; epilogue only, minor).

@@ -1,7 +1,9 @@
 # flash_attn_legacy x HF transformers 5.20.2: model-family survey (Tesla V100-SXM2-32GB, SM 7.0)
 
+> **Snapshot before P0** (transformers 5.20.2 at the time). BUG-1/2/3 and the missing features M1-M7 are resolved, see `docs/PLAN.md` (§1, §3); each row carries its resolving entry. The present tense below describes the code at the time.
+
 Environment: torch 2.7.1+cu126, transformers 5.20.2, all models loaded in fp16. The library code under /workspace/fa was not modified.
-Everything lives in `/workspace/analysis/models/`: scripts are `*.py`, raw results are `results/*.json`, logs are `logs/*.log`.
+Everything lived in `/workspace/analysis/models/` on the test box; the scripts (`*.py`) and raw results (`results/*.json`) are tracked under `docs/analysis/models/`, the logs (`logs/*.log`) stayed on the test box and are not committed.
 `python show.py results/<tag>.json` prints a compact view of one survey result.
 
 ## How correctness was judged
@@ -37,7 +39,7 @@ Abbreviations:
 Notes on the table:
 - **Left padding.** In every causal model the padded batch produced logits bit-identical to sdpa (1-cos 0, max\|d\| 0). The short padded prompt matched the same prompt run alone, and generated tokens matched sdpa 24/24 for both sequences.
 - **Chunked prefill.** "2nd chunk FB" on sliding-window models happens even when kv_len < window. The mask builder delegates to `sdpa_mask`, and that never skips the mask when q_offset > 0 and q_len != kv_len. Results are still correct; this is a missing fast path (see M3).
-- **Existing test.** `tests/test_hf_equivalence.py` on 7 models (log: `logs/pytest_hf_equivalence.log`): **35 passed, 7 failed**. None of the failures is a numerical error in the kernel:
+- **Existing test.** `tests/test_hf_equivalence.py` on 7 models (log `logs/pytest_hf_equivalence.log`, on the test box, not committed): **35 passed, 7 failed**. None of the failures is a numerical error in the kernel:
   - gemma-3 N=16, top1 0.9375: an fp16 near-tie. Flash 1-cos 9.5e-7 is below the eager floor of 1.43e-6.
   - gemma-3 N=1000 and the chunked tests on gemma-3, gemma-2, Phi-3 and Mistral-v0.1: these are expected sliding-window fallbacks. The test asserts that every layer ran the kernel.
   - gemma-3 greedy generation: the same near-tie as in the table (first divergence at token 5).
@@ -45,7 +47,7 @@ Notes on the table:
 
 ## Confirmed bugs (measured)
 
-### BUG-1: `softcap` is silently ignored on both the kernel path and the fallback path. Affects Gemma-2.
+### BUG-1 (resolved: P0.3, P4.2): `softcap` is silently ignored on both the kernel path and the fallback path. Affects Gemma-2.
 
 What the code receives: Gemma-2 passes `softcap=50.0` (plus `sliding_window=4096`) to the attention function on every layer. `flash_attn_legacy_forward` ignores it in both branches, with no warning.
 
@@ -71,7 +73,7 @@ Per-layer shadow check (fp32 reference with softcap; N=1000): the attention-outp
 
 Because HF's own `sdpa` also drops softcap, flash matches sdpa (1-cos 2.98e-7). Any test that uses sdpa as the reference therefore passes.
 
-### BUG-2: attention sinks (`s_aux`, gpt-oss) are silently ignored on both paths.
+### BUG-2 (resolved: P0.3, P4.3): attention sinks (`s_aux`, gpt-oss) are silently ignored on both paths.
 
 Minimal repro: `repro_ignored_kwargs.py`. The output with `s_aux` is bit-identical to the output without it, with rel err 6.57e-2 vs the sink-aware reference on both the kernel and fallback paths.
 
@@ -85,7 +87,7 @@ Model-level repro: `/workspace/analysis/models/sinks_probe.py`. It builds a tiny
 
 Note: GptOss declares `_supports_sdpa=False`. `flash_attn_legacy` is nevertheless accepted, and its "safe" SDPA fallback has no sink support either.
 
-### BUG-3: packed sequences without a packed mask run the kernel as one causal sequence; `position_ids` and `cu_seq_lens_*` are ignored.
+### BUG-3 (resolved: P0.4, P3.2): packed sequences without a packed mask run the kernel as one causal sequence; `position_ids` and `cu_seq_lens_*` are ignored.
 
 Minimal repro: `/workspace/analysis/models/repro_packed.py`. Full probe: `train_probe2.py`, results in `results/train_probe2_qwen25.json`.
 
@@ -152,14 +154,14 @@ Decode never runs the kernel. The roughly 10% decode gain comes from the integra
 
 | # | Feature | Today | Models affected |
 |---|---|---|---|
-| M1 | **Logit softcapping** (tanh) in the kernel, or at least a softcap-aware fallback, or a hard error | silently wrong (BUG-1) | Gemma-2 (all layers); any model that passes `softcap` |
-| M2 | **Attention sinks** (`s_aux`) | silently wrong (BUG-2) | gpt-oss-20b/120b |
-| M3 | **Sliding-window / local attention in the kernel**, including chunked prefill with q_offset>0 while kv < window (today FB even when the window cannot bind) | correct via SDPA FB, but no speed or memory benefit | Gemma-3 (22/26 layers beyond 512 tokens), Gemma-2 (13/26 beyond 4096), Phi-3-mini-4k (all layers beyond 2047), Mistral-7B-v0.1 (all beyond 4096), Qwen2 with use_sliding_window, gpt-oss (window 128), ModernBERT local layers (14/22 at any length, window 128 bidirectional) |
-| M4 | **Varlen / unpadding for padded batches** (the library already has `flash_attn_varlen_func`; the integration does not use it) | FB on every padded batch: batched generation, right-padded SFT, encoder batches, Qwen3-Embedding batches | all models |
-| M5 | **Packed sequences** via `position_ids` / `cu_seq_lens_*` (FA2 contract) | wrong when no packed mask is built (BUG-3); FB when it is | all causal LMs trained with DataCollatorWithFlattening |
-| M6 | Decode kernel (q_len=1) | always FB, by design | all |
-| M7 | Head dims outside {32, 64, 96, 128, 256}: `_patched_check` silently switches the whole model to "sdpa" | not measured (code reading only) | e.g. head_dim 80 models |
-| M8 | Attention dropout in training | FB (from code; not measured) | BERT-style training with attention_probs_dropout 0.1 |
+| M1 (resolved: P4.2) | **Logit softcapping** (tanh) in the kernel, or at least a softcap-aware fallback, or a hard error | silently wrong (BUG-1) | Gemma-2 (all layers); any model that passes `softcap` |
+| M2 (resolved: P4.3) | **Attention sinks** (`s_aux`) | silently wrong (BUG-2) | gpt-oss-20b/120b |
+| M3 (resolved: P4.1) | **Sliding-window / local attention in the kernel**, including chunked prefill with q_offset>0 while kv < window (today FB even when the window cannot bind) | correct via SDPA FB, but no speed or memory benefit | Gemma-3 (22/26 layers beyond 512 tokens), Gemma-2 (13/26 beyond 4096), Phi-3-mini-4k (all layers beyond 2047), Mistral-7B-v0.1 (all beyond 4096), Qwen2 with use_sliding_window, gpt-oss (window 128), ModernBERT local layers (14/22 at any length, window 128 bidirectional) |
+| M4 (resolved: P3.1) | **Varlen / unpadding for padded batches** (the library already has `flash_attn_varlen_func`; the integration does not use it) | FB on every padded batch: batched generation, right-padded SFT, encoder batches, Qwen3-Embedding batches | all models |
+| M5 (resolved: P3.2) | **Packed sequences** via `position_ids` / `cu_seq_lens_*` (FA2 contract) | wrong when no packed mask is built (BUG-3); FB when it is | all causal LMs trained with DataCollatorWithFlattening |
+| M6 (resolved: P6.1) | Decode kernel (q_len=1) | always FB, by design | all |
+| M7 (resolved: P0.1; d=72/80 in P2.7) | Head dims outside {32, 64, 96, 128, 256}: `_patched_check` silently switches the whole model to "sdpa" (since P0.1 the head_dim check is per call, with a recorded fallback reason) | not measured (code reading only) | e.g. head_dim 80 models |
+| M8 (open: P6.4) | Attention dropout in training | FB (from code; not measured) | BERT-style training with attention_probs_dropout 0.1 |
 
 ## Unexpected or noteworthy
 
@@ -171,7 +173,7 @@ Decode never runs the kernel. The roughly 10% decode gain comes from the integra
 6. Gemma models (fp16) produced finite outputs everywhere tested (up to 5000 tokens); no fp16 overflow was observed.
 7. Mistral-7B prefill at 8192 tokens fits with flash_attn_legacy (15.4 GB peak) but OOMs with HF sdpa on 32 GB.
 
-## Repro and script index (all under `/workspace/analysis/models/`)
+## Repro and script index (all under `/workspace/analysis/models/`, tracked under `docs/analysis/models/`)
 
 - `repro_ignored_kwargs.py`: BUG-1 and BUG-2 at the attention-function level (kernel and fallback).
 - `sinks_probe.py`: BUG-2 on a tiny real GptOss model.
@@ -182,4 +184,4 @@ Decode never runs the kernel. The roughly 10% decode gain comes from the integra
 - `kernel_probe.py` and `bwd_probe.py`: forward and backward kernel sweeps.
 - `train_probe.py` and `e2e_grad.py`: the training probe and the gradient isolation test.
 - `timing.py`: the timing runs.
-- `logs/pytest_hf_equivalence.log`: the existing test run on 7 models.
+- `logs/pytest_hf_equivalence.log`: the existing test run on 7 models (on the test box, not committed).

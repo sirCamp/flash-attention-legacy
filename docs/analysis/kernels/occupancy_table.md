@@ -1,3 +1,5 @@
+Regenerated at e13edbd; the cache kernel's kBf16 / kRows variants and later register counts are not listed; rerun occupancy.py to refresh.
+
 | kernel | tile | warps/block | arch | regs | stack B | spill st/ld B | dyn smem B (KB) | blocks/SM | warps/SM (max) | blocks/SM limits |
 |---|---|---|---|---|---|---|---|---|---|---|
 | bwd_mma | BwdTileMma&lt;32, 16, 256, 4> | 4 | sm_75 | 178 | 0 | 0/0 | 53504 (52.2) | 1 | 4/32 | by regs=2, by smem=1 |

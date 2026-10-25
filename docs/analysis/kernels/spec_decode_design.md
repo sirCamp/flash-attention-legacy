@@ -1,6 +1,6 @@
 # Short queries against a long cache: split-KV and packed GQA rows in the forward (P6.8)
 
-Status: design, 2026-10-23, reviewed (notes folded in). The code becomes the reference once implemented.
+Status: implemented (steps a-d); the code is the reference. Design 2026-10-23, reviewed (notes folded in).
 
 ## Why (measured)
 The decode kernel (P6.1) handles R = (H_q / H_kv) * q_len <= 8 query rows per KV head. Everything else that HF sends with a
@@ -51,8 +51,8 @@ The decode kernel stays for R <= 8 (bandwidth bound, measured near the floor); t
   `contiguous_aligned` copy, no fp16 conversion pass) runs the forward for R > 8; the HF integration routes q_len > 1 with a cache
   to it (today `flash_attention` copies sliced static caches, `integrations.py`, and converts bf16 caches: separate costs, measured
   apart). For R > 8 it accepts fp16 only, per-batch `cache_seqlens` (int or tensor, clamped on the device as the decode kernel
-  does), causal / window / softcap / sinks; bf16, `cache_leftpad`, `key_mask` and paged caches raise NotImplementedError (the
-  forward bodies are fp16; padded HF batches with q_len > 1 keep the unpad -> varlen route, the 4D mask at q_len > 1 its fallback).
+  does), causal / window / softcap / sinks; bf16, `cache_leftpad`, `key_mask` and paged caches raise NotImplementedError (superseded by step (c):
+  all four supported; the forward bodies are fp16; padded HF batches with q_len > 1 keep the unpad -> varlen route, the 4D mask at q_len > 1 its fallback).
 - **Split-KV.** Grid gets a split axis (num_splits, 1 = today, bit-identical); split s clips `fwd_band_loop`'s kv_begin / kv_end
   to its chunk of Bc blocks (an empty chunk skips the loop but still writes its partials). With num_splits > 1 a row writes the
   decode partial format: O normalised (O * inv, fp32) and its lse in log2, from `BandSoftmax::finalize`; rows with no visible key
@@ -69,11 +69,11 @@ The decode kernel stays for R <= 8 (bandwidth bound, measured near the floor); t
   one); rows_per_token = 1 keeps today's addressing. `KeyWindow` is built over q_len tokens (its offset is seq_len_k - seq_len_q
   in tokens); each lane's rows are fixed over the K/V loop, so their tokens are computed once before it, and `fwd_band_loop`'s
   q_first / q_last / band bounds become tokens. Sinks (one per query head) would need one value per row in
-  `BandSoftmax::init`: calls with sinks keep the unpacked layout (a block per query head; gpt-oss at q_len 1 is within the
+  `BandSoftmax::init`: calls with sinks keep the unpacked layout (superseded by step (c): sinks with packed rows; a block per query head; gpt-oss at q_len 1 is within the
   decode kernel's 8 rows). L / lse stay in the natural [B, H_q, q_len] order. Its value is mostly band compute on Pascal (q_len 2, rep 4: four
   bands become one) and K/V read once per KV head: measured against (a) before it is merged.
-- **Not in scope:** backward with splits or packing (inference only, as decode); paged K/V in the forward (P6.9); a packed varlen
-  batch of mixed q_len (P6.9); bf16 / leftpad / key_mask with R > 8 (later, if measured useful).
+- **Not in scope:** backward with splits or packing (inference only, as decode); paged K/V in the forward (P6.9; superseded by step (c): paged done); a packed varlen
+  batch of mixed q_len (P6.9); bf16 / leftpad / key_mask with R > 8 (later, if measured useful; superseded by step (c): all done).
 
 ## Steps (one change each: tests on all GPUs + review)
 a. Shared combine header (decode unchanged, bit-identical). Then split-KV in the forward bodies (batched, inference) behind
@@ -81,7 +81,7 @@ a. Shared combine header (decode unchanged, bit-identical). Then split-KV in the
    Tests: every family (forced Pascal too) against SDPA math with num_splits 1..16 forced and more splits than Bc blocks,
    causal / window / softcap / sinks, q_len 1..64 against N up to 32k, per-batch cache_seqlens tensors, d = 72 / 80 padded
    columns, CUDA-graph capture; num_splits = 1 bit-identical and the existing forward's speed unchanged.
-b. Packed GQA rows (no sinks). Tests as (a) with rep 1..16, including 3, 7, 12 (Br % rep != 0), MQA; sinks run unpacked.
+b. Packed GQA rows (no sinks). Tests as (a) with rep 1..16, including 3, 7, 12 (Br % rep != 0), MQA; sinks run unpacked (superseded by step (c): sinks with packed rows).
 c. HF: q_len == 1 with rep > 8 to the packed path; the "decode (N query heads per KV head)" fallback reason disappears. Tests: HF
    assisted generate / prompt lookup / a rep-12 model identical to plain greedy and to SDPA within noise.
 d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README / PLAN.
@@ -91,14 +91,14 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   entry `flash_attn_split_combine`), shared by decode and forward; decode bit-identical (50 cases: fp16 / bf16, splits 1 / 3 / 16 /
   auto, paged, sinks, softcap). One split-count rule `flash_attn_num_splits(blocks, sms, resident, max_len, rows)`, unchanged for
   decode (rows <= 8).
-- Forward: `fwd_batched_kernel<Tile, Body, kCache>`. kCache (selected by `O_part`) is the variant of `flash_attn_with_kvcache`:
+- Forward: `fwd_batched_kernel<Tile, Body, kCache>` (now `<Tile, Body, kCache, kBf16, kRows>`, `flash_attn_fwd_band.h`). kCache (selected by `O_part`) is the variant of `flash_attn_with_kvcache`:
   per-batch key lengths, split s of the visible K/V blocks, fp32 partials + log2 lse through `fwd_store_o` / `fwd_store_lse`
   (also one split), sink in split 0. A template parameter because the plain forward must carry none of it: a runtime branch in
   the epilogue made the Pascal d=128 forward 23% slower on the P100 (36 -> 44 ms at N=4096; 39 with the partial store out of
   line), and the per-batch length load alone made d=64 9% slower on the 1080 Ti (15.7 -> 17.2 ms); with kCache the plain
   forward measures as HEAD on every GPU (alternated A/B against a HEAD build on the same box).
 - `flash_attn_with_kvcache` with R > 8: the kCache forward on the cache views, fp16 and a contiguous cache (bf16, paged,
-  cache_leftpad, key_mask raise NotImplementedError).
+  cache_leftpad, key_mask raise NotImplementedError; superseded by step (c): all four supported).
 - Attention of one layer, d=128, B=1, us (HF's path today -> `flash_attn_with_kvcache`):
 
 | GPU | GQA 32/8, 16k, q_len 16 | GQA 32/8, 4k, q_len 4 | GQA 24/2, 4k, q_len 1 (SDPA today) |
@@ -114,7 +114,7 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
 
 - HF: q_len 2..SHORT_Q_MAX (64) new tokens against a longer cache go to `flash_attn_with_kvcache` (the cache read in place: the
   decode kernel up to 8 rows per KV head, the kCache forward beyond; inference, no padding; bf16 beyond 8 rows stays on the
-  forward). End to end, HF generate as in "Why" (Qwen2.5-3B, 1.5k prompt, 128 tokens, outputs identical to plain greedy, no
+  forward; superseded by step (c): bf16 on the cache kernel). End to end, HF generate as in "Why" (Qwen2.5-3B, 1.5k prompt, 128 tokens, outputs identical to plain greedy, no
   fallback), tok/s ours (before -> after) / SDPA / eager:
 
 | GPU | plain | assisted (draft) | prompt lookup |
@@ -164,7 +164,7 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   packed forward) in FP16 without a padding mask; BF16 or a key mask keep the SDPA fallback (`decode` reason, recorded). Test:
   an MQA 16:1 model's generate on the kernel, every step within the noise of FP32 eager; BF16 recorded as fallback.
 - `key_mask` beyond 8 rows done: the cache kernel masks the keys the mask drops in the masked step (every block takes it with a
-  mask) and its K / V loaders read them as zeros (`kNullRows`: never read, so a NaN there cannot reach O through P = 0 times
+  mask; now in the `kRows` variant only, see below) and its K / V loaders read them as zeros (`kNullRows`: never read, so a NaN there cannot reach O through P = 0 times
   V); HF short queries with padding go there with the padding as key mask (no unpad plan, no host sync), and MQA / GQA > 8:1
   decode with padding too. Possible refinement: the mask byte is read per score element and per 16-byte vector, and blocks or
   splits whose keys are all dropped still run (the decode kernel shrinks its splits to the kept keys): a per-block bitmask in
@@ -197,13 +197,13 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   On Pascal bf16 costs as fp16 (the same body). On SM 7.x the CUDA-core body is compute bound for 64 rows per KV head
   (the split count is near the best of a sweep on the T4): a bf16 path on the tensor-core bodies (bf16 -> fp16 with a
   power-of-2 scale in the loader) is the open refinement.
-- Sinks with packed rows done: `fwd_softmax_init`
-  gives each row of the cache kernel its query head's sink (split 0; the plain forward keeps the head's one). `cache_leftpad` done: the cache
-  kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
+- Sinks with packed rows done: `fwd_softmax_init` gives each row of the cache kernel its query head's sink (split 0; the
+  plain forward keeps the head's one). `cache_leftpad` done: the cache kernel starts K / V of row b at leftpad[b] and ends at cache_seqlens[b] (causal / window aligned to the end, as decode).
 
 ## Step (d), done
 - `benchmarks/speculative.py` (kernel: one verification call per path; generate: plain / prompt lookup / assisted end to end),
-  results of the five GPUs in `docs/bench/speculative.md`; `occupancy_table.md` regenerated (`*_cache` rows: the cache kernel).
+  results of the five GPUs in `docs/bench/speculative.md`; `occupancy_table.md` regenerated (`*_cache` rows: the cache kernel; at e13edbd, before the step (c) bf16 / paged / `kRows`
+  commits).
 - Measured there: on short caches (1k) the T4's cache path is a little slower than the plain forward at q_len 8-16 (fp32
   partials and the combine also for one split): a possible refinement (write O directly when one split is chosen).
 

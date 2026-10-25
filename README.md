@@ -81,6 +81,7 @@ pip install -e ".[test,bench]" --no-build-isolation
 Load any HuggingFace model with flash attention — no code changes needed:
 
 ```python
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -96,7 +97,7 @@ outputs = model.generate(**inputs, max_new_tokens=100)
 print(tokenizer.decode(outputs[0]))
 ```
 
-The integration uses our flash kernel for unmasked **prefill** (where memory savings matter) and falls back to PyTorch SDPA for decode (q_len=1) and padded/masked batches.
+Prefill, decode, padded batches, training and continuous batching run on our kernels; the table below lists each case and the few that fall back to PyTorch SDPA.
 
 ### What runs on the kernel
 
@@ -227,22 +228,21 @@ Longest sequence that fits (ours / the better of SDPA and eager; ">=" = no longe
 | Generate, Qwen2.5-3B, B=1 (prompt) | >= 64k / >= 8k | 32k / 2k | >= 64k / 2k | 32k / 2k | 32k / 2k |
 | Training, checkpointing, TinyLlama | 32k / 4k | 16k / 4k | 16k / 4k | 8k / 2k | 8k / 2k |
 
-Larger models: Llama 3.1 8B on the V100 prefills at least 16k tokens (the longest measured; SDPA / eager 4k; 1.66x and -3.8 GiB at 4k), decodes 8 x 2k prompts
-compiled at 1.70x with -7.5 GiB, and LoRA-trains at 8k (others 4k; 1.48x at 4k); on the P100 (16 GB, weights 15 GiB) it prefills
+Larger models: Llama 3.1 8B on the V100 prefills at least 16k tokens (the longest measured; SDPA / eager 4k; 1.65x and -3.8 GiB at 4k), decodes 8 x 2k prompts
+compiled at 1.72x with -7.5 GiB, and LoRA-trains at 8k (others 4k; 1.48x at 4k); on the P100 (16 GB, weights 15 GiB) it prefills
 2k tokens and generates from a 2k prompt where SDPA and eager stop at 1k (prefill) / 512 (prompt). Qwen2.5-14B on the V100 prefills 8k (others 2k),
 Qwen3.5-9B at least 32k (others 8k).
 
 The attention memory is O(N) in the sequence instead of O(N^2), so contexts up to 32x longer fit (TinyLlama prefill on the T4 /
 P100; the same length where the weights or the KV cache, not the attention, set the limit), and where all fit the kernel is
-faster or at parity: the rows below 1x in the full tables (0.93-0.99x) are the Qwen3.5 models (host bound), short prefills of
-7-8B models on the P100 (matmul bound) and decode with eager steps, within the noise of the shared cloud boxes (see
-`docs/bench/models.md`). The training loss agrees with SDPA and eager in every case where more than one fits (largest
-difference 0.0026). With gradient checkpointing on the large-vocabulary models (Qwen2.5, Llama 3.1: vocabularies of 128k-152k) the
+faster or at parity: the rows below 1x in the full tables (0.93-0.99x) are the Qwen3.5 models (host bound) and one Gemma 2 2B train step
+on the V100 at 1k (0.98x), within the noise of the shared cloud boxes (see `docs/bench/models.md`). The training loss agrees with SDPA and eager in every case where more than one fits (largest
+difference 0.0007). With gradient checkpointing on the large-vocabulary models (Qwen2.5, Llama 3.1: vocabularies of 128k-152k) the
 full-vocabulary fp32 logits of HF's loss take most of the memory, so the length gain shrinks (LoRA on the V100: Qwen2.5-3B 8k
-for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.53x V100, 2.69x T4); on TinyLlama (32k
+for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.54x V100, 2.68x T4); on TinyLlama (32k
 vocabulary) checkpointing with our kernel trains 4-8x longer sequences. On the 1080 Ti SDPA with a padding mask runs its fp16
 kernel, which sm_61 executes at 1/64 rate: hence 5.65x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
-layers in 4, here on transformers' PyTorch reference) run at parity or a little faster (compiled decode 1.02-1.31x), with the memory saving. Decode reads the cache in place with
+layers in 4, here on transformers' PyTorch reference) run at parity or a little faster (compiled decode 1.00-1.32x), with the memory saving. Decode reads the cache in place with
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
 
@@ -266,8 +266,8 @@ the T4 (594 / 1196), 1164 on the P100 (7506 / 4577); HF prompt lookup and assist
 on every GPU.
 
 Serving with transformers' continuous batching (`model.generate_batch`, paged cache; `python benchmarks/serving.py`,
-[`docs/bench/serving.md`](docs/bench/serving.md)): generated tokens/s 4.9-16x SDPA's best on V100, T4, P100 and 2080 Ti
-(Qwen2.5-0.5B and 3B, up to 8 x 8192-token prompts), 31-117x on the 1080 Ti; `paged|eager` runs out of memory.
+[`docs/bench/serving.md`](docs/bench/serving.md)): generated tokens/s 4.9-15.5x SDPA's best on V100, T4, P100 and 2080 Ti
+(Qwen2.5-0.5B and 3B, up to 8 x 8192-token prompts), 33-117x on the 1080 Ti; `paged|eager` runs out of memory.
 
 Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
 results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
@@ -364,8 +364,8 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] BF16 / FP32 inference
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
 - [x] Short queries against a cache beyond 8 query rows per KV head (assisted / speculative decoding, MQA / GQA > 8:1): key splits and packed GQA rows in the forward (`docs/analysis/kernels/spec_decode_design.md`)
-- [ ] Serving: varlen prefill straight from a paged cache, mixed prefill + decode batches (continuous batching in transformers;
-  a vLLM backend plugin only on Turing, see `docs/analysis/vllm_feasibility.md`)
+- [ ] Serving: one grid for mixed prefill + decode batches (they run today on the varlen kernel), a vLLM backend plugin
+  (Turing only, see `docs/analysis/vllm_feasibility.md`)
 - [ ] Dropout and deterministic dQ in the kernel
 
 ## References

@@ -1,6 +1,7 @@
 # Decode with a KV cache: split-KV kernel (P6.1)
 
-Status: design, reviewed 2026-10-22 (review notes folded in). The code becomes the reference once implemented.
+Status: implemented (PLAN P6.1 done; steps a-i below); the code is the reference. Design reviewed 2026-10-22 (review notes
+folded in).
 
 ## Why
 - Today every decode step (q_len == 1) leaves the kernel: SDPA, or the fp32 eager fallback when the layer has a softcap
@@ -73,7 +74,7 @@ q_len (that re-reads K/V).
 - Padding (P6.5 step b): the 2D / 4D decode mask goes to the kernel as `key_mask` (each split shrunk to its first / last
   kept key, masked keys skipped): any padding, holes included, without host sync, never through `_unpad_plan` (its gathers
   copy the cache). With a 4D mask cache_seqlens = last kept key + 1 (on the device) keeps causal / window aligned to the
-  query. Before step b: leftpad from the 2D mask with one host sync per step, holes on the fallback.
+  query. Before P6.5 step b: leftpad from the 2D mask with one host sync per step, holes on the fallback.
 - Sliding caches: the dynamic sliding layer passes up to W - 1 + q_len keys (window satisfied); the padding scrolls out (leftpad
   -> 0): test decoding past W with and without left padding.
 - Beam search: reordered caches are plain tensors; low risk. Cross-attention decode (non-causal against encoder K/V): covered
@@ -92,14 +93,14 @@ q_len (that re-reads K/V).
   end-to-end step time (mask builder included).
 
 ## Steps (one change each: tests on all GPUs + review)
-a. Contiguous cache, num_splits = 1, R <= 4, fp16 / bf16, API with upstream order and return_softmax_lse.
-b. Splits + combine (num_splits auto / forced), sinks once.
-c. R = 8 (q in shared memory).
-d. cache_leftpad.
+a. Done: contiguous cache, num_splits = 1, R <= 4, fp16 / bf16, API with upstream order and return_softmax_lse.
+b. Done: splits + combine (num_splits auto / forced), sinks once.
+c. Done: R = 8 (q in shared memory).
+d. Done: cache_leftpad.
 e. Done: paged (block_table), without leftpad; kPaged template (the contiguous path keeps its addressing), shift / mask for
    power-of-2 block sizes. T4 GQA 32/8 d=128: B=1 16k 0.297 ms contiguous vs 0.310 paged; B=8 4k 0.606 vs 0.71-0.73 (the
-   table load precedes the K / V loads: prefetching the next block indices is the open item).
-f. HF routing of decode steps.
+   table load precedes the K / V loads: prefetching the next block indices is the open item; resolved by step i).
+f. Done: HF routing of decode steps.
 g. Tuning, measured on T4 (decode kernel only, B=8, 16k context): R <= 4 runs at 200-236 GB/s (d=128: ~65-70% of the
    peak; near the bound). R = 8 (d=64, gpt-oss) at ~100 GB/s, issue bound: ablations (wrong results, timing only) put
    the per-key update (exp2, P V FMAs, V conversion) at ~33% and the score shuffles at ~14%; 135 registers -> 3 blocks
@@ -143,5 +144,5 @@ i. Done: paged addressing (P6.9 step b found it in transformers' continuous batc
 
    Pascal gained most, up to 31-33% (the table load was on the critical path of its fp32 key step); SM 7.x up to 10% at
    R = 8.
-   Tried again, not kept: C = 2 / 4 keys per group and step with one rescale per step (as in g): the P100 does not gain
-   consistently, C = 4 is slower everywhere (registers), the T4 / 2080 Ti gain only at R = 8 with large grids.
+   Tried again, not kept: U = 2 / 4 keys per group and step with one rescale per step (as in g): the P100 does not gain
+   consistently, U = 4 is slower everywhere (registers), the T4 / 2080 Ti gain only at R = 8 with large grids.

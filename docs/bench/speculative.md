@@ -6,8 +6,9 @@ as a template parameter (`kRows`, 585b76c); torch 2.7.1, transformers 5.20.2.
 
 - kernel: one attention call of a verification step, d=128, B=1, us. `forward` = the plain forward kernel on the cache (HF's
   path before P6.8); `kvcache` = flash_attn_with_kvcache (the decode kernel up to 8 query rows per KV head, the forward with key
-  splits and packed GQA rows beyond: HF's path now for q_len 2-64 after a longer cache and for MQA / GQA > 8:1 decode);
-  `1tok x q_len` = what plain decoding pays for the same tokens; `sdpa` = HF's SDPA (KV repeated, causal mask).
+  splits and packed GQA rows beyond: HF's path now for short queries (q_len 2-64) against a longer cache and for MQA /
+  GQA > 8:1 decode); `1tok x q_len` = what plain decoding pays for the same tokens (at q_len 1 the same call as `kvcache`,
+  timed separately); `sdpa` = HF's SDPA (KV repeated, causal mask).
 - generate: HF greedy generate of 128 tokens after a ~1.5k-token prompt (code to rewrite: prompt lookup finds candidates);
   plain, prompt lookup (10 tokens) and assisted (Qwen2.5-0.5B draft, same implementation); "output = plain greedy" checks the
   speculative modes return the same tokens. The prompt is the start of `flash_attn_legacy/integrations.py` (1491 tokens).
@@ -17,9 +18,9 @@ as a template parameter (`kRows`, 585b76c); torch 2.7.1, transformers 5.20.2.
 
 Reading the numbers: on short caches (1k) the T4's `kvcache` is a little slower than the plain forward at q_len 8-16 (it always
 writes fp32 partials and runs the combine, also for one split); from 4k on and on every other GPU it is faster, and the
-verification of 16 tokens costs about one to two one-token decodes on SM 7.x (the cache read once per KV head). Pascal is
-compute bound (fp32 FMA). At 1.5k tokens the attention is a small part of a decode step: the end-to-end gain is bounded there
-and grows with the context.
+verification of 16 tokens costs about one to three one-token decodes on SM 7.x (the cache read once per KV head). Pascal is
+compute bound (fp32 FMA); SDPA on the 1080 Ti runs fp16 at 1/64 rate (sm_61), hence its ~10x slower cells. At 1.5k
+tokens the attention is a small part of a decode step: the end-to-end gain is bounded there and grows with the context.
 
 #### Tesla V100-SXM2-16GB: one layer, d=128, B=1, us
 
@@ -56,7 +57,7 @@ and grows with the context.
 | 24/2 | 16384 | 8 | 96 | 1369 | 105 | - | 1248 |
 | 24/2 | 16384 | 16 | 192 | 1369 | 180 | - | 1263 |
 
-#### Tesla V100-SXM2-16GB: Qwen/Qwen2.5-3B, fp16, 128 new tokens (decode tok/s)
+#### Tesla V100-SXM2-16GB: Qwen/Qwen2.5-3B, fp16, 128 new tokens (tok/s, prefill included)
 
 | implementation | prompt tokens | mode | tok/s | output = plain greedy |
 |---|---|---|---|---|
@@ -105,7 +106,7 @@ and grows with the context.
 | 24/2 | 16384 | 8 | 96 | 592 | 129 | - | 1112 |
 | 24/2 | 16384 | 16 | 192 | 591 | 173 | - | 1151 |
 
-#### Tesla T4: Qwen/Qwen2.5-3B, fp16, 128 new tokens (decode tok/s)
+#### Tesla T4: Qwen/Qwen2.5-3B, fp16, 128 new tokens (tok/s, prefill included)
 
 | implementation | prompt tokens | mode | tok/s | output = plain greedy |
 |---|---|---|---|---|
@@ -154,7 +155,7 @@ and grows with the context.
 | 24/2 | 16384 | 8 | 96 | 7510 | 488 | - | 4520 |
 | 24/2 | 16384 | 16 | 192 | 7510 | 1015 | - | 4557 |
 
-#### Tesla P100-PCIE-16GB: Qwen/Qwen2.5-3B, fp16, 128 new tokens (decode tok/s)
+#### Tesla P100-PCIE-16GB: Qwen/Qwen2.5-3B, fp16, 128 new tokens (tok/s, prefill included)
 
 | implementation | prompt tokens | mode | tok/s | output = plain greedy |
 |---|---|---|---|---|
@@ -203,7 +204,7 @@ and grows with the context.
 | 24/2 | 16384 | 8 | 96 | 5447 | 572 | - | 28943 |
 | 24/2 | 16384 | 16 | 192 | 5448 | 1069 | - | 28963 |
 
-#### NVIDIA GeForce GTX 1080 Ti: Qwen/Qwen2.5-3B, fp16, 128 new tokens (decode tok/s)
+#### NVIDIA GeForce GTX 1080 Ti: Qwen/Qwen2.5-3B, fp16, 128 new tokens (tok/s, prefill included)
 
 | implementation | prompt tokens | mode | tok/s | output = plain greedy |
 |---|---|---|---|---|
@@ -252,7 +253,7 @@ and grows with the context.
 | 24/2 | 16384 | 8 | 96 | 1311 | 147 | - | 1502 |
 | 24/2 | 16384 | 16 | 192 | 1312 | 224 | - | 1538 |
 
-#### NVIDIA GeForce RTX 2080 Ti: Qwen/Qwen2.5-3B, fp16, 128 new tokens (decode tok/s)
+#### NVIDIA GeForce RTX 2080 Ti: Qwen/Qwen2.5-3B, fp16, 128 new tokens (tok/s, prefill included)
 
 | implementation | prompt tokens | mode | tok/s | output = plain greedy |
 |---|---|---|---|---|
