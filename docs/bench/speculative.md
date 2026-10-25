@@ -2,8 +2,7 @@
 
 `python benchmarks/speculative.py kernel` and `... generate --model Qwen/Qwen2.5-3B --draft Qwen/Qwen2.5-0.5B` (design and
 measurements per step: `docs/analysis/kernels/spec_decode_design.md`, PLAN P6.8). Kernels with the cache kernel's per-row K / V
-as a template parameter (`kRows`, 585b76c); torch 2.7.1, transformers 5.20.2. The V100 is an SXM2 16 GB box (the
-32 GB one of the other tables is gone; not the same machine: compare its rows with the other tables with care).
+as a template parameter (`kRows`, 585b76c); torch 2.7.1, transformers 5.20.2.
 
 - kernel: one attention call of a verification step, d=128, B=1, us. `forward` = the plain forward kernel on the cache (HF's
   path before P6.8); `kvcache` = flash_attn_with_kvcache (the decode kernel up to 8 query rows per KV head, the forward with key
