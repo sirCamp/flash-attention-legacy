@@ -23,7 +23,7 @@ namespace flash_attn_legacy {
 
 struct PascalFwd {
 static constexpr bool kBf16Inputs = true;  // bf16 Q / K / V (the cache forward)
-template <typename Tile, bool kCache, bool kBf16>
+template <typename Tile, bool kCache, bool kBf16, bool kRows>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     constexpr int Br = Tile::Br;
     constexpr int Bc = Tile::Bc;
@@ -118,7 +118,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             // smem_S is rewritten only in the next K/V block, after fwd_band_loop's
             // block-wide barrier (its contract)
         }
-        fwd_logits<kMask, kCache>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
+        fwd_logits<kMask, kCache, kRows>(a, s, [&](int i) { return a.q_row_start + row0 + i; },
                           [&](int j) { return kv_start + cg + 8 * j; });
         float alpha[4];
         softmax.update(s, alpha);
@@ -158,7 +158,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         __syncwarp();  // P^T reads done before the next block overwrites it
     };
 
-    fwd_band_run<Tile, LDF, kCache, kBf16>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDF, kCache, kBf16, kRows>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     float inv[4], lse[4];

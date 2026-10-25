@@ -170,10 +170,16 @@ d. Measure (`spec_bench.py`, `spec_e2e.py` into `benchmarks/`), all GPUs; README
   splits whose keys are all dropped still run (the decode kernel shrinks its splits to the kept keys): a per-block bitmask in
   shared memory and split bounds from the mask.
 - Paged caches beyond 8 rows done: the cache kernel's K / V row of key j comes from `paged_row_offset` (one rule with the
-  decode kernel: block_table[j / block_size], slot j % block_size); the per-row loader is taken only with a key mask or a
-  paged cache (a uniform branch per tile): on contiguous unmasked caches the one-stride loader, as fast as before (the per-row
-  function on every 16-byte vector cost up to 22% on the P100). Equal bit for bit to the same cache contiguous (NHD, HND,
+  decode kernel: block_table[j / block_size], slot j % block_size). Equal bit for bit to the same cache contiguous (NHD, HND,
   vLLM layouts; block sizes 16 / 32 / 48 / 64).
+- Per-row K / V as a template parameter (`kRows`, like `kCache`): the per-row loader, the key mask in the logits and the
+  masked step for every block exist only in the cache kernel's `kRows` variant, launched with a key mask or a paged cache.
+  Before, a uniform runtime branch per tile chose the loader: both loaders stayed in the main loop (sm_61 d=128: 3094
+  instructions against 2064) and contiguous unmasked caches ran 9% (median) to 26% slower on the 1080 Ti than before the key
+  mask (bisected to it; found by the benchmark refresh). Against the build before the key mask, `flash_attn_with_kvcache`
+  median: V100, T4, P100 1.00, 1080 Ti 1.015 (24/2 q_len 1 at 4k / 16k still +10% / +8%, 32/8 4k q_len 4 +6%: the sm_61 code
+  layout only, left as is); against the runtime branch, `flash_attn_with_kvcache` median / best: V100 0.98 / 0.90, T4 0.95 / 0.79, P100 0.90 / 0.87, 1080 Ti
+  0.94 / 0.85, 2080 Ti 0.96 / 0.79 (the forward, one-token decode and SDPA unchanged).
 - BF16 beyond 8 rows done: the cache kernel of the CUDA-core (Pascal) body, compiled for every architecture, reads bf16
   Q / K / V tiles exactly as fp32 (a shift of the 16-bit word, no fp16 range); the tensor-core bodies stay fp16-only
   (`kBf16Inputs`). Before: SDPA for MQA / GQA > 8:1 bf16 decode (20-60x slower than fp16) and the plain forward for bf16

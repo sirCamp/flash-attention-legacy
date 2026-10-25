@@ -115,10 +115,11 @@ __device__ __forceinline__ void fwd_store_lse(const FwdBlockArgs& a, int row, fl
 }
 
 // Key `key` is not visible to sequence row `q_row` (KeyWindow over the tokens;
-// includes keys past the end).
-template <bool kCache>
+// includes keys past the end). kRows: the cache kernel with per-row K / V (a key
+// mask or a paged cache; see fwd_batched_kernel).
+template <bool kCache, bool kRows>
 __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row, int key) {
-    if constexpr (kCache) {  // and the key mask (padding of any shape, holes included)
+    if constexpr (kRows) {  // and the key mask (padding of any shape, holes included)
         if (a.key_mask && key < a.seq_len_k && !a.key_mask[key]) return true;
     }
     return a.window().masked(fwd_token<kCache>(a, q_row), key);
@@ -128,7 +129,7 @@ __device__ __forceinline__ bool fwd_key_masked(const FwdBlockArgs& a, int q_row,
 // outside the KeyWindow when kMask (masked after the map: c * tanh(-inf) would be
 // finite). row(r) / key(c): absolute row of the block's rows (a sequence row, or
 // a packed GQA row of the cache kernel) / key of s[r][c].
-template <bool kMask, bool kCache, int R, int C, typename RowOf, typename KeyOf>
+template <bool kMask, bool kCache, bool kRows, int R, int C, typename RowOf, typename KeyOf>
 __device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][C], RowOf&& row, KeyOf&& key) {
     a.score_map().log2_logits(s);
     if constexpr (kMask) {
@@ -136,7 +137,7 @@ __device__ __forceinline__ void fwd_logits(const FwdBlockArgs& a, float (&s)[R][
         for (int r = 0; r < R; r++) {
             #pragma unroll
             for (int c = 0; c < C; c++) {
-                if (fwd_key_masked<kCache>(a, row(r), key(c))) s[r][c] = -INFINITY;
+                if (fwd_key_masked<kCache, kRows>(a, row(r), key(c))) s[r][c] = -INFINITY;
             }
         }
     }
@@ -243,7 +244,7 @@ __device__ __forceinline__ void fwd_softmax_init(BandSoftmax<ROWS, ROW_LANES>& s
 // by step() for block j is not rewritten by step() for block j + 1 before every
 // warp is done with block j: the block-wide barrier closing each iteration
 // (the column-split Pascal forward relies on it for its partial S).
-template <int Br, int Bc, bool kCache, typename LoadQ, typename Fetch, typename Commit, typename Step>
+template <int Br, int Bc, bool kCache, bool kRows, typename LoadQ, typename Fetch, typename Commit, typename Step>
 __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_row0, bool band_active,
                                               LoadQ&& load_q, Fetch&& fetch, Commit&& commit, Step&& step) {
     // First / last key of a row grow with the row (its token: packed GQA rows of
@@ -273,7 +274,7 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
         __syncthreads();
         if (kv_blk + 1 < kv_end) fetch(kv_blk + 1);
         if (band_active && kv_start <= band_last_key && kv_start + Bc - 1 >= band_first_key) {  // warp-uniform
-            if (kv_start >= nomask_first && kv_start + Bc - 1 <= nomask_last && !(kCache && a.key_mask))  // a key mask: every block
+            if (kv_start >= nomask_first && kv_start + Bc - 1 <= nomask_last && !(kRows && a.key_mask))  // a key mask: every block
                 step(std::false_type{}, kv_start);
             else                                                              step(std::true_type{}, kv_start);
         }
@@ -286,7 +287,7 @@ __device__ __forceinline__ void fwd_band_loop(const FwdBlockArgs& a, int band_ro
 // cores: converted once, when stored). With Tile::kPrefetch the next K/V block
 // is loaded into registers while the current one is computed; otherwise each
 // block is copied straight to shared memory at its turn.
-template <typename Tile, int LD, bool kCache, bool kBf16 = false, typename DstT, typename Step>
+template <typename Tile, int LD, bool kCache, bool kBf16, bool kRows, typename DstT, typename Step>
 __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row0, bool band_active,
                                              DstT* smem_Q, DstT* smem_K, DstT* smem_V, Step&& step) {
     constexpr int Br = Tile::Br, Bc = Tile::Bc, d = Tile::d, NT = Tile::kNumWarps * 32;
@@ -313,11 +314,11 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
     };
     if constexpr (Tile::kPrefetch) {
         TileRegs<Bc, d, NT> next_K, next_V;
-        fwd_band_loop<Br, Bc, kCache>(a, band_row0, band_active, load_q,
+        fwd_band_loop<Br, Bc, kCache, kRows>(a, band_row0, band_active, load_q,
             [&](int kv_blk) {
                 const int kv_start = kv_blk * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                if (kCache && (a.block_table || a.key_mask)) {  // per-row addresses only when needed (uniform)
+                if constexpr (kRows) {
                     load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
                                                         next_K, valid_kv, a.head_dim);
                     load_tile_g2r_rows<Bc, d, NT, true>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
@@ -334,12 +335,12 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
             step);
     } else {
         int pending = 0;  // block the next commit() loads
-        fwd_band_loop<Br, Bc, kCache>(a, band_row0, band_active, load_q,
+        fwd_band_loop<Br, Bc, kCache, kRows>(a, band_row0, band_active, load_q,
             [&](int kv_blk) { pending = kv_blk; },
             [&]() {
                 const int kv_start = pending * Bc;
                 const int valid_kv = min(Bc, a.seq_len_k - kv_start);
-                if (kCache && (a.block_table || a.key_mask)) {  // per-row addresses only when needed (uniform)
+                if constexpr (kRows) {
                     load_tile_g2s_rows<Bc, d, NT, LD, true, kBf16>(kv_rows(a.K, a.k_stride, a.k_block_stride, kv_start),
                                                             smem_K, valid_kv, a.head_dim);
                     load_tile_g2s_rows<Bc, d, NT, LD, true, kBf16>(kv_rows(a.V, a.v_stride, a.v_block_stride, kv_start),
@@ -360,10 +361,14 @@ __device__ __forceinline__ void fwd_band_run(const FwdBlockArgs& a, int band_row
 // splits, the splits' partials for the combine). A template parameter: the
 // plain forward carries none of it (a runtime branch or even the per-batch
 // length load made the compiler lay the kernel out differently: Pascal d=128
-// +23% on the P100, d=64 +9% on the 1080 Ti).
-template <typename Tile, typename Body, bool kCache, bool kBf16 = false>
+// +23% on the P100, d=64 +9% on the 1080 Ti). kRows likewise splits the cache
+// kernel: K / V rows through a key mask or a block table (per-row addresses, the
+// key mask in the logits) only in its kRows variant (both loaders in one kernel:
+// the contiguous cache 9% (median) to 26% slower on the 1080 Ti).
+template <typename Tile, typename Body, bool kCache, bool kBf16, bool kRows>
 __global__ void __launch_bounds__(Tile::kNumWarps * 32)
 fwd_batched_kernel(FlashAttnParams p) {
+    static_assert(kCache || (!kBf16 && !kRows), "bf16 inputs and per-row K / V: the cache kernel only");
     // Flat grid: x = (batch * heads) * q_blocks + q_block (no 65535 limit on
     // B * H; the Q blocks of one head are adjacent, sharing its K/V in L2), y =
     // key split (the cache kernel). The cache kernel with packed GQA rows: heads =
@@ -388,7 +393,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         // window stay aligned to `end` as in the decode kernel
         const int end = p.seqlens_k ? min(max(p.seqlens_k[b_idx], 0), p.seq_len_k) : p.seq_len_k;
         const int start = p.leftpad_k ? min(max(p.leftpad_k[b_idx], 0), end) : 0;
-        if (p.block_table) {  // paged (no leftpad): K / V at the KV head, rows through the block table
+        if (kRows && p.block_table) {  // paged (no leftpad): K / V at the KV head, rows through the block table
             a.K = p.K + kv_h_idx * p.k_head_stride;
             a.V = p.V + kv_h_idx * p.v_head_stride;
         } else {
@@ -397,7 +402,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         }
         a.k_stride = p.k_seq_stride;
         a.v_stride = p.v_seq_stride;
-        a.block_table = p.block_table ? p.block_table + index_t(b_idx) * p.max_blocks : nullptr;
+        a.block_table = kRows && p.block_table ? p.block_table + index_t(b_idx) * p.max_blocks : nullptr;
         a.k_block_stride = p.k_batch_stride;
         a.v_block_stride = p.v_batch_stride;
         a.block_size = p.block_size;
@@ -415,7 +420,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.softcap = p.softcap;
         a.sink_log2 = -INFINITY;  // per row: a.sinks (fwd_softmax_init)
         a.sinks = p.sinks && split == 0 ? p.sinks + h0 : nullptr;  // the sink once per row
-        a.key_mask = p.key_mask ? p.key_mask + b_idx * p.mask_batch_stride + start : nullptr;  // key 0 of K = start
+        a.key_mask = kRows && p.key_mask ? p.key_mask + b_idx * p.mask_batch_stride + start : nullptr;  // key 0 of K = start
         a.window_left = p.window_left;
         a.window_right = p.window_right;
         a.split = split;
@@ -464,7 +469,7 @@ fwd_batched_kernel(FlashAttnParams p) {
         a.key_mask = nullptr;
         a.block_table = nullptr;
     }
-    Body::template run<Tile, kCache, kBf16>(a);
+    Body::template run<Tile, kCache, kBf16, kRows>(a);
 }
 
 template <typename Tile, typename Body>
@@ -511,7 +516,7 @@ fwd_varlen_kernel(FlashAttnVarlenParams p) {
     a.sinks = nullptr;
     a.key_mask = nullptr;
     a.block_table = nullptr;
-    Body::template run<Tile, false, false>(a);
+    Body::template run<Tile, false, false, false>(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,17 +529,23 @@ void launch_fwd(FlashAttnParams& params, cudaStream_t stream) {
     const int64_t blocks = int64_t(cdiv(params.seq_len_q * rpt, Tile::Br)) * params.batch_size * (params.num_heads / rpt);
     if (blocks > INT32_MAX) throw std::runtime_error("flash_attn_legacy: batch * heads * query blocks exceeds the grid limit");
     const dim3 grid(static_cast<unsigned>(blocks), max(params.num_splits, 1));
-    auto launch = [&](auto cache, auto bf16) {
-        const auto kernel = fwd_batched_kernel<Tile, Body, decltype(cache)::value, decltype(bf16)::value>;
+    auto launch = [&](auto cache, auto bf16, auto rows) {
+        const auto kernel = fwd_batched_kernel<Tile, Body, decltype(cache)::value, decltype(bf16)::value,
+                                               decltype(rows)::value>;
         FLASH_ATTN_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kernel<<<grid, Tile::kNumWarps * 32, smem, stream>>>(params);
     };
+    // flash_attn_with_kvcache (partials, even of one split): per-row K / V with a key mask or a paged cache
+    auto launch_cache = [&](auto bf16) {
+        if (params.key_mask || params.block_table) launch(std::true_type{}, bf16, std::true_type{});
+        else                                       launch(std::true_type{}, bf16, std::false_type{});
+    };
     if (!params.O_part) {
-        launch(std::false_type{}, std::false_type{});
-    } else if (!params.bf16) {  // flash_attn_with_kvcache: partials, even of one split
-        launch(std::true_type{}, std::false_type{});
+        launch(std::false_type{}, std::false_type{}, std::false_type{});
+    } else if (!params.bf16) {
+        launch_cache(std::false_type{});
     } else if constexpr (Body::kBf16Inputs) {  // bf16 inputs: CUDA-core bodies (fp32 tiles)
-        launch(std::true_type{}, std::true_type{});
+        launch_cache(std::true_type{});
     } else {
         throw std::runtime_error("flash_attn_legacy: bf16 inputs need the CUDA-core forward");
     }

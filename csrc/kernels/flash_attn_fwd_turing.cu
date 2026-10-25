@@ -25,7 +25,7 @@ namespace flash_attn_legacy {
 
 struct TuringFwd {
 static constexpr bool kBf16Inputs = false;  // bf16 Q / K / V (the cache forward): not on tensor cores
-template <typename Tile, bool kCache, bool kBf16>
+template <typename Tile, bool kCache, bool kBf16, bool kRows>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     static_assert(!kBf16, "bf16 inputs run on the CUDA-core forward");
     constexpr int Br = Tile::Br;
@@ -108,7 +108,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             s[0][2 * n] = S[n][0]; s[0][2 * n + 1] = S[n][1];
             s[1][2 * n] = S[n][2]; s[1][2 * n + 1] = S[n][3];
         }
-        fwd_logits<kMask, kCache>(a, s, [&](int r) { return a.q_row_start + band_row0 + g + 8 * r; },
+        fwd_logits<kMask, kCache, kRows>(a, s, [&](int r) { return a.q_row_start + band_row0 + g + 8 * r; },
                           [&](int c) { return kv_start + 8 * (c / 2) + 2 * t + (c & 1); });
         float alpha[2];
         softmax.update(s, alpha);
@@ -140,7 +140,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         }
     };
 
-    fwd_band_run<Tile, LDH, kCache>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDH, kCache, kBf16, kRows>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     float inv[2], lse[2];
@@ -167,7 +167,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // family from the arch of the code that runs (compiled_arch_for).
 struct TuringFwd {
     static constexpr bool kBf16Inputs = false;
-    template <typename Tile, bool kCache, bool kBf16>
+    template <typename Tile, bool kCache, bool kBf16, bool kRows>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 

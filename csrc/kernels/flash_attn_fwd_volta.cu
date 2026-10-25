@@ -41,7 +41,7 @@ namespace flash_attn_legacy {
 // ---------------------------------------------------------------------------
 struct VoltaFwd {
 static constexpr bool kBf16Inputs = false;  // bf16 Q / K / V (the cache forward): not on tensor cores
-template <typename Tile, bool kCache, bool kBf16>
+template <typename Tile, bool kCache, bool kBf16, bool kRows>
 static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
     static_assert(!kBf16, "bf16 inputs run on the CUDA-core forward");
     constexpr int Br = Tile::Br;
@@ -127,7 +127,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
             s[0][4 * c] = v.x; s[0][4 * c + 1] = v.y; s[0][4 * c + 2] = v.z; s[0][4 * c + 3] = v.w;
         }
         // element 4c + i of the row: key 4 (2c + h) + i of the block
-        fwd_logits<kMask, kCache>(a, s, [&](int) { return q_row; },
+        fwd_logits<kMask, kCache, kRows>(a, s, [&](int) { return q_row; },
                           [&](int e) { return kv_start + 4 * (2 * (e / 4) + h) + e % 4; });
         float alpha[1];
         softmax.update(s, alpha);
@@ -161,7 +161,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
         __syncwarp();  // P and row_scale reads done before the next block reuses them
     };
 
-    fwd_band_run<Tile, LDH, kCache>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
+    fwd_band_run<Tile, LDH, kCache, kBf16, kRows>(a, band_row0, band_active, smem_Q, smem_K, smem_V, step);
     if (!band_active) return;
 
     // Finalize: O / row_sum, logsumexp, O written through the staging tile
@@ -204,7 +204,7 @@ static __device__ __forceinline__ void run(const FwdBlockArgs& a) {
 // family from the arch of the code that runs (compiled_arch_for).
 struct VoltaFwd {
     static constexpr bool kBf16Inputs = false;
-    template <typename Tile, bool kCache, bool kBf16>
+    template <typename Tile, bool kCache, bool kBf16, bool kRows>
     static __device__ __forceinline__ void run(const FwdBlockArgs&) { __trap(); }
 };
 
