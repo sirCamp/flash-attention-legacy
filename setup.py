@@ -189,7 +189,7 @@ setup(
     extras_require={
         "test": ["pytest", "numpy"],
         "bench": ["tabulate", "matplotlib", "sentence-transformers", "datasets"],
-        "transformers": ["transformers>=4.34.0", "accelerate", "sentencepiece"],
+        "transformers": ["transformers>=5.0", "accelerate", "sentencepiece"],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",

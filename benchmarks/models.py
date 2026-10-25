@@ -38,6 +38,7 @@ Usage:
 Results print as JSON lines; --save appends them to docs/bench/models_<gpu>.jsonl;
 --report FILE... turns saved files into markdown tables (one per GPU and mode; a case
 saved more than once shows its last result).
+--summary FILE... prints the README's overview: a row per model and GPU.
 """
 
 import argparse
@@ -268,15 +269,10 @@ def report(paths):
     the faster of SDPA and eager, flash_attn_legacy's speedup, its time (ours /
     theirs: below 1 we are faster) and the peak memory it saves against the
     smaller of their peaks; then, per GPU, the longest N each implementation ran."""
-    rows = [json.loads(line) for path in paths for line in pathlib.Path(path).read_text().splitlines() if line]
-    latest = {}  # a case measured again (e.g. after a kernel change) keeps its last result
-    for r in rows:
-        if r["mode"] != "check":
-            latest[(r["gpu"], r["impl"], r["mode"], r["N"], *case_of(r))] = r
-    rows = list(latest.values())
+    rows = latest_rows(paths)
     for gpu in dict.fromkeys(r["gpu"] for r in rows):
         for mode in dict.fromkeys(r["mode"] for r in rows if r["gpu"] == gpu):
-            key = "decode_tok_s" if mode.startswith("generate") else "tok_s"
+            key = rate_key(mode)
             sel = [r for r in rows if r["gpu"] == gpu and r["mode"] == mode]
             impls = [i for i in IMPLS if any(r["impl"] == i for r in sel)]
             print(f"\n#### {gpu}: {mode} ({key.replace('_', ' ')}, peak GiB)\n")
@@ -288,18 +284,92 @@ def report(paths):
                 for i in impls:
                     r = got.get(i)
                     cells.append("-" if r is None else "OOM" if r.get("oom") else f"{r[key]:,} ({r['peak_gib']})")
-                ours = got.get("flash_attn_legacy", {})
-                ran = [got[i] for i in ("sdpa", "eager") if i in got and not got[i].get("oom")]
-                if ours.get(key) and ran:
-                    best = max(r[key] for r in ran)
-                    low = min(r["peak_gib"] for r in ran)
-                    saved = low - ours["peak_gib"]
-                    cmp = [f"{ours[key] / best:.2f}x", f"{best / ours[key]:.2f}x",
-                           f"{saved:.2f} GiB ({saved / low:.0%})"]
-                else:
-                    cmp = ["only ours" if ours.get(key) else "-", "-", "-"]
+                vs = versus(got, key)
+                cmp = (["only ours" if got.get("flash_attn_legacy", {}).get(key) else "-", "-", "-"] if vs is None else
+                       [f"{vs[0]:.2f}x", f"{1 / vs[0]:.2f}x", f"{vs[1]:.2f} GiB ({vs[2]:.0%})"])
                 print(f"| {model_name(case)} | {case[1]} | {case[2]} | {case[-1]} | " + " | ".join(cells + cmp) + " |")
         longest(gpu, rows)
+
+
+def latest_rows(paths):
+    """The saved rows but the checks; a case measured again (e.g. after a kernel change) keeps its last result."""
+    rows = [json.loads(line) for path in paths for line in pathlib.Path(path).read_text().splitlines() if line]
+    latest = {}
+    for r in rows:
+        if r["mode"] != "check":
+            latest[(r["gpu"], r["impl"], r["mode"], r["N"], *case_of(r))] = r
+    return list(latest.values())
+
+
+def rate_key(mode):
+    return "decode_tok_s" if mode.startswith("generate") else "tok_s"
+
+
+def versus(got, key):
+    """flash_attn_legacy against the faster of SDPA and eager in one case (impl -> row): (speedup, GiB saved
+    against the smaller of their peaks, its share), or None when ours or both of them did not run."""
+    ours = got.get("flash_attn_legacy", {})
+    ran = [got[i] for i in ("sdpa", "eager") if i in got and not got[i].get("oom")]
+    if not ours.get(key) or not ran:
+        return None
+    low = min(r["peak_gib"] for r in ran)
+    return ours[key] / max(r[key] for r in ran), low - ours["peak_gib"], (low - ours["peak_gib"]) / low
+
+
+# The README overview: (column, modes tried in order, B, N)
+SUMMARY = (("prefill, 4k", ("prefill",), 1, 4096),
+           ("decode, 2k prompt", ("generate",), 1, 2048),
+           ("compiled decode, 2k prompt", ("generate_static_compiled",), 1, 2048),
+           ("train step, 2k", ("train_ckpt", "train_lora_ckpt", "train"), 1, 2048))
+SUMMARY_TAG = {"train_lora_ckpt": " (LoRA)", "train": " (no ckpt)"}
+
+
+def summary(paths):
+    """One markdown table, a row per model (by weight size) and GPU: speedup against the faster of SDPA and
+    eager and the peak memory saved in the SUMMARY cases (train: the first of its modes ours ran), and the
+    longest prefill of ours / of the better of the others (>= N: no longer N measured; full tables: --report)."""
+    rows = latest_rows(paths)
+    gpus = sorted(dict.fromkeys(r["gpu"] for r in rows), key=lambda g: [k in g for k in GPU_ORDER].index(True))
+    weights = lambda m: min((r["base_gib"] for r in rows if r["model"] == m and "base_gib" in r), default=0)  # noqa: E731
+    print("| model | GPU | " + " | ".join(c[0] for c in SUMMARY) + " | longest prefill, ours / others |")
+    print("|---" * (len(SUMMARY) + 3) + "|")
+    for model in sorted(dict.fromkeys(r["model"] for r in rows), key=weights):
+        for gpu in [g for g in gpus if any(r["model"] == model and r["gpu"] == g for r in rows)]:
+            sel = [r for r in rows if r["model"] == model and r["gpu"] == gpu]
+            cells = []
+            for _, modes, B, N in SUMMARY:
+                case = lambda m: {r["impl"]: r for r in sel if r["mode"] == m and r["B"] == B and r["N"] == N}  # noqa: E731
+                tried = [m for m in modes if case(m)]
+                mode = next((m for m in tried if not case(m).get("flash_attn_legacy", {"oom": True}).get("oom")),
+                            tried[0] if tried else None)
+                got, key = case(mode), rate_key(mode or "")
+                vs = versus(got, key)
+                if vs is not None:
+                    cell = f"{vs[0]:.2f}x" + (f", -{vs[1]:.1f} GiB" if vs[1] >= 0.05 else "")
+                elif got.get("flash_attn_legacy", {}).get(key):
+                    cell = "only ours"
+                else:
+                    cell = "OOM" if got and all(r.get("oom") for r in got.values()) else "-"
+                cells.append(cell + (SUMMARY_TAG.get(mode, "") if cell != "-" else ""))
+            cells.append(" / ".join(longest_prefill(sel, impls) for impls in (("flash_attn_legacy",), ("sdpa", "eager"))))
+            print(f"| {model.split('/')[-1]} | {short_gpu(gpu)} | " + " | ".join(cells) + " |")
+
+
+GPU_ORDER = ("V100", "T4", "P100", "1080", "2080")
+
+
+def longest_prefill(sel, impls):
+    ran = [r["N"] for r in sel if r["mode"] == "prefill" and r["impl"] in impls and not r.get("oom")]
+    oom = [r["N"] for r in sel if r["mode"] == "prefill" and r["impl"] in impls and r.get("oom")]
+    if not ran:
+        return "OOM" if oom else "-"
+    return ("" if any(n > max(ran) for n in oom) else ">= ") + f"{max(ran) // 1024}k"
+
+
+def short_gpu(gpu):
+    for prefix in ("Tesla ", "NVIDIA GeForce GTX ", "NVIDIA GeForce RTX "):
+        gpu = gpu.removeprefix(prefix)
+    return gpu.split("-")[0] + (" 32 GB" if "32GB" in gpu else "")
 
 
 def case_of(r):
@@ -396,6 +466,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                 allow_abbrev=False)  # the workers' command lines filter --check by name
     p.add_argument("--report", nargs="+", metavar="JSONL", help="print markdown tables from saved results and exit")
+    p.add_argument("--summary", nargs="+", metavar="JSONL", help="print the README's per-model overview table and exit")
     p.add_argument("--models", nargs="+")
     p.add_argument("--impls", nargs="+", default=list(IMPLS), choices=IMPLS)
     p.add_argument("--modes", nargs="+", default=["prefill", "generate", "train"],
@@ -418,6 +489,8 @@ def main():
     args = p.parse_args()
     if args.report:
         return report(args.report)
+    if args.summary:
+        return summary(args.summary)
     if not args.models:
         p.error("--models is required")
     if args.compile and not args.static:

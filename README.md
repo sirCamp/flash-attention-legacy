@@ -1,6 +1,6 @@
 # Flash Attention Legacy
 
-**Flash Attention v2 for Pascal and Volta GPUs**
+**Flash Attention v2 for Pascal, Volta and Turing GPUs**
 
 CUDA implementation of [Flash Attention v2](https://arxiv.org/abs/2307.08691) for older NVIDIA GPUs not supported by the [official flash-attn package](https://github.com/Dao-AILab/flash-attention).
 
@@ -26,9 +26,9 @@ But not all code paths go through SDPA. Some models, training frameworks, and re
 
 ### What this project actually is
 
-1. **A drop-in replacement** for `flash_attention_2` on Pascal/Volta GPUs. If a model requires it and your GPU is rejected, `pip install` this and use `attn_implementation="flash_attn_legacy"` instead.
+1. **A drop-in replacement** for `flash_attention_2` on Pascal, Volta and Turing GPUs. If a model requires it and your GPU is rejected, `pip install` this and use `attn_implementation="flash_attn_legacy"` instead.
 
-2. **A from-scratch CUDA implementation** of Flash Attention v2 — hand-written kernels with WMMA tensor cores (Volta) and half2 packed math (Pascal). No cuDNN, no ATen, no black boxes. If you want to understand how flash attention works at the CUDA level, this is a readable reference.
+2. **A from-scratch CUDA implementation** of Flash Attention v2 — hand-written kernels with WMMA tensor cores (Volta), `mma.sync` tensor cores (Turing) and fp32 math on CUDA cores (Pascal). No cuDNN, no ATen, no black boxes. If you want to understand how flash attention works at the CUDA level, this is a readable reference.
 
 3. **Variable-length sequence support** (`flash_attn_varlen_func`) for packed batching without padding waste — useful for training with heterogeneous sequence lengths.
 
@@ -64,13 +64,15 @@ pip install -e ".[test,bench]" --no-build-isolation
 
 > **Why `--no-build-isolation`?** The CUDA extension needs to link against your installed PyTorch at build time. With build isolation, pip creates a temporary environment where PyTorch may not be available, causing the build to fail.
 
-**Requirements**: CUDA toolkit >= 11.0, PyTorch >= 1.12 (PyTorch 2.4 for Pascal/SM 6.0), a Pascal or Volta GPU.
+**Requirements**: a Pascal, Volta or Turing GPU; a CUDA toolkit >= 11.0 that still compiles its architecture (CUDA 13 no longer
+compiles SM 6.0 / 6.1 / 7.0: use 12.x); PyTorch >= 1.12 built for that architecture (the cu126 wheels of PyTorch 2.7.1 cover
+all of them); transformers >= 5.0 for the HuggingFace integration.
 
 > **Beta**: This project is under active development. It has been tested with the following configuration:
-> - PyTorch 2.4 (last version supporting SM 6.0 / Pascal)
-> - Transformers 5.4
-> - CUDA 12.4 / 12.8 (NVIDIA driver 580)
-> - Tesla P100 16GB, Tesla V100-SXM2-32GB
+> - PyTorch 2.7.1 (cu126 wheels)
+> - Transformers 5.20.2
+> - CUDA 12.6 (12.8 on the P100)
+> - Tesla V100-SXM2 (16 and 32 GB), Tesla T4, Tesla P100 16GB, GTX 1080 Ti, RTX 2080 Ti
 >
 > Other combinations may work but are not yet validated. Bug reports and contributions are welcome.
 
@@ -203,7 +205,7 @@ check_gpu_compatibility()
 ## Benchmarks
 
 End to end on HuggingFace models (transformers 5.20.2, fp16), against PyTorch SDPA and eager attention on the same inputs:
-`python benchmarks/models.py`. Every table (prefill, generate, train, LoRA, padded batches; TinyLlama, Qwen2.5 3B / 14B, Gemma 2,
+`python benchmarks/models.py --models <hf id> ... --save`. Every table (prefill, generate, train, LoRA, padded batches; TinyLlama, Qwen2.5 3B / 14B, Gemma 2,
 Mistral 7B, Llama 3.1 8B, Qwen3.5 2B / 4B / 9B), with time ratios and peak memory, is in
 [`docs/bench/models.md`](docs/bench/models.md). Each cell: speedup of ours over the faster of SDPA and eager, and the peak memory
 saved against the smaller of their peaks; "only ours" = SDPA and eager run out of memory.
@@ -227,6 +229,38 @@ Longest sequence that fits (ours / the better of SDPA and eager; ">=" = no longe
 | Prefill, Qwen2.5-3B | >= 128k / 8k | 32k / 4k | 64k / 4k | 32k / 4k | 16k / 4k |
 | Generate, Qwen2.5-3B, B=1 (prompt) | >= 64k / >= 8k | 32k / 2k | >= 64k / 2k | 32k / 2k | 32k / 2k |
 | Training, checkpointing, TinyLlama | 32k / 4k | 16k / 4k | 16k / 4k | 8k / 2k | 8k / 2k |
+
+Every model measured, one row per model and GPU (B=1; train: one step with gradient checkpointing, `(LoRA)` = rank-16 LoRA
+where it was measured instead, `(no ckpt)` = measured only without checkpointing; OOM = no implementation fits; `-` = not
+measured; compiled decode needs SM >= 7.0): `python benchmarks/models.py --summary docs/bench/models_*.jsonl`.
+
+| model | GPU | prefill, 4k | decode, 2k prompt | compiled decode, 2k prompt | train step, 2k | longest prefill, ours / others |
+|---|---|---|---|---|---|---|
+| TinyLlama-1.1B-Chat-v1.0 | V100 32 GB | 3.38x, -3.9 GiB | 1.07x, -1.0 GiB | 1.22x, -1.0 GiB | 2.06x, -1.0 GiB | >= 128k / 8k |
+| TinyLlama-1.1B-Chat-v1.0 | T4 | 3.97x, -3.9 GiB | 1.12x, -1.0 GiB | 1.32x, -1.0 GiB | 2.30x, -1.0 GiB | >= 128k / 4k |
+| TinyLlama-1.1B-Chat-v1.0 | P100 | 1.71x, -3.9 GiB | 1.24x, -1.0 GiB | - | 1.26x, -1.0 GiB | >= 128k / 4k |
+| TinyLlama-1.1B-Chat-v1.0 | 1080 Ti | 1.72x, -3.9 GiB | 1.13x, -1.0 GiB | - | 1.21x, -1.0 GiB | 64k / 4k |
+| TinyLlama-1.1B-Chat-v1.0 | 2080 Ti | 3.21x, -3.9 GiB | 1.15x, -1.0 GiB | 1.30x, -1.0 GiB | 2.02x, -1.0 GiB | 64k / 4k |
+| Qwen3.5-2B | V100 32 GB | 1.07x, -0.7 GiB | 0.98x, -0.1 GiB | 1.02x, -0.1 GiB | 0.93x | >= 16k / >= 16k |
+| Qwen3.5-2B | T4 | 1.10x, -0.7 GiB | 1.02x, -0.1 GiB | 1.05x, -0.1 GiB | 1.01x | >= 16k / 8k |
+| Qwen3.5-2B | P100 | 0.99x, -0.7 GiB | 1.02x, -0.1 GiB | - | 0.99x | >= 16k / 8k |
+| Qwen3.5-2B | 1080 Ti | 0.99x, -0.7 GiB | 1.01x, -0.1 GiB | - | OOM | >= 16k / 8k |
+| Qwen3.5-2B | 2080 Ti | 1.07x, -0.7 GiB | 1.00x, -0.1 GiB | 1.03x, -0.1 GiB | OOM | >= 16k / 8k |
+| gemma-2-2b-it | V100 32 GB | 1.39x, -0.9 GiB | 1.08x, -0.2 GiB | 1.10x, -0.2 GiB | 1.07x | >= 16k / >= 16k |
+| Qwen2.5-3B | V100 32 GB | 1.75x, -1.8 GiB | 1.11x, -0.4 GiB | 1.11x, -0.4 GiB | 1.33x | >= 128k / 8k |
+| Qwen2.5-3B | T4 | 1.96x, -1.8 GiB | 1.11x, -0.4 GiB | 1.17x, -0.4 GiB | 1.38x | 32k / 4k |
+| Qwen2.5-3B | P100 | 1.12x, -1.8 GiB | 1.28x, -0.4 GiB | - | 1.03x | 64k / 4k |
+| Qwen2.5-3B | 1080 Ti | 1.16x, -1.8 GiB | 1.08x, -0.4 GiB | - | 1.01x (LoRA) | 32k / 4k |
+| Qwen2.5-3B | 2080 Ti | 1.72x, -1.8 GiB | 1.12x, -0.4 GiB | 1.18x, -0.4 GiB | only ours (LoRA) | 16k / 4k |
+| Qwen3.5-4B | V100 32 GB | 1.08x, -1.3 GiB | 1.10x, -0.1 GiB | 1.05x, -0.2 GiB | 1.00x | >= 16k / 8k |
+| Qwen3.5-4B | T4 | 1.10x, -1.3 GiB | 1.02x, -0.1 GiB | 1.06x, -0.2 GiB | OOM (no ckpt) | >= 16k / 4k |
+| Qwen3.5-4B | P100 | 0.99x, -1.3 GiB | 1.08x, -0.1 GiB | - | OOM | 16k / 4k |
+| Mistral-7B-Instruct-v0.2 | V100 32 GB | 1.66x, -3.8 GiB | 1.16x, -0.9 GiB | 1.13x, -0.9 GiB | OOM (no ckpt) | >= 16k / 4k |
+| Mistral-7B-Instruct-v0.2 | P100 | only ours | 1.26x, -0.9 GiB | - | OOM (no ckpt) | 4k / 1k |
+| Llama-3.1-8B-Instruct | V100 32 GB | 1.65x, -3.8 GiB | 1.32x, -0.9 GiB | 1.13x, -0.9 GiB | 1.29x (LoRA) | >= 16k / 4k |
+| Llama-3.1-8B-Instruct | P100 | OOM | only ours | - | OOM (LoRA) | 2k / 1k |
+| Qwen3.5-9B | V100 32 GB | 1.06x, -1.3 GiB | 0.98x, -0.1 GiB | 1.02x, -0.2 GiB | - | >= 32k / 8k |
+| Qwen2.5-14B | V100 32 GB | only ours | 1.16x, -1.1 GiB | 1.12x, -1.2 GiB | OOM (LoRA) | 8k / 2k |
 
 Larger models: Llama 3.1 8B on the V100 prefills at least 16k tokens (the longest measured; SDPA / eager 4k; 1.65x and -3.8 GiB at 4k), decodes 8 x 2k prompts
 compiled at 1.72x with -7.5 GiB, and LoRA-trains at 8k (others 4k; 1.48x at 4k); on the P100 (16 GB, weights 15 GiB) it prefills
@@ -381,7 +415,7 @@ If you use Flash Attention Legacy in your research, please cite:
 ```bibtex
 @software{campese2025flashattentionlegacy,
   author       = {Campese, Stefano},
-  title        = {Flash Attention Legacy: Flash Attention v2 for Pascal and Volta GPUs},
+  title        = {Flash Attention Legacy: Flash Attention v2 for Pascal, Volta and Turing GPUs},
   year         = {2025},
   url          = {https://github.com/sirCamp/flash-attention-legacy},
   license      = {MIT}
