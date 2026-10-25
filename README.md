@@ -20,9 +20,16 @@ This leaves perfectly functional GPUs locked out — not because the hardware ca
 
 ### What about SDPA?
 
-PyTorch's `scaled_dot_product_attention` (SDPA) already provides memory-efficient attention on these GPUs via its `memory_efficient` backend. If you can use `attn_implementation="sdpa"`, **you should** — it works out of the box with no extra dependencies.
+PyTorch's `scaled_dot_product_attention` (SDPA) runs on these GPUs too, with no extra dependencies, but without a flash
+backend: its `memory_efficient` kernel, or the `math` one that materializes the N x N scores. Kernel against kernel, ours takes
+0.54-0.92x of SDPA memory-efficient's time on SM 7.x at d=64 and is slower on the P100 at d=128 / 256 (1.24x / 1.81x; table in
+Benchmarks). End to end in transformers the gap grows: with GQA, HF's SDPA path repeats the KV heads, and SDPA has no split-KV
+decode, paged-cache or varlen kernel. Measured on real models: up to 3.97x faster prefill, contexts up to 32x longer on the
+same GPU, continuous batching 4.9-15.5x faster.
 
-But not all code paths go through SDPA. Some models, training frameworks, and research codebases explicitly require `flash_attention_2` and won't fall back gracefully. That's where this package comes in.
+And some models, training frameworks and research codebases require `flash_attention_2` outright and won't fall back to SDPA.
+This package covers both cases: one `attn_implementation`, with SDPA kept as its fallback for the few cases the kernels do not
+handle (listed in "What runs on the kernel").
 
 ### What this project actually is
 
@@ -68,7 +75,7 @@ pip install -e ".[test,bench]" --no-build-isolation
 compiles SM 6.0 / 6.1 / 7.0: use 12.x); PyTorch >= 1.12 built for that architecture (the cu126 wheels of PyTorch 2.7.1 cover
 all of them); transformers >= 5.0 for the HuggingFace integration.
 
-> **Beta**: This project is under active development. It has been tested with the following configuration:
+> **Tested configuration** (v1.0.0):
 > - PyTorch 2.7.1 (cu126 wheels)
 > - Transformers 5.20.2
 > - CUDA 12.6 (12.8 on the P100)
