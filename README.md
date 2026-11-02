@@ -202,6 +202,27 @@ x = torch.randn(2, 1024, 512, device='cuda', dtype=torch.float16)
 out = attn(x)  # [2, 1024, 512]
 ```
 
+### FP16 linear layers on the P100 (opt-in)
+
+On the Tesla P100 (compute capability 6.0) torch runs FP16 matrix multiplications with FP32 accumulation at 5-8.7
+TFLOPS, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model onto a GEMM kernel that
+multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 128 elements: 13-14 TFLOPS. It is
+**off by default** and a no-op on every other GPU:
+
+```python
+import flash_attn_legacy
+flash_attn_legacy.patch_linear(model)                # or: FLASH_ATTN_LEGACY_LINEAR=1 in the environment, for models
+                                                     # loaded with attn_implementation="flash_attn_legacy"
+flash_attn_legacy.patch_linear(model, enable=False)  # back to stock
+```
+
+Calls with fewer than 128 rows (decode) and anything the kernel does not take (other dtypes, K % 8 != 0, ...) run on
+`F.linear` unchanged; the backward computes dX on the kernel when the shapes allow it, dW and the bias gradient stock. Measured on the P100
+([`docs/bench/linear.md`](docs/bench/linear.md)): prefill 1.37-1.88x (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B,
+Llama-3.1-8B), LoRA training 1.24-1.35x (the same but Llama), decode unchanged (-1% at batch 1 on small models: the Python check per layer).
+Accuracy: perplexity within 0.0013 of stock FP16; 0.26-0.59% of top-1 predictions differ from FP32, against 0.18-0.35%
+for stock FP16. A LoRA fine-tune reaches the same validation loss (±1.5e-4, seeds differ by 1e-3).
+
 ### GPU compatibility check
 
 ```python
@@ -405,6 +426,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] BF16 / FP32 inference
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
 - [x] Short queries against a cache beyond 8 query rows per KV head (assisted / speculative decoding, MQA / GQA > 8:1): key splits and packed GQA rows in the forward (`docs/analysis/kernels/spec_decode_design.md`)
+- [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.88x, LoRA training up to 1.35x
 - [ ] Serving: one grid for mixed prefill + decode batches (they run today on the varlen kernel), a vLLM backend plugin
   (Turing only, see `docs/analysis/vllm_feasibility.md`)
 - [ ] Dropout and deterministic dQ in the kernel
