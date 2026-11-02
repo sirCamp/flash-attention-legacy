@@ -230,8 +230,9 @@ alternated) — met; LoRA loss — met (validation loss ±1.5e-4 of stock, seeds
 accuracy — perplexity at the noise floor (within 0.0013 of stock FP16 and of FP32), but top-1 flips against FP32 are
 0.26-0.59% vs stock FP16's 0.18-0.35% (1.3-1.7x; element-wise error 1.2e-3 vs 2.1e-4): above the noise floor on
 near-ties, accepted for an opt-in path and documented. Decode: unchanged at B = 8, -0.6 to -1.0% at B = 1 on 1-1.5B
-models (host-bound step, the patched forward's row check). Still to do: the suite on the other GPUs (sm_61 / 7.0 / 7.5:
-build and no-op), then the commit. A smaller C (fold every 64) to close the top-1 gap is the first follow-up to measure.
+models (host-bound step, the patched forward's row check). Other GPUs (2026-11-02; 1080 Ti, V100, 2080 Ti, T4): build
+unchanged, `tests/test_linear.py` 18 passed / 35 skipped (SM 6.0 only), the full suite green. A smaller C (fold every
+64) to close the top-1 gap is the first follow-up to measure.
 
 Open, after P8: dX reading W in its [N,K] layout (no W^T copy), dW on the kernel, a hand-scheduled SASS main loop (cuBLAS's
 `maxwell_hgemm` reaches ~89% of peak, ours ~80%), and attention's QK^T / PV on HFMA2 with the same chunking. A llama.cpp PR
