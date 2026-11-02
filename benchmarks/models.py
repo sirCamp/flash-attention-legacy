@@ -22,6 +22,8 @@ What a user sees, per model and attention implementation, on the same inputs:
 An out-of-memory result is reported as OOM (the longest length that fits is a
 result in itself: attention memory is O(N) on the kernel, O(N^2) in eager).
 --check saves the top-1 agreement of the prefill logits with eager (512 tokens).
+--linear also runs the fp16 nn.Linear layers on the P100's HFMA2 kernel (patch_linear, off by default;
+a no-op elsewhere): its rows record the number of patched layers and are cases of their own.
 
 Every (model, implementation) runs in its own processes, one for prefill and generate
 and one for train: compiled graphs (which keep their StaticCache alive), dynamo's
@@ -46,6 +48,7 @@ import contextlib
 import gc
 import json
 import math
+import os
 import pathlib
 import statistics
 import subprocess
@@ -120,9 +123,20 @@ def run_case(fn, result, on_oom=None):
     return result
 
 
-def load(name, impl, dtype):
+def load(name, impl, dtype, linear=False):
+    """The model on the GPU; with linear, its fp16 nn.Linear layers patched (patch_linear: layers loaded
+    in other dtypes, as the fp32 trainable ones of train_model, stay stock)."""
     from transformers import AutoModelForCausalLM
-    return AutoModelForCausalLM.from_pretrained(name, dtype=dtype, attn_implementation=impl).cuda()
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, attn_implementation=impl).cuda()
+    if linear:
+        from flash_attn_legacy import patch_linear
+        patch_linear(model)
+    return model
+
+
+def patched_layers(model):
+    from flash_attn_legacy.linear import _FusedLinear
+    return sum(isinstance(m, _FusedLinear) for m in model.modules())
 
 
 def tokens(model, B, N, seed=0):
@@ -182,7 +196,7 @@ def bench_generate(model, B, P, new, reps, static, compile_):
     return run_case(fn, {"mode": mode, "B": B, "N": P, "new": new})
 
 
-def train_model(name, impl, lora):
+def train_model(name, impl, lora, linear=False):
     """Trainable in fp32 (AdamW states): the attention projections, or with lora > 0 rank-`lora`
     adapters on them; the rest frozen in fp16. Loaded in bf16 (checkpoints are bf16: the fp32
     parameters are exact) to keep host memory at 2 bytes per parameter."""
@@ -196,6 +210,9 @@ def train_model(name, impl, lora):
         trainable = "lora_" in n if lora else any(proj in n for proj in ATTN_PROJ)
         p.data = p.data.float() if trainable else p.data.half()
         p.requires_grad_(trainable)
+    if linear:  # after the casts: the frozen fp16 layers (the LoRA base layers too), not the fp32 trainable ones
+        from flash_attn_legacy import patch_linear
+        patch_linear(model)
     return model
 
 
@@ -249,12 +266,13 @@ def bench_train(model, B, N, reps, checkpointing, lora):
     return result
 
 
-def check(name, impls, dtype, n=512):
-    """Top-1 agreement of each implementation's prefill logits with eager."""
+def check(name, impls, dtype, n=512, linear=False):
+    """Top-1 agreement of each implementation's prefill logits with eager (eager stock, the others with
+    linear patched)."""
     import torch
     logits = {}
     for impl in ("eager", *[i for i in impls if i != "eager"]):
-        model = load(name, impl, dtype)
+        model = load(name, impl, dtype, linear and impl != "eager")
         with torch.inference_mode():
             logits[impl] = model(input_ids=tokens(model, 1, n)).logits.float()
         del model
@@ -335,7 +353,8 @@ def summary(paths):
     print("|---" * (len(SUMMARY) + 3) + "|")
     for model in sorted(dict.fromkeys(r["model"] for r in rows), key=weights):
         for gpu in [g for g in gpus if any(r["model"] == model and r["gpu"] == g for r in rows)]:
-            sel = [r for r in rows if r["model"] == model and r["gpu"] == gpu]
+            # the stock linear layers only: the overview compares attention implementations
+            sel = [r for r in rows if r["model"] == model and r["gpu"] == gpu and "linear" not in r]
             cells = []
             for _, modes, B, N in SUMMARY:
                 case = lambda m: {r["impl"]: r for r in sel if r["mode"] == m and r["B"] == B and r["N"] == N}  # noqa: E731
@@ -374,11 +393,11 @@ def short_gpu(gpu):
 
 def case_of(r):
     """What makes two rows of a mode the same case, but N."""
-    return r["model"], r["dtype"], r["B"], r.get("new"), r.get("lora")
+    return r["model"], r["dtype"], r["B"], r.get("new"), r.get("lora"), "linear" in r
 
 
 def model_name(case):
-    return case[0].split("/")[-1] + (f" (LoRA r{case[4]})" if case[4] else "")
+    return case[0].split("/")[-1] + (f" (LoRA r{case[4]})" if case[4] else "") + (" (fused linear)" if case[5] else "")
 
 
 def longest(gpu, rows):
@@ -410,8 +429,10 @@ def run_worker(args, name, impl):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     out = ROOT / "docs" / "bench" / f"models_{gpu.replace(' ', '_')}.jsonl"
 
+    linear = {}  # with --linear: the patched layers of the loaded model, in every row
+
     def emit(r):  # printed and saved as soon as measured: a crash loses one case
-        r.update(model=name, gpu=gpu)
+        r.update(model=name, gpu=gpu, **linear)
         r.setdefault("dtype", args.dtype)  # train rows are fp16 autocast whatever the inference weights
         r.setdefault("impl", impl)
         print(json.dumps(r), flush=True)
@@ -421,12 +442,18 @@ def run_worker(args, name, impl):
 
     if args.check:
         print(f"{gpu}, torch {torch.__version__}, {flash_attn_legacy.get_device_info()}", flush=True)
-        emit({"mode": "check", "impl": "-", "B": 1, "N": 512, "top1_vs_eager": check(name, args.impls, dtype)})
+        emit({"mode": "check", "impl": "-", "B": 1, "N": 512, **({"linear": True} if args.linear else {}),
+              "top1_vs_eager": check(name, args.impls, dtype, linear=args.linear)})
         return
 
     def loaded(fn, oom_rows):  # the model, or OOM rows for its cases when its weights alone do not fit
+        if args.linear:
+            linear["linear"] = True  # the OOM rows of a model that does not fit
         try:
-            return fn()
+            model = fn()
+            if args.linear:
+                linear["linear"] = patched_layers(model)
+            return model
         except Exception as err:
             if not is_oom(err):
                 raise
@@ -436,7 +463,7 @@ def run_worker(args, name, impl):
 
     gen_modes = ["generate"] + (["generate_static" + ("_compiled" if args.compile else "")] if args.static else [])
     if "prefill" in args.modes or "generate" in args.modes:
-        model = loaded(lambda: load(name, impl, dtype).eval(),
+        model = loaded(lambda: load(name, impl, dtype, args.linear).eval(),
                        [{"mode": "prefill", "B": 1, "N": n} for n in args.prefill_lens if "prefill" in args.modes]
                        + [{"mode": m, "B": B, "N": P, "new": args.new_tokens} for B in args.gen_batch
                           for P in args.prompt_lens for m in gen_modes if "generate" in args.modes])
@@ -454,7 +481,7 @@ def run_worker(args, name, impl):
         gc.collect()
         torch.cuda.empty_cache()
     if "train" in args.modes:
-        model = loaded(lambda: train_model(name, impl, args.lora),
+        model = loaded(lambda: train_model(name, impl, args.lora, args.linear),
                        [train_row(B, n, args.checkpointing, args.lora) for B in args.train_batch for n in args.train_lens])
         if model is not None:
             for B in args.train_batch:
@@ -484,9 +511,12 @@ def main():
     p.add_argument("--compile", action="store_true", help="with --static: HF's compiled decode steps (SM >= 7.0)")
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--check", action="store_true", help="save the top-1 agreement with eager on 512 tokens")
+    p.add_argument("--linear", action="store_true", help="fp16 nn.Linear on the P100's HFMA2 kernel (patch_linear)")
     p.add_argument("--save", action="store_true")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)  # one (model, impl) in this process
     args = p.parse_args()
+    if os.environ.get("FLASH_ATTN_LEGACY_LINEAR"):
+        p.error("unset FLASH_ATTN_LEGACY_LINEAR: it would patch the stock rows too (use --linear)")
     if args.report:
         return report(args.report)
     if args.summary:
