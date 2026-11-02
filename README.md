@@ -225,8 +225,8 @@ y = flash_attn_legacy.fused_linear(x, W, bias)       # the function itself, F.li
 
 Calls with fewer than 128 rows (decode) and anything the kernel does not take (other dtypes, K % 8 != 0, ...) run on
 `F.linear` unchanged (`fallback_stats()` counts them, decode excluded). The backward computes dX on the kernel when the
-shapes allow it (torch >= 2.4), dW and the bias gradient stock. Measured on the P100, against the same model with stock
-`F.linear` and our attention in both ([`docs/bench/linear.md`](docs/bench/linear.md), `python benchmarks/linear.py`):
+shapes allow it (torch >= 2.4), reading W in place (no transposed copy), dW and the bias gradient stock. Measured on
+the P100, against the same model with stock `F.linear` and our attention in both ([`docs/bench/linear.md`](docs/bench/linear.md), `python benchmarks/linear.py`):
 
 | | speedup |
 |---|---|

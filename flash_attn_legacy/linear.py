@@ -27,6 +27,8 @@ _INT32 = 1 << 31
 _PLAIN_TYPES = (torch.Tensor, nn.Parameter)
 # The extension has the op (an extension built before P8 does not: fused_linear is then F.linear, with a warning)
 _HAS_OP = hasattr(_ops, "linear")
+# ... and its W [K, N] layout (P8.6; an older build: dX stock)
+_HAS_W_KN = _HAS_OP and "w_kn" in str(_ops.linear.default._schema)
 
 # Device index -> compute capability 6.0. Read through torch.cuda.get_device_properties, which torch.compile
 # folds into a constant.
@@ -41,10 +43,11 @@ def _sm60(index):
     return ok
 
 
-def _int32_ok(M, N, K):
-    """y [M, N] = x [M, K] W [N, K]^T fits the kernel's int32 element offsets: the limits of the op's TORCH_CHECK
-    (linear_forward in csrc/flash_attn_legacy.cpp), keep them in sync."""
-    return M * N < _INT32 and M * K + 32 < _INT32 and N * K + 32 < _INT32
+def _int32_ok(M, N, K, w_kn=False):
+    """y [M, N] = x [M, K] W [N, K]^T (w_kn: x W, W [K, N]) fits the kernel's int32 element offsets: the limits of
+    the op's TORCH_CHECK (linear_forward in csrc/flash_attn_legacy.cpp), keep them in sync."""
+    w_elems = N * (-(-K // 32) * 32) if w_kn else N * K + 32
+    return M * N < _INT32 and M * K + 32 < _INT32 and w_elems < _INT32
 
 
 def _fallback_reason(x, W, bias):
@@ -89,7 +92,7 @@ def fused_linear(x, W, bias=None):
     not float16 (or autocast to another dtype), fewer than MIN_M rows (decode), K % 8 != 0, non-contiguous,
     misaligned or tensor-subclass inputs, beyond int32 offsets. The reasons are counted in fallback_stats(), except
     the small-M one (the designed decode path) and not under torch.compile (this code only runs while tracing).
-    Differentiable: dX on the kernel (W^T copied for it), dW and db stock; no double backward."""
+    Differentiable: dX on the kernel, dW and db stock; no double backward."""
     reason = _fallback_reason(x, W, bias)
     if reason is not None:
         # not counted: small M (the designed decode path) and a last dim that does not match W (F.linear raises)
@@ -104,22 +107,25 @@ def fused_linear(x, W, bias=None):
 
 
 # ---------------------------------------------------------------------------
-# Autograd of torch.ops.flash_attn_legacy.linear (2-D x, W, bias)
+# Autograd of torch.ops.flash_attn_legacy.linear (2-D x, W, bias; w_kn: W [K, N], y = x W)
 # ---------------------------------------------------------------------------
 
-def _grad_input(grad, W):
-    """dX [M, K] = dY [M, N] W [N, K]. On the kernel as dY (W^T)^T: it reduces along contiguous rows, so it takes
-    a transposed copy of W, made only when the shapes allow the kernel (else stock)."""
+def _grad_input(grad, W, w_kn):
+    """dX [M, K] = dY [M, N] W [N, K] (w_kn: dY W^T with W [K, N]). On the kernel with the other layout of the same
+    W, no copy: W [N, K] is W^T [K, N] read with w_kn, and the other way round. Stock when the shapes do not allow
+    the kernel (the reduction N % 8: the kernel's K; the outputs are the forward's K, a multiple of 8)."""
     M, N = grad.shape
-    K = W.shape[1]
-    if grad.dtype == torch.float16 and M >= MIN_M and N > 0 and N % 8 == 0 and _int32_ok(M, K, N):
-        return _ops.linear(grad.contiguous(), W.t().contiguous(), None)
-    return grad.mm(W)
+    K = W.shape[0] if w_kn else W.shape[1]
+    if (_HAS_W_KN and grad.dtype == torch.float16 and M >= MIN_M and N > 0 and N % 8 == 0
+            and _int32_ok(M, K, N, not w_kn)):
+        return _ops.linear(grad.contiguous(), W, None, not w_kn)
+    return grad.mm(W.t() if w_kn else W)
 
 
 def _setup_context(ctx, inputs, output):
-    x, W, bias = inputs
+    x, W, bias = inputs[:3]
     ctx.has_bias = bias is not None
+    ctx.w_kn = len(inputs) > 3 and bool(inputs[3])
     # x only for dW, W only for dX
     ctx.save_for_backward(x if W.requires_grad else None, W if x.requires_grad else None)
 
@@ -130,12 +136,12 @@ def _backward(ctx, grad):
     x, W = ctx.saved_tensors
     dx = dW = db = None
     if ctx.needs_input_grad[0]:
-        dx = _grad_input(grad, W)
+        dx = _grad_input(grad, W, ctx.w_kn)
     if ctx.needs_input_grad[1]:
-        dW = grad.t().mm(x)  # stock cuBLAS (fp32 accumulation)
+        dW = x.t().mm(grad) if ctx.w_kn else grad.t().mm(x)  # stock cuBLAS (fp32 accumulation)
     if ctx.has_bias and ctx.needs_input_grad[2]:
         db = grad.sum(0)
-    return dx, dW, db
+    return dx, dW, db, None
 
 
 _HAS_AUTOGRAD = hasattr(torch.library, "register_autograd")  # torch >= 2.4; else gradients go to F.linear

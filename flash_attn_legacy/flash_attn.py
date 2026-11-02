@@ -74,8 +74,8 @@ def _register_fakes():
 
     if hasattr(_ops, "linear"):  # an extension built before P8 has no linear op
         @register("flash_attn_legacy::linear")
-        def _(x, W, bias=None):
-            return x.new_empty((x.shape[0], W.shape[0]))
+        def _(x, W, bias=None, w_kn=False):
+            return x.new_empty((x.shape[0], W.shape[1] if w_kn else W.shape[0]))
 
 
 _register_fakes()

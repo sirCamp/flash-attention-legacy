@@ -204,6 +204,32 @@ only in C (2026-11-02; GEMM: the 60 shapes with M >= 512 above, 2 rounds alterna
 slower and not measurably better on top-1. Perplexity within 0.0033 of stock FP16 in all three (0.0010 at C = 64). All three pass `tests/test_linear.py`
 with 0 spills.
 
+## The backward: dX
+
+dX = dY W (P8.6). Before: the kernel on a transposed copy of W (`W.t().contiguous()`, 2·N·K bytes moved per call and an
+N x K transient). Now: the op reads W [N, K] in place as a [K, N] operand (`w_kn`), the same shared-memory words, so dX
+is bitwise the copy path's. One process, A (copy) and B (in place) alternated, CUDA events, median of 6 rounds x 20
+calls (`p86_ab.py kernel`, a one-off script); M rows, N and K of the forward layer:
+
+| M | N | K | A copy + kernel | A kernel alone | B | B vs A kernel | B vs A |
+|---|---|---|---|---|---|---|---|
+| 2048 | 1536 | 1536 | 0.831 ms | 0.749 ms | 0.752 ms | 0.995x | 1.104x |
+| 2048 | 256 | 1536 | 0.173 ms | 0.155 ms | 0.156 ms | 0.995x | 1.113x |
+| 2048 | 8960 | 1536 | 4.626 ms | 4.162 ms | 4.193 ms | 0.992x | 1.103x |
+| 2048 | 1536 | 8960 | 4.691 ms | 4.214 ms | 4.232 ms | 0.996x | 1.108x |
+| 2048 | 896 | 4864 | 1.521 ms | 1.367 ms | 1.376 ms | 0.994x | 1.106x |
+| 2048 | 4864 | 896 | 1.459 ms | 1.317 ms | 1.324 ms | 0.995x | 1.102x |
+| 2048 | 151936 | 1536 | 113.182 ms | 69.980 ms | 70.553 ms | 0.992x | 1.604x |
+| 4096 | 1536 | 1536 | 1.542 ms | 1.461 ms | 1.470 ms | 0.993x | 1.049x |
+| 512 | 8960 | 1536 | 1.525 ms | 1.050 ms | 1.063 ms | 0.988x | 1.435x |
+
+The in-place staging costs 0.4-1.2% of the GEMM (one `__byte_perm` per shared-memory word); the copy was 5-38% of
+the whole dX. Peak memory of one dX of Qwen2.5-1.5B's lm_head (dY [2048, 151936], W [151936, 1536]), peak reset before
+the call: 459 MiB above the inputs with the copy, 13 MiB in place (dX 6 MiB plus the stream-K workspace). LoRA step
+(`p86_ab.py lora`), Qwen2.5-1.5B at 2048 tokens (rank 16 on every projection, gradient checkpointing, `patch_linear`,
+AdamW), blocks of 5 steps alternated A B / B A, 40 steps each: 2590.9 -> 2507.9 ms (1.033x; steps within ±2 ms); the
+peak of the step is unchanged (6.76 GiB).
+
 ## LoRA fine-tuning
 
 A one-off run (not a repo script): Qwen2.5-0.5B loaded with `attn_implementation="flash_attn_legacy"`, peft rank-16 LoRA on every projection, 300 AdamW steps of 4 x 512

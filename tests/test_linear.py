@@ -368,11 +368,89 @@ int64_t hog_started() { return g_started == nullptr ? 0 : *(volatile int*)g_star
     @compile_ready
     def test_opcheck(self):
         x, W, b = make(300, 1152, 896, 4)
-        for args in ((x, W, b), (x, W, None), (x[:0], W, b)):
+        Wt = W.t().contiguous()
+        for args in ((x, W, b), (x, W, None), (x[:0], W, b), (x, Wt, b, True), (x[:0], Wt, None, True)):
             torch.library.opcheck(ops().linear.default, args, test_utils=("test_schema", "test_faketensor"))
         # needs inputs that require gradients
-        torch.library.opcheck(ops().linear.default, (x.clone().requires_grad_(), W.clone().requires_grad_(), b),
-                              test_utils=("test_autograd_registration",))
+        for Wr, extra in ((W, ()), (Wt, (True,))):
+            torch.library.opcheck(ops().linear.default,
+                                  (x.clone().requires_grad_(), Wr.clone().requires_grad_(), b, *extra),
+                                  test_utils=("test_autograd_registration",))
+
+    # (M, N, K) of y = x W with W [K, N]: tails in every dimension (N, K multiples of 8), the dX shapes of real
+    # layers (M, the forward's N, the forward's K: Qwen2.5-0.5B / 1.5B, k_proj and the lm_head included)
+    _KN_EDGE = [(M, N, K) for M in (1, 17, 129, 1000) for N, K in ((64, 8), (104, 72), (264, 136), (1000, 1000),
+                                                                  (136, 4864), (1160, 2056))]
+    _KN_REAL = [(2048, 896, 4864), (2048, 4864, 896), (2048, 896, 128), (2048, 1536, 8960), (2048, 8960, 1536),
+                (2048, 1536, 256), (1024, 1536, 1536), (2048, 1536, 151936)]
+
+    @pytest.mark.parametrize("M,N,K", _KN_EDGE + _KN_REAL,
+                             ids=[f"M{m}-N{n}-K{k}" for m, n, k in _KN_EDGE + _KN_REAL])
+    def test_w_kn_bitwise(self, M, N, K):
+        """y = x W with W [K, N] read in place (w_kn) bitwise equal to the op on the transposed copy W^T [N, K]
+        (the words, chains and folds are the same), data-parallel and default plan."""
+        x, Wnk, b = make(M, N, K, seed=M + 3 * N + 7 * K, bias=M % 2 == 1)
+        Wkn = Wnk.t().contiguous()
+        for ctx in (contextlib.nullcontext, data_parallel_only):
+            with ctx():
+                expected = ops().linear(x, Wnk, b)
+                got = ops().linear(x, Wkn, b, True)
+            assert got.shape == (M, N) and torch.equal(got, expected), f"{ctx.__name__}: differs"
+        assert relf(got, ref64(x, Wnk, b)) < TOL
+
+    def test_w_kn_streams_and_graph(self):
+        """W [K, N] on stream-K shapes: two streams at once and a CUDA graph replayed with new inputs, bitwise the
+        eager result."""
+        shapes = [(1024, 1536, 8960), (2048, 1536, 4864)]  # dX shapes (M, forward K, forward N)
+        ins = []
+        for i, (M, N, K) in enumerate(shapes):
+            assert plan(M, N, K)[2] > 0, f"{(M, N, K)} must use stream-K"
+            x, W, _ = make(M, N, K, seed=40 + i, bias=False)
+            ins.append((x, W.t().contiguous()))
+        expected = [ops().linear(x, Wkn, None, True) for x, Wkn in ins]
+        torch.cuda.synchronize()
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        bad = [torch.zeros((), dtype=torch.int64, device=DEV) for _ in range(2)]
+        for s in streams:
+            s.wait_stream(torch.cuda.current_stream())
+        for _ in range(30):
+            for s in (0, 1):
+                with torch.cuda.stream(streams[s]):
+                    bad[s] += (ops().linear(*ins[s], None, True) != expected[s]).any().long()
+        torch.cuda.synchronize()
+        assert int(bad[0]) == 0 and int(bad[1]) == 0, f"mismatching outputs {bad}"
+
+        x, Wkn = ins[0]
+        static_x = x.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            ops().linear(static_x, Wkn, None, True)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_y = ops().linear(static_x, Wkn, None, True)
+        for r in range(3):
+            xr = make(*shapes[0], seed=50 + r, bias=False)[0]
+            static_x.copy_(xr)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(static_y, ops().linear(xr, Wkn, None, True)), f"replay {r} differs from eager"
+
+    def test_w_kn_rejects(self):
+        x = torch.randn(256, 64, device=DEV, dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="multiple of 8 with W"):
+            ops().linear(x, torch.randn(64, 100, device=DEV, dtype=torch.float16), None, True)
+        with pytest.raises(RuntimeError, match=r"W \[K, N\]"):
+            ops().linear(x, torch.randn(72, 64, device=DEV, dtype=torch.float16), None, True)
+        # N * K + 32 < 2^31, but the last stage addresses W rows up to K rounded up to 32 (the dX of a
+        # [299592, 7168] lm_head): the backward goes stock
+        assert linear_mod._int32_ok(128, 7168, 299592) and not linear_mod._int32_ok(128, 7168, 299592, True)
+        # the op's own check (before any copy: W an expanded view), the same bound
+        Wkn = torch.empty(1, 1, device=DEV, dtype=torch.float16).expand(299592, 7168)
+        xk = torch.empty(128, 299592, device=DEV, dtype=torch.float16)
+        with pytest.raises(RuntimeError, match=r"int32 offsets \(W \[K, N\]"):
+            ops().linear(xk, Wkn, None, True)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +508,43 @@ class TestAutograd:
                 assert g is None, name
                 continue
             assert g.dtype == torch.float16 and torch.isfinite(g).all(), name
+            err = ((g.float() - r).norm() / r.norm()).item()
+            assert err < 3e-3, f"{name}: relF vs fp32 {err:.2e}"
+
+    def test_grad_input_no_copy(self):
+        """dX on the kernel reads W in place: bitwise the kernel on a transposed copy of W (the path before P8.6),
+        and no N x K transient (the lm_head of Qwen2.5-1.5B is 151936 x 1536: 467 MB)."""
+        M, N, K = 512, 151936, 1536
+        g = torch.Generator(device=DEV).manual_seed(11)
+        grad = torch.randn(M, N, device=DEV, dtype=torch.float16, generator=g)
+        W = (torch.randn(N, K, device=DEV, dtype=torch.float16, generator=g) * N ** -0.5).half()
+        expected = ops().linear(grad, W.t().contiguous())
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        dx = linear_mod._grad_input(grad, W, False)
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated() - base
+        assert torch.equal(dx, expected)
+        # dX itself (1.5 MB) and the stream-K workspace (at most 2 fp32 tiles per SM) only
+        assert extra < dx.numel() * 2 + 2 * 128 * 128 * 4 * _sms() + (1 << 20), f"{extra / 2**20:.1f} MiB"
+
+    @pytest.mark.parametrize("M", [300, 64], ids=["kernel-dX", "small-M"])
+    def test_w_kn_grads(self, M):
+        """The op with W [K, N] (y = x W) differentiates too: dX on the kernel with W read as [N, K] (stock below
+        MIN_M rows), dW = x^T dY."""
+        torch.manual_seed(1)
+        K, N = 896, 1152
+        x0 = torch.randn(M, K, device=DEV, dtype=torch.float16)
+        W0 = (torch.randn(K, N, device=DEV, dtype=torch.float16) * K ** -0.5).half()
+        b0 = torch.randn(N, device=DEV, dtype=torch.float16)
+        gy = torch.randn(M, N, device=DEV, dtype=torch.float16)
+        got = self._run(lambda x, W, b: ops().linear(x, W, b, True), x0, W0, b0, gy, torch.float16)
+        ref = self._run(lambda x, W, b: x @ W + b, x0, W0, b0, gy, torch.float32)
+        if M >= linear_mod.MIN_M:
+            assert torch.equal(got[1], ops().linear(gy, W0))  # dX: the kernel on W [K, N] read as [N, K]
+        for name, g, r in zip(("y", "dX", "dW", "db"), got, ref):
+            assert g.dtype == torch.float16 and g.shape == r.shape and torch.isfinite(g).all(), name
             err = ((g.float() - r).norm() / r.norm()).item()
             assert err < 3e-3, f"{name}: relF vs fp32 {err:.2e}"
 

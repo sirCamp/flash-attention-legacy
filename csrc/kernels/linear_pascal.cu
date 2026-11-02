@@ -1,7 +1,8 @@
 // ============================================================================
 // FP16 linear layer for the P100 (SM 6.0): HFMA2 with chunked accumulation
 // (docs/PLAN.md P8). y [M, N] = x [M, K] W [N, K]^T (+ bias [N]), fp16 in and
-// out, x and W K-contiguous (the nn.Linear layout).
+// out, x and W K-contiguous (the nn.Linear layout); or y = x W with W [K, N]
+// N-contiguous (w_kn: the dX of the backward, dY W, without a transposed copy).
 //
 // torch runs fp16 GEMMs on SM 6.0 with cuBLAS COMPUTE_32F, at about half the
 // card's HFMA2 rate; COMPUTE_16F accumulates the whole K in fp16 (top-1 tokens
@@ -17,6 +18,10 @@
 // block tile 128 x 128, 256 threads with 8 x 8 outputs each, stages of 32
 // halves (16 K pairs), shared-memory double buffer (one __syncthreads per
 // stage), global -> register -> shared staging (no cp.async on SM 6.0).
+// W [K, N] (kWKN): the same shared-memory words, staged from 16-byte loads along
+// N of two K rows each, paired per column with __byte_perm (word c = (W[2kp][c],
+// W[2kp + 1][c]), the word a transposed copy of W would give): bitwise the
+// result of the op on W^T copied to [N, K].
 //
 // Schedules (LinearPlan, chosen on the host by linear_pascal_plan):
 //   data-parallel: one block per output tile, the whole K;
@@ -107,7 +112,8 @@ __device__ __forceinline__ uint32_t sk_block_of(uint32_t u, uint32_t units, uint
 
 // kStreamK = false: one block per output tile (blockIdx.x, row-major tile order), tile0 unused.
 // kStreamK = true: stream-K over the tiles [tile0, tiles).
-template <bool kStreamK>
+// kWKN: W is [K, N] (N-contiguous) instead of [N, K].
+template <bool kStreamK, bool kWKN>
 __global__ void __launch_bounds__(kThreads, 1)
 linear_kernel(const LinearParams p, const int tile0) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 600
@@ -127,14 +133,19 @@ linear_kernel(const LinearParams p, const int tile0) {
     const int nt = (K + 2 * kStagePairs - 1) / (2 * kStagePairs);  // stages over the whole K
     const int kc = (tid & 3) * 8;  // same K offset for every 16-byte chunk of this thread (kThreads % 4 == 0)
     const int s0 = ((tid & 3) * 4) * kStride + (tid >> 2);
+    // W [K, N] staging (kWKN): 2 rows x 8 outputs per thread and stage, a 256-byte segment per row and 16 threads
+    constexpr int kLoadsB = kWKN ? 2 : kLoads;
+    const int kr = (tid >> 4) * 2, nc = (tid & 15) * 8;
+    static_assert(kThreads == 16 * kStagePairs && 16 * 8 == kTile, "W [K, N] staging: thread / tile mismatch");
 
     float facc[8][8];
 
     // Accumulates the stages [st0, st1) of tile (m0, n0) into facc
     auto segment = [&](int m0, int n0, int st0, int st1) {
-        // 32-bit element offsets (the host checks M * K, N * K < 2^31): 4 registers instead of
-        // 4 64-bit pointers, so ptxas does not rematerialise the row * K products in the main loop
-        int oa[kLoads], ob[kLoads];
+        // 32-bit element offsets (the host bounds them below 2^31, W [K, N] up to the last stage's rows,
+        // N * K rounded up to the stage): registers instead of 64-bit pointers, so ptxas does not rematerialise
+        // the row * K products in the main loop
+        int oa[kLoads], ob[kLoadsB];
         uint32_t okA = 0, okB = 0;
         #pragma unroll
         for (int l = 0; l < kLoads; ++l) {
@@ -142,13 +153,20 @@ linear_kernel(const LinearParams p, const int tile0) {
             okA |= (m0 + r < M) ? (1u << l) : 0u;
             oa[l] = min(m0 + r, M - 1) * K + kc;
         }
-        #pragma unroll
-        for (int l = 0; l < kLoads; ++l) {
-            const int r = (tid + l * kThreads) >> 2;
-            okB |= (n0 + r < N) ? (1u << l) : 0u;
-            ob[l] = min(n0 + r, N - 1) * K + kc;
+        if constexpr (kWKN) {
+            // rows kr, kr + 1 of the stage, 8 outputs from column n0 + nc (N % 8 == 0: whole or out)
+            okB = n0 + nc < N;
+            #pragma unroll
+            for (int l = 0; l < kLoadsB; ++l) ob[l] = (kr + l) * N + min(n0 + nc, N - 8);
+        } else {
+            #pragma unroll
+            for (int l = 0; l < kLoads; ++l) {
+                const int r = (tid + l * kThreads) >> 2;
+                okB |= (n0 + r < N) ? (1u << l) : 0u;
+                ob[l] = min(n0 + r, N - 1) * K + kc;
+            }
         }
-        uint4 ra[kLoads], rb[kLoads];
+        uint4 ra[kLoads], rb[kLoadsB];
         auto gload = [&](int t) {
             const int ko = t * 2 * kStagePairs;
             const bool kok = ko + kc < K;
@@ -157,24 +175,44 @@ linear_kernel(const LinearParams p, const int tile0) {
                 ra[l] = (kok && (okA >> l & 1)) ? __ldg(reinterpret_cast<const uint4*>(X + (oa[l] + ko)))
                                                 : make_uint4(0, 0, 0, 0);
             }
-            #pragma unroll
-            for (int l = 0; l < kLoads; ++l) {
-                rb[l] = (kok && (okB >> l & 1)) ? __ldg(reinterpret_cast<const uint4*>(W + (ob[l] + ko)))
-                                                : make_uint4(0, 0, 0, 0);
+            if constexpr (kWKN) {
+                const bool ok = okB && ko + kr < K;  // K % 8 == 0: row kr + 1 < K too
+                #pragma unroll
+                for (int l = 0; l < kLoadsB; ++l) {
+                    rb[l] = ok ? __ldg(reinterpret_cast<const uint4*>(W + (ob[l] + ko * N))) : make_uint4(0, 0, 0, 0);
+                }
+            } else {
+                #pragma unroll
+                for (int l = 0; l < kLoads; ++l) {
+                    rb[l] = (kok && (okB >> l & 1)) ? __ldg(reinterpret_cast<const uint4*>(W + (ob[l] + ko)))
+                                                    : make_uint4(0, 0, 0, 0);
+                }
             }
         };
         auto sstore = [&](int buf) {
             uint32_t* a = &As[buf][0][0] + s0;
-            uint32_t* b = &Bs[buf][0][0] + s0;
             #pragma unroll
             for (int l = 0; l < kLoads; ++l) {
                 const int o = l * (kThreads / 4);
                 a[o] = ra[l].x; a[o + kStride] = ra[l].y; a[o + 2 * kStride] = ra[l].z; a[o + 3 * kStride] = ra[l].w;
             }
-            #pragma unroll
-            for (int l = 0; l < kLoads; ++l) {
-                const int o = l * (kThreads / 4);
-                b[o] = rb[l].x; b[o + kStride] = rb[l].y; b[o + 2 * kStride] = rb[l].z; b[o + 3 * kStride] = rb[l].w;
+            if constexpr (kWKN) {
+                // word c = (row kr, row kr + 1) of column c: the low halves of the two rows' words (0x5410),
+                // then the high halves (0x7632); two 16-byte stores
+                const uint4 r0 = rb[0], r1 = rb[1];
+                uint4* b = reinterpret_cast<uint4*>(&Bs[buf][kr >> 1][nc]);
+                b[0] = make_uint4(__byte_perm(r0.x, r1.x, 0x5410), __byte_perm(r0.x, r1.x, 0x7632),
+                                  __byte_perm(r0.y, r1.y, 0x5410), __byte_perm(r0.y, r1.y, 0x7632));
+                b[1] = make_uint4(__byte_perm(r0.z, r1.z, 0x5410), __byte_perm(r0.z, r1.z, 0x7632),
+                                  __byte_perm(r0.w, r1.w, 0x5410), __byte_perm(r0.w, r1.w, 0x7632));
+            } else {
+                uint32_t* b = &Bs[buf][0][0] + s0;
+                #pragma unroll
+                for (int l = 0; l < kLoads; ++l) {
+                    const int o = l * (kThreads / 4);
+                    b[o] = rb[l].x; b[o + kStride] = rb[l].y;
+                    b[o + 2 * kStride] = rb[l].z; b[o + 3 * kStride] = rb[l].w;
+                }
             }
         };
         uint32_t acc[8][8];
@@ -388,7 +426,10 @@ int linear_resident_blocks() {
     }
     int sms = 0, per_sm = 0;
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    FLASH_ATTN_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, linear_kernel<true>, kThreads, 0));
+    // The W [N, K] instance; this only sizes the stream-K grid (no block waits for another): both instances
+    // run one block per SM (216-251 registers x 256 threads)
+    FLASH_ATTN_CHECK_CUDA(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, linear_kernel<true, false>, kThreads, 0));
     if (per_sm < 1) throw std::runtime_error("flash_attn_legacy: the linear kernel cannot be resident on this GPU");
     const int resident = sms * per_sm;
     if (dev < kMaxDevices) cache[dev].store(resident, std::memory_order_relaxed);
@@ -429,9 +470,15 @@ LinearPlan linear_pascal_plan(int M, int N, int K) {
 
 // p.ws / p.counters: plan.sk_blocks * 2 * kLinearTile^2 floats and plan.tiles - plan.tile0
 // zeroed counters when plan.tile0 < plan.tiles (the host op allocates them).
+template <bool kWKN>
+void launch(const LinearParams& p, const LinearPlan& plan, cudaStream_t stream) {
+    if (plan.tile0 > 0) linear_kernel<false, kWKN><<<plan.tile0, kThreads, 0, stream>>>(p, 0);
+    if (plan.tile0 < plan.tiles) linear_kernel<true, kWKN><<<plan.sk_blocks, kThreads, 0, stream>>>(p, plan.tile0);
+}
+
 void linear_pascal_launch(const LinearParams& p, const LinearPlan& plan, cudaStream_t stream) {
-    if (plan.tile0 > 0) linear_kernel<false><<<plan.tile0, kThreads, 0, stream>>>(p, 0);
-    if (plan.tile0 < plan.tiles) linear_kernel<true><<<plan.sk_blocks, kThreads, 0, stream>>>(p, plan.tile0);
+    if (p.w_kn) launch<true>(p, plan, stream);
+    else        launch<false>(p, plan, stream);
 }
 
 }  // namespace flash_attn_legacy

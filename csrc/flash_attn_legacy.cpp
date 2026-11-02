@@ -986,16 +986,21 @@ static void check_linear_device(int device_id) {
     compiled_arch_for(sm);  // a clear error when the build has no SM 6.0 code
 }
 
-torch::Tensor linear_forward(torch::Tensor x, torch::Tensor W, c10::optional<torch::Tensor> bias) {
+// y = x W^T (W [N, K]), or y = x W (w_kn: W [K, N], N % 8 == 0)
+torch::Tensor linear_forward(torch::Tensor x, torch::Tensor W, c10::optional<torch::Tensor> bias, bool w_kn) {
     TORCH_CHECK(x.is_cuda() && W.device() == x.device(), "x and W must be on the same CUDA device");
     TORCH_CHECK(x.dtype() == torch::kFloat16 && W.dtype() == torch::kFloat16, "x and W must be float16");
-    TORCH_CHECK(x.dim() == 2 && W.dim() == 2 && W.size(1) == x.size(1),
-                "x must be [M, K] and W [N, K], got ", x.sizes(), " and ", W.sizes());
-    const int64_t M = x.size(0), K = x.size(1), N = W.size(0);
+    TORCH_CHECK(x.dim() == 2 && W.dim() == 2 && W.size(w_kn ? 0 : 1) == x.size(1),
+                "x must be [M, K] and W ", w_kn ? "[K, N]" : "[N, K]", ", got ", x.sizes(), " and ", W.sizes());
+    const int64_t M = x.size(0), K = x.size(1), N = W.size(w_kn ? 1 : 0);
     TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8 (128-bit loads), got ", K);
+    TORCH_CHECK(!w_kn || N % 8 == 0, "N must be a multiple of 8 with W [K, N] (128-bit loads), got ", N);
     // 32-bit element offsets in the kernel: row * K + k stays below M * K + 32 (N * K + 32 for W)
-    TORCH_CHECK(M * N < (int64_t(1) << 31) && M * K + 32 < (int64_t(1) << 31) && N * K + 32 < (int64_t(1) << 31),
-                "M * N, M * K and N * K must fit the kernel's int32 offsets, got M=", M, " N=", N, " K=", K);
+    // (w_kn: the last stage addresses W rows up to K rounded up to 32, its loads beyond K masked)
+    const int64_t w_elems = w_kn ? N * ((K + 31) / 32 * 32) : N * K + 32;
+    TORCH_CHECK(M * N < (int64_t(1) << 31) && M * K + 32 < (int64_t(1) << 31) && w_elems < (int64_t(1) << 31),
+                "M * N, M * K and N * K must fit the kernel's int32 offsets", w_kn ? " (W [K, N]: N * K rounded up to 32)" : "",
+                ", got M=", M, " N=", N, " K=", K);
     torch::Tensor b;
     if (bias.has_value() && bias->defined()) {
         TORCH_CHECK(bias->device() == x.device() && bias->dtype() == torch::kFloat16 && bias->dim() == 1 &&
@@ -1020,6 +1025,7 @@ torch::Tensor linear_forward(torch::Tensor x, torch::Tensor W, c10::optional<tor
     p.bias = b.defined() ? reinterpret_cast<const half*>(b.data_ptr<at::Half>()) : nullptr;
     p.y = reinterpret_cast<half*>(y.data_ptr<at::Half>());
     p.M = int(M); p.N = int(N); p.K = int(K);
+    p.w_kn = w_kn;
     const LinearPlan plan = linear_pascal_plan(p.M, p.N, p.K);
     torch::Tensor ws, counters;  // held until after the launch (the caching allocator orders their reuse)
     if (plan.tile0 < plan.tiles) {
@@ -1083,7 +1089,7 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "int uniform_seqlen=-1) -> (Tensor, Tensor)");
     m.def("kvcache_append(Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor k, Tensor v, Tensor? cache_seqlens, "
           "int uniform_seqlen=-1, Tensor? block_table=None) -> ()");
-    m.def("linear(Tensor x, Tensor W, Tensor? bias=None) -> Tensor");
+    m.def("linear(Tensor x, Tensor W, Tensor? bias=None, bool w_kn=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {

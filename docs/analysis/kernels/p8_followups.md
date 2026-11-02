@@ -1,7 +1,8 @@
 # P8 follow-ups on the P100: where the time goes, and what to change next
 
 Status: analysis and proposal (2026-11-02), revised after an independent review; to be decided before any
-implementation. Follow-up 1 (fold every 64 K elements) is done and measured (`docs/bench/linear.md`, "Fold interval").
+implementation. Follow-up 1 (fold every 64 K elements) is done and measured (`docs/bench/linear.md`, "Fold interval");
+so is 2a (docs/PLAN.md P8.6, `docs/bench/linear.md`, "The backward: dX").
 This note covers the other three:
 
 - 2: the backward of the linear layers: dX without the W^T copy (2a); fp32 weights under autocast and dW on the
@@ -78,7 +79,7 @@ transpose is the fallback if 2a's staging turns out slower than measured here.
   - The stores are 2x STS.128 per thread.
   - Their 2-way bank conflict matches today's STS.32 pattern, which is already 2-way, so it is no regression.
   - `stage()`, the fold and the epilogue are unchanged.
-- **Kernel.** A template parameter (`kBRowsK`) on `linear_kernel`.
+- **Kernel.** A template parameter (`kBRowsK`; as implemented, `kWKN`, op flag `w_kn`) on `linear_kernel`.
 - **Host.** The kernel is reached through a layout flag on `torch.ops.flash_attn_legacy.linear`, or a sibling op with its
   own `register_fake`. `_grad_input` passes W as is.
 - **Constraints.**

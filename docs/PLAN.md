@@ -241,9 +241,19 @@ top-1. Shipped figures with C = 64: prefill 1.35-1.82x (geomean 1.51x), LoRA tra
 1.22-1.33x, LoRA fine-tune validation loss ±1.4e-4 of stock, 1.31x faster; same registers (221 / 251), 0 spills,
 `tests/test_linear.py` 52 passed + the two-GPU test skipped (GPU1 off the bus), the full suite green.
 
-Open, after P8 (analysis and proposed order in `docs/analysis/kernels/p8_followups.md`, 2026-11-02, reviewed; to be
-decided): P8.6 dX without the W^T copy; P8.7 a PyTorch emulation gate for HFMA2 attention (S's error becomes P's
-relative error through exp2); P8.8 fp32 weights under autocast (the standard full fine-tuning recipe reaches the kernel
+P8.6, dX without the W^T copy (2026-11-02, `docs/bench/linear.md` "The backward: dX"): a W [K, N] layout of the op
+(`linear(x, W, bias, w_kn=True)`, y = x W; kernel template `kWKN`): the B operand staged from 16-byte loads along N of
+two K rows, paired per column with `__byte_perm` into the words a transposed copy gives. `_grad_input` reads W in place.
+Against the criteria: dX bitwise equal to the copy path (edge shapes, real layer shapes, the 151936 x 1536 lm_head) —
+met; the dX GEMM 0.988-0.996x of the old kernel alone, the whole dX 1.05-1.60x faster — met; LoRA step on Qwen2.5-1.5B
+at 2k 1.033x (A/B alternated, 40 steps each) — met; no N x K transient (isolated peak) — met; 0 spills (216 / 251
+registers); opcheck, streams and CUDA graph with the new layout — green (`tests/test_linear.py` 89 passed + the two-GPU
+test skipped, the full suite 4579 passed on the P100); other GPUs unchanged (1080 Ti, V100, 2080 Ti, T4: build,
+`tests/test_linear.py` 18 passed / 72 skipped, the full suite green). The W [K, N] layout bounds its 32-bit offsets by
+N times K rounded up to 32 (the last stage's rows; review finding), stock dX beyond it.
+
+Open, after P8 (analysis and proposed order in `docs/analysis/kernels/p8_followups.md`, 2026-11-02, reviewed): P8.7
+a PyTorch emulation gate for HFMA2 attention (S's error becomes P's relative error through exp2); P8.8 fp32 weights under autocast (the standard full fine-tuning recipe reaches the kernel
 in neither direction today); P8.9 the HFMA2 attention forward, if the gate passes; P8.10 dW on the kernel; P8.11 the
 HFMA2 attention backward; P8.12 a hand-scheduled SASS main loop (ceiling ~79% of peak with the fold, ours 64-72%;
 assembler to choose). A llama.cpp PR (its P100 path is cuBLAS `COMPUTE_16F`, same speed, lower accuracy) once P8 is
