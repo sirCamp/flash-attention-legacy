@@ -41,7 +41,7 @@ handle (listed in "What runs on the kernel").
 
 3. **Variable-length sequence support** (`flash_attn_varlen_func`) for packed batching without padding waste — useful for training with heterogeneous sequence lengths.
 
-4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.88x and LoRA training up to 1.35x faster on top of the attention kernels.
+4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.82x and LoRA training up to 1.33x faster on top of the attention kernels.
 
 ## Supported Hardware
 
@@ -212,8 +212,8 @@ out = attn(x)  # [2, 1024, 512]
 
 On the Tesla P100 (compute capability 6.0) torch runs FP16 matrix multiplications with FP32 accumulation at 4.6-8.7
 TFLOPS on real layer shapes, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model onto a
-GEMM kernel that multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 128 elements: up
-to 14.3 TFLOPS (12.7 or more from 512 rows per call, except the smallest layers). It is **off by default** and a no-op on every other GPU:
+GEMM kernel that multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 64 elements: up
+to 13.7 TFLOPS (12.3 or more from 512 rows per call, except the smallest layers). It is **off by default** and a no-op on every other GPU:
 
 ```python
 import flash_attn_legacy
@@ -230,15 +230,15 @@ shapes allow it (torch >= 2.4), dW and the bias gradient stock. Measured on the 
 
 | | speedup |
 |---|---|
-| Linear layers alone (80 shapes of Qwen2.5 0.5B-3B and Llama 3.1 8B, 128-8192 rows) | 1.83x geomean (1.61-2.87x from 512 rows) |
-| Prefill, 1k-8k tokens (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B, Llama-3.1-8B at 1k) | 1.37-1.88x |
-| LoRA training, 1k-4k tokens (the same models without Llama, which does not fit) | 1.24-1.35x, same loss |
+| Linear layers alone (80 shapes of Qwen2.5 0.5B-3B and Llama 3.1 8B, 128-8192 rows) | 1.77x geomean (1.54-2.76x from 512 rows) |
+| Prefill, 1k-8k tokens (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B, Llama-3.1-8B at 1k) | 1.35-1.82x |
+| LoRA training, 1k-4k tokens (the same models without Llama, which does not fit) | 1.22-1.33x, same loss |
 | Decode | unchanged (0.6-1.0% slower at batch 1 on 1-1.5B models: the patched layer's Python check) |
 
-Accuracy: perplexity on wikitext-2 within 0.0013 of stock FP16 and of FP32. The kernel's element-wise error is about 6x
-stock's (1.2e-3 vs 2.1e-4), so more near-ties flip: 0.26-0.59% of top-1 predictions differ from FP32, against 0.18-0.35%
-for stock FP16. A 300-step LoRA fine-tune of Qwen2.5-0.5B reaches the same validation loss (±1.5e-4; two seeds differ by
-1e-3), 1.34x faster.
+Accuracy: perplexity on wikitext-2 within 0.001 of stock FP16 and of FP32. The kernel's element-wise error is about 4x
+stock's (8.7e-4 vs 2.1e-4); 0.21-0.42% of top-1 predictions differ from FP32, against 0.18-0.35% for stock FP16. A
+300-step LoRA fine-tune of Qwen2.5-0.5B reaches the same validation loss (±1.4e-4; two seeds differ by 1e-3), 1.31x
+faster.
 
 ### GPU compatibility check
 
@@ -325,8 +325,8 @@ layers in 4, here on transformers' PyTorch reference) run at parity or faster (c
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
 
-The tables above use stock `F.linear` for the linear layers. On the P100 the opt-in `patch_linear` adds 1.37-1.88x to
-prefill and 1.24-1.35x to LoRA training on top of them (`python benchmarks/models.py ... --linear`,
+The tables above use stock `F.linear` for the linear layers. On the P100 the opt-in `patch_linear` adds 1.35-1.82x to
+prefill and 1.22-1.33x to LoRA training on top of them (`python benchmarks/models.py ... --linear`,
 [`docs/bench/linear.md`](docs/bench/linear.md)).
 
 Task accuracy is unchanged (`python benchmarks/tasks.py`, [`docs/bench/tasks.md`](docs/bench/tasks.md)): Llama 3.1 8B
@@ -452,7 +452,7 @@ python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / -
 - [x] BF16 / FP32 inference
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
 - [x] Short queries against a cache beyond 8 query rows per KV head (assisted / speculative decoding, MQA / GQA > 8:1): key splits and packed GQA rows in the forward (`docs/analysis/kernels/spec_decode_design.md`)
-- [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.88x, LoRA training up to 1.35x
+- [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.82x, LoRA training up to 1.33x
 - [ ] Serving: one grid for mixed prefill + decode batches (they run today on the varlen kernel), a vLLM backend plugin
   (Turing only, see `docs/analysis/vllm_feasibility.md`)
 - [ ] Dropout and deterministic dQ in the kernel

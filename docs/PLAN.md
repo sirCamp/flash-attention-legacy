@@ -231,11 +231,18 @@ accuracy — perplexity at the noise floor (within 0.0013 of stock FP16 and of F
 0.26-0.59% vs stock FP16's 0.18-0.35% (1.3-1.7x; element-wise error 1.2e-3 vs 2.1e-4): above the noise floor on
 near-ties, accepted for an opt-in path and documented. Decode: unchanged at B = 8, -0.6 to -1.0% at B = 1 on 1-1.5B
 models (host-bound step, the patched forward's row check). Other GPUs (2026-11-02; 1080 Ti, V100, 2080 Ti, T4): build
-unchanged, `tests/test_linear.py` 18 passed / 35 skipped (SM 6.0 only), the full suite green. A smaller C (fold every
-64) to close the top-1 gap is the first follow-up to measure.
+unchanged, `tests/test_linear.py` 18 passed / 35 skipped (SM 6.0 only), the full suite green.
+
+Follow-up 1, C = 64 (2026-11-02, `docs/bench/linear.md` "Fold interval"): builds with C = 128 / 64 / 32 compared on the
+P100. C = 64 brings the top-1 flips to 0.21-0.42% (1.06-1.29x stock FP16's, within the range by which the two stock FP16
+variants differ, 0.90-1.58x: the accuracy criterion is met within counting noise, 16k predictions per model) for 4% of
+the GEMM speed (sweep median; geomean 1.77x over stock on 80 shapes); 32 is 8% slower and not measurably better on
+top-1. Shipped figures with C = 64: prefill 1.35-1.82x (geomean 1.51x), LoRA train
+1.22-1.33x, LoRA fine-tune validation loss ±1.4e-4 of stock, 1.31x faster; same registers (221 / 251), 0 spills,
+`tests/test_linear.py` 52 passed + the two-GPU test skipped (GPU1 off the bus), the full suite green.
 
 Open, after P8: dX reading W in its [N,K] layout (no W^T copy), dW on the kernel, a hand-scheduled SASS main loop (cuBLAS's
-`maxwell_hgemm` reaches ~89% of peak, ours ~80%), and attention's QK^T / PV on HFMA2 with the same chunking. A llama.cpp PR
+`maxwell_hgemm` reaches ~89% of peak, our main loop ~80% by its instruction count; 64-72% measured at C = 64), and attention's QK^T / PV on HFMA2 with the same chunking. A llama.cpp PR
 (its P100 path is cuBLAS `COMPUTE_16F`, same speed, lower accuracy) once P8 is proven.
 
 ---
