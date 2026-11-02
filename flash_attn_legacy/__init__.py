@@ -24,6 +24,10 @@ Quick start:
     >>> k_gqa = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
     >>> v_gqa = torch.randn(2, 2, 1024, 64, device='cuda', dtype=torch.float16)
     >>> out_gqa = flash_attention(q, k_gqa, v_gqa, causal=True)
+
+FP16 linear layers on the P100 (SM 6.0 only, off by default): fused_linear(x, W, bias)
+and patch_linear(model), or FLASH_ATTN_LEGACY_LINEAR=1 for HF models loaded with
+attn_implementation="flash_attn_legacy".
 """
 
 __version__ = "1.0.0"
@@ -42,6 +46,7 @@ from .utils import (
 )
 
 from .integrations import register, fallback_stats, reset_fallback_stats
+from .linear import fused_linear, patch_linear
 
 __all__ = [
     "flash_attention",
@@ -54,6 +59,8 @@ __all__ = [
     "register",
     "fallback_stats",
     "reset_fallback_stats",
+    "fused_linear",
+    "patch_linear",
 ]
 
 # Auto-register with HuggingFace transformers if available

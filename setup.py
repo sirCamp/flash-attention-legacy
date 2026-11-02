@@ -1,6 +1,7 @@
 """
 Flash Attention Legacy — Build & Install
-Compiles CUDA kernels for Pascal (SM 6.x), Volta (SM 7.0) and Turing (SM 7.5).
+Compiles CUDA kernels for Pascal (SM 6.x), Volta (SM 7.0) and Turing (SM 7.5),
+and the FP16 linear-layer kernel of the P100 (SM 6.0 only).
 
 Target architectures:
   FLASH_ATTN_LEGACY_ARCHS, e.g. "7.5" or "6.0;6.1;7.0" ("+PTX" also embeds PTX
@@ -48,6 +49,7 @@ cuda_sources = [
     str(csrc_dir / "kernels" / "flash_attn_fwd_pascal.cu"),
     str(csrc_dir / "kernels" / "flash_attn_bwd.cu"),
     str(csrc_dir / "kernels" / "flash_attn_decode.cu"),
+    str(csrc_dir / "kernels" / "linear_pascal.cu"),  # SM 6.0 only (a stub on the other archs)
 ]
 
 include_dirs = [

@@ -16,6 +16,7 @@ Requires transformers >= 5.0 (uses ALL_ATTENTION_FUNCTIONS registry).
 
 import logging
 import math
+import os
 from collections import Counter
 from typing import Dict, NamedTuple, Optional
 
@@ -38,7 +39,8 @@ _PagedAttentionCache = None
 # Fallback registry — the single place that lists why a call does not run our
 # kernel. Each reason either falls back to torch SDPA (correct result, no
 # kernel) or raises, when no available path would give a correct result
-# (better an explicit error than a silently wrong output).
+# (better an explicit error than a silently wrong output). The linear-layer
+# reasons (linear.py, fused_linear) fall back to F.linear.
 #
 # Counters and the warn-once set are plain module state: updates from several
 # threads may at worst lose a count or log a warning twice. Under torch.compile
@@ -50,7 +52,8 @@ class FallbackReason(NamedTuple):
     message: str
     # "sdpa": torch SDPA, with position_bias added to its mask; a call with a
     # softcap or sinks (which SDPA would ignore) goes to _eager_attention
-    # instead, which applies them and position_bias. "raise": NotImplementedError
+    # instead, which applies them and position_bias. "raise": NotImplementedError.
+    # "linear": F.linear (fused_linear, bitwise the stock result)
     action: str = "sdpa"
     expected: bool = False   # expected by design: counted but not logged
     hint: str = ""           # what to use instead (for action="raise")
@@ -77,6 +80,20 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "non_fp16_training": FallbackReason(
         "bf16/fp32 training: kernel gradients are fp16 and may underflow without loss "
         "scaling (docs/PLAN.md P6.2)"),
+    # -- linear layers (fused_linear, docs/PLAN.md P8): F.linear ------------
+    "linear_device": FallbackReason("not on CUDA, or x / W / bias on different devices", "linear"),
+    "linear_dtype": FallbackReason("not float16, or autocast to another dtype", "linear"),
+    "linear_arch": FallbackReason("not a compute capability 6.0 GPU (the HFMA2 kernel is P100 only)",
+                                  "linear"),
+    "linear_shape": FallbackReason("K == 0, K % 8 != 0, or shapes F.linear handles itself", "linear"),
+    # (fewer than 128 rows, decode: F.linear by design, not counted)
+    "linear_layout": FallbackReason("non-contiguous, misaligned, non-strided or tensor-subclass inputs",
+                                    "linear"),
+    "linear_int32": FallbackReason("beyond the kernel's int32 offsets (M * N, M * K or N * K >= 2^31)",
+                                   "linear"),
+    "linear_unavailable": FallbackReason("the extension was built without the linear op: rebuild it", "linear"),
+    "linear_autograd": FallbackReason("gradients without torch.library.register_autograd (torch < 2.4)",
+                                      "linear"),
 }
 
 # 2D masks follow HF's flash_attention_2 convention: a [B, n] mask means only the
@@ -109,7 +126,7 @@ def _warn_once(key: str, message: str, *args) -> None:
 
 def _record_fallback(reason: str, detail: str = "") -> str:
     """Count a fallback; warn once per reason (unless expected); raise if the
-    reason has no correct fallback. Returns the action ("sdpa" or "eager")."""
+    reason has no correct fallback. Returns the action ("sdpa" or "linear")."""
     if reason not in FALLBACK_REASONS:
         raise KeyError(f"unknown fallback reason {reason!r}")
     info = FALLBACK_REASONS[reason]
@@ -119,14 +136,14 @@ def _record_fallback(reason: str, detail: str = "") -> str:
             f"flash_attn_legacy: {info.message}{detail} is not supported yet, and the SDPA "
             f"fallback would silently ignore it: {info.hint}.")
     if not info.expected:
-        _warn_once(reason, "flash_attn_legacy: falling back to %s attention: %s%s",
-                   info.action, info.message, detail)
+        _warn_once(reason, "flash_attn_legacy: falling back to %s: %s%s",
+                   "F.linear" if info.action == "linear" else info.action + " attention", info.message, detail)
     return info.action
 
 
 def fallback_stats() -> Dict[str, int]:
-    """Number of attention calls that did not run the kernel, per reason
-    (keys of FALLBACK_REASONS)."""
+    """Number of attention calls (and fused_linear calls) that did not run the
+    kernel, per reason (keys of FALLBACK_REASONS)."""
     return dict(_fallback_counts)
 
 
@@ -851,6 +868,36 @@ def _flash_attn_legacy_mask(batch_size, q_length, kv_length, q_offset=0, kv_offs
     return valid
 
 
+# FLASH_ATTN_LEGACY_LINEAR=1 (docs/PLAN.md P8; off by default): models loaded with
+# attn_implementation="flash_attn_legacy" also run their FP16 nn.Linear layers on
+# the P100's HFMA2 kernel (linear.patch_linear; a no-op on other GPUs), with no
+# code change (pipelines, transformers serve). transformers checks the attention
+# implementation in PreTrainedModel.__init__, before the layers exist and the
+# weights are loaded, cast and moved: a forward pre-hook patches the model at its
+# first eager forward instead, then removes itself. A model moved to the GPU after
+# that forward needs patch_linear(model) by hand.
+_LINEAR_ENV = "FLASH_ATTN_LEGACY_LINEAR"
+
+
+def _linear_pre_hook(module, args):
+    if is_compiling():
+        return  # traced: patched at the next eager forward
+    # Removed by identity, not through a handle (still right on a deepcopy of the model)
+    for key in [k for k, hook in module._forward_pre_hooks.items() if hook is _linear_pre_hook]:
+        module._forward_pre_hooks.pop(key, None)  # pop: nn.DataParallel replicas share the dict
+    if getattr(getattr(module, "config", None), "_attn_implementation", None) == "flash_attn_legacy":
+        from .linear import patch_linear
+        patch_linear(module)
+
+
+def _patch_linear_on_first_forward(model) -> None:
+    """With FLASH_ATTN_LEGACY_LINEAR=1: patch_linear(model) before its first forward."""
+    hooks = getattr(model, "_forward_pre_hooks", None)
+    if (os.environ.get(_LINEAR_ENV) == "1" and isinstance(model, nn.Module) and hooks is not None
+            and not any(hook is _linear_pre_hook for hook in hooks.values())):
+        model.register_forward_pre_hook(_linear_pre_hook)
+
+
 def register():
     """Register flash_attn_legacy in transformers' attention function registry.
 
@@ -864,7 +911,9 @@ def register():
        kernel support is decided per attention call (_kernel_fallback_reason).
        The patch is needed because transformers assumes any implementation with "flash" in the name
        needs lazy_import_flash_attention(), which tries to load hub kernels
-       or the flash_attn package — neither of which we use.
+       or the flash_attn package — neither of which we use. It is also where
+       FLASH_ATTN_LEGACY_LINEAR=1 hooks patch_linear onto the model
+       (_patch_linear_on_first_forward).
 
     After registration, users can do:
         model = AutoModelForCausalLM.from_pretrained(
@@ -929,6 +978,7 @@ def register():
 
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
+                _patch_linear_on_first_forward(self)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)
 

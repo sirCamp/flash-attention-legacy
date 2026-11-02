@@ -10,13 +10,18 @@ from typing import Dict, Optional
 SUPPORTED_HEAD_DIMS = (32, 64, 72, 80, 96, 128, 256)
 
 
+def cuda_autocast_dtype() -> Optional[torch.dtype]:
+    """The dtype CUDA autocast casts to, or None when it is off."""
+    if hasattr(torch, "get_autocast_dtype"):  # torch >= 2.4
+        return torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+    return torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else None
+
+
 def fp16_autocast_active() -> bool:
     """CUDA autocast to float16 is on. Attention then computes in fp16, as SDPA does
     under autocast, and the GradScaler that fp16 autocast training requires covers
     gradient underflow."""
-    if hasattr(torch, "get_autocast_dtype"):  # torch >= 2.4
-        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
-    return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+    return cuda_autocast_dtype() == torch.float16
 
 
 def is_compiling() -> bool:

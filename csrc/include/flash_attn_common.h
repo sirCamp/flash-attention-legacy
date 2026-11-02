@@ -212,6 +212,34 @@ struct SplitCombineParams {
 };
 
 // ---------------------------------------------------------------------------
+// FP16 linear layer on SM 6.0 (linear_pascal.cu, docs/PLAN.md P8): y [M, N] =
+// x [M, K] W [N, K]^T (+ bias [N]), fp16, rows contiguous and 16-byte aligned,
+// K % 8 == 0, element offsets in 32 bits (M * N, M * K + 32, N * K + 32 < 2^31).
+// Output tiles of kLinearTile x kLinearTile: [0, tile0) data-parallel (one block
+// each, the whole K), [tile0, tiles) stream-K over sk_blocks blocks (LinearPlan).
+// ---------------------------------------------------------------------------
+constexpr int kLinearTile = 128;
+
+struct LinearParams {
+    const half* __restrict__ x;      // [M, K]
+    const half* __restrict__ w;      // [N, K]
+    const half* __restrict__ bias;   // [N] or nullptr
+    half* __restrict__ y;            // [M, N]
+    int M, N, K;
+    // Stream-K only: two fp32 tile partials per stream-K block (no initialization needed),
+    // and one arrival counter per stream-K tile, 0 at launch (the kernel resets them to 0)
+    float* __restrict__ ws;
+    int* __restrict__ counters;
+};
+
+struct LinearPlan {
+    int tiles;      // output tiles
+    int tile0;      // first stream-K tile (tiles: none)
+    int sk_blocks;  // stream-K blocks (0: none)
+    int resident;   // blocks resident at once on the device (SMs x blocks per SM)
+};
+
+// ---------------------------------------------------------------------------
 // Backward kernel launch parameters — shared between all kernels
 // ---------------------------------------------------------------------------
 struct FlashAttnBwdParams {

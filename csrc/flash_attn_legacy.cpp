@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include "include/flash_attn_common.h"
@@ -45,6 +47,8 @@ void flash_attn_kvcache_append_launch(const KvAppendParams& params, cudaStream_t
 int flash_attn_decode_max_rows();
 int flash_attn_num_splits(int blocks, int sms, int resident, int max_len, int rows);
 int flash_attn_max_splits();
+LinearPlan linear_pascal_plan(int M, int N, int K);
+void linear_pascal_launch(const LinearParams& p, const LinearPlan& plan, cudaStream_t stream);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -99,12 +103,17 @@ std::vector<std::string> compiled_archs() {
     return out;
 }
 
-static int get_sm_version(int device_id = -1) {
-    if (device_id < 0) FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&device_id));
+// Compute capability of a device, e.g. 60 (no FLASH_ATTN_LEGACY_FORCE_ARCH).
+static int device_sm(int device_id) {
     int major, minor;
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
     FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id));
-    const int sm = major * 10 + minor;
+    return major * 10 + minor;
+}
+
+static int get_sm_version(int device_id = -1) {
+    if (device_id < 0) FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&device_id));
+    const int sm = device_sm(device_id);
     const int code_sm = compiled_arch_for(sm);  // selects the kernel family below
     if (const char* force = std::getenv("FLASH_ATTN_LEGACY_FORCE_ARCH")) {
         const std::string f(force);
@@ -942,6 +951,114 @@ void flash_attn_kvcache_append(
     FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
 }
 
+// ---------------------------------------------------------------------------
+// FP16 linear layer on the P100 (docs/PLAN.md P8, linear_pascal.cu): y [M, N] =
+// x [M, K] W [N, K]^T (+ bias [N]), HFMA2 with chunked accumulation. Compute
+// capability 6.0 only, real hardware (FLASH_ATTN_LEGACY_FORCE_ARCH does not
+// apply: on other GPUs the kernel is a stub). Inputs that are not contiguous or
+// not 16-byte aligned are copied (contiguous_aligned; the Python API sends them
+// to F.linear instead, outside torch.compile).
+//
+// Stream-K workspace: the partials (two fp32 tiles per stream-K block) come from
+// the caching allocator on the current stream, per call, uninitialized. The
+// arrival counters (one per stream-K tile) must be 0 at launch, and the kernel
+// leaves them at 0 (the last arriver of a tile resets its counter):
+//   - eager launches: one persistent buffer per (device, stream), zeroed when it
+//     is created. Launches on one stream never overlap, launches on different
+//     streams use different buffers; no per-call memset (a separate memset
+//     launch measured 10-20% of a small stream-K GEMM on the P100);
+//   - under CUDA graph capture: counters per call from the graph's private pool,
+//     zeroed by a captured memset: a graph never shares counters with eager
+//     launches or other graphs, and every replay starts from 0.
+// Known limit: a persistent buffer is keyed by the stream handle; a stream
+// destroyed with work pending and a new stream reusing its handle could overlap
+// (PyTorch's pool streams are never destroyed).
+// ---------------------------------------------------------------------------
+static std::mutex g_linear_counters_mutex;
+// Leaked on purpose: no tensor destructor runs after the CUDA driver has shut down at exit
+static auto* g_linear_counters = new std::map<std::pair<int, cudaStream_t>, torch::Tensor>();
+
+// The device runs the linear kernel: compute capability 6.0 and a build with SM 6.0 code.
+static void check_linear_device(int device_id) {
+    const int sm = device_sm(device_id);
+    TORCH_CHECK(sm == 60, "flash_attn_legacy linear: compute capability 6.0 (P100) only, this GPU is SM ",
+                sm / 10, ".", sm % 10);
+    compiled_arch_for(sm);  // a clear error when the build has no SM 6.0 code
+}
+
+torch::Tensor linear_forward(torch::Tensor x, torch::Tensor W, c10::optional<torch::Tensor> bias) {
+    TORCH_CHECK(x.is_cuda() && W.device() == x.device(), "x and W must be on the same CUDA device");
+    TORCH_CHECK(x.dtype() == torch::kFloat16 && W.dtype() == torch::kFloat16, "x and W must be float16");
+    TORCH_CHECK(x.dim() == 2 && W.dim() == 2 && W.size(1) == x.size(1),
+                "x must be [M, K] and W [N, K], got ", x.sizes(), " and ", W.sizes());
+    const int64_t M = x.size(0), K = x.size(1), N = W.size(0);
+    TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8 (128-bit loads), got ", K);
+    // 32-bit element offsets in the kernel: row * K + k stays below M * K + 32 (N * K + 32 for W)
+    TORCH_CHECK(M * N < (int64_t(1) << 31) && M * K + 32 < (int64_t(1) << 31) && N * K + 32 < (int64_t(1) << 31),
+                "M * N, M * K and N * K must fit the kernel's int32 offsets, got M=", M, " N=", N, " K=", K);
+    torch::Tensor b;
+    if (bias.has_value() && bias->defined()) {
+        TORCH_CHECK(bias->device() == x.device() && bias->dtype() == torch::kFloat16 && bias->dim() == 1 &&
+                    bias->size(0) == N, "bias must be float16 [N] = [", N, "] on the device of x");
+        b = bias->contiguous();
+    }
+    const at::cuda::CUDAGuard device_guard(x.device());
+    check_linear_device(x.get_device());
+    if (M == 0 || N == 0 || K == 0) {  // no product (a 0-sized grid is invalid): y = bias, or 0
+        torch::Tensor y = torch::zeros({M, N}, x.options());
+        if (b.defined()) y.copy_(b.expand({M, N}));
+        return y;
+    }
+    x = contiguous_aligned(x);
+    W = contiguous_aligned(W);
+    torch::Tensor y = torch::empty({M, N}, x.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    LinearParams p = {};
+    p.x = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+    p.w = reinterpret_cast<const half*>(W.data_ptr<at::Half>());
+    p.bias = b.defined() ? reinterpret_cast<const half*>(b.data_ptr<at::Half>()) : nullptr;
+    p.y = reinterpret_cast<half*>(y.data_ptr<at::Half>());
+    p.M = int(M); p.N = int(N); p.K = int(K);
+    const LinearPlan plan = linear_pascal_plan(p.M, p.N, p.K);
+    torch::Tensor ws, counters;  // held until after the launch (the caching allocator orders their reuse)
+    if (plan.tile0 < plan.tiles) {
+        const int64_t ws_floats = int64_t(plan.sk_blocks) * 2 * kLinearTile * kLinearTile;
+        const int64_t n_counters = plan.tiles - plan.tile0;
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        FLASH_ATTN_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            ws = torch::empty({ws_floats}, x.options().dtype(torch::kFloat32));
+            std::lock_guard<std::mutex> lock(g_linear_counters_mutex);
+            torch::Tensor& c = (*g_linear_counters)[{int(x.get_device()), stream}];
+            // (Re)created zeroed on this stream; a replaced buffer is freed stream-ordered
+            if (!c.defined() || c.numel() < n_counters) {
+                c = torch::zeros({std::max<int64_t>(n_counters, 1024)}, x.options().dtype(torch::kInt32));
+            }
+            counters = c;  // a handle: the buffer stays alive through this launch even if replaced meanwhile
+            p.counters = counters.data_ptr<int>();
+        } else {
+            ws = torch::empty({ws_floats + n_counters}, x.options().dtype(torch::kFloat32));
+            p.counters = reinterpret_cast<int*>(ws.data_ptr<float>() + ws_floats);
+            FLASH_ATTN_CHECK_CUDA(cudaMemsetAsync(p.counters, 0, n_counters * sizeof(int), stream));
+        }
+        p.ws = ws.data_ptr<float>();
+    }
+    linear_pascal_launch(p, plan, stream);
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return y;
+}
+
+// (tiles, first stream-K tile, stream-K blocks, resident blocks) of linear_forward on the current device (tests).
+std::vector<int64_t> linear_plan(int64_t M, int64_t N, int64_t K) {
+    int dev = 0;
+    FLASH_ATTN_CHECK_CUDA(cudaGetDevice(&dev));
+    check_linear_device(dev);
+    TORCH_CHECK(M > 0 && N > 0 && K > 0 && M * N < (int64_t(1) << 31) && K <= INT32_MAX, "invalid linear shape");
+    const LinearPlan plan = linear_pascal_plan(int(M), int(N), int(K));
+    return {plan.tiles, plan.tile0, plan.sk_blocks, plan.resident};
+}
+
 }  // namespace flash_attn_legacy
 
 // The kernels are dispatcher operators (torch.ops.flash_attn_legacy.*): torch.compile
@@ -966,6 +1083,7 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "int uniform_seqlen=-1) -> (Tensor, Tensor)");
     m.def("kvcache_append(Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor k, Tensor v, Tensor? cache_seqlens, "
           "int uniform_seqlen=-1, Tensor? block_table=None) -> ()");
+    m.def("linear(Tensor x, Tensor W, Tensor? bias=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
@@ -975,6 +1093,7 @@ TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
     m.impl("backward_varlen", &flash_attn_legacy::flash_attn_backward_varlen);
     m.impl("with_kvcache", &flash_attn_legacy::flash_attn_with_kvcache);
     m.impl("kvcache_append", &flash_attn_legacy::flash_attn_kvcache_append);
+    m.impl("linear", &flash_attn_legacy::linear_forward);
 }
 
 // Helpers (host-side queries, not traced)
@@ -988,4 +1107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Automatic key splits of flash_attn_with_kvcache for (blocks, SMs, resident blocks per SM, max_len, "
           "query rows per block)", py::arg("blocks"), py::arg("sms"), py::arg("resident"), py::arg("max_len"),
           py::arg("rows"));
+    m.def("linear_plan", &flash_attn_legacy::linear_plan,
+          "(tiles, first stream-K tile, stream-K blocks, resident blocks) of the linear op for x [M, K], W [N, K] "
+          "on the current device (compute capability 6.0)", py::arg("M"), py::arg("N"), py::arg("K"));
 }

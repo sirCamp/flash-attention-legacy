@@ -72,6 +72,11 @@ def _register_fakes():
     def _(k_cache, v_cache, k, v, cache_seqlens, uniform_seqlen=-1, block_table=None):
         return None
 
+    if hasattr(_ops, "linear"):  # an extension built before P8 has no linear op
+        @register("flash_attn_legacy::linear")
+        def _(x, W, bias=None):
+            return x.new_empty((x.shape[0], W.shape[0]))
+
 
 _register_fakes()
 
