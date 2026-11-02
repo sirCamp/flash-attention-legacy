@@ -148,7 +148,7 @@ Run inference under `torch.inference_mode()` (or `torch.no_grad()`): with BF16/F
 ### Examples
 
 - `examples/generate.py`: generation (batched, left padding), tokens per second and peak memory, `--compare` with SDPA and eager.
-- `examples/finetune.py`: mixed-precision fine-tuning (fp16 autocast + GradScaler) of the attention projections on a local text, `--compare` with SDPA. P100, TinyLlama-1.1B, batch 2 x 1024 tokens: 1,275 tok/s and 8.1 GiB vs SDPA 1,158 tok/s and 14.2 GiB (same loss); at 2048 tokens SDPA runs out of memory (11.8 GiB here).
+- `examples/finetune.py`: mixed-precision fine-tuning (fp16 autocast + GradScaler) of the attention projections on a local text, `--compare` with SDPA. P100, TinyLlama-1.1B, batch 2 x 1024 tokens: 1,275 tok/s and 8.1 GiB vs SDPA 1,158 tok/s and 14.2 GiB (same loss); at 2048 tokens SDPA runs out of memory.
 
 ### Direct API
 
