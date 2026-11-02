@@ -3,7 +3,7 @@ FP16 linear layers on the P100 (compute capability 6.0): HFMA2 with chunked accu
 
 torch runs FP16 nn.Linear on SM 6.0 through cuBLAS with FP32 accumulation, at about half the card's HFMA2 rate. The
 kernel (csrc/kernels/linear_pascal.cu, torch.ops.flash_attn_legacy.linear) multiplies FP16 pairs along K and folds
-each lane into FP32 every 128 K elements: the stock FP16 accuracy, faster from a few hundred rows on. Off by default:
+each lane into FP32 every 64 K elements: the stock FP16 accuracy, faster from a few hundred rows on. Off by default:
 
     fused_linear(x, W, bias)      F.linear(x, W, bias) on the kernel when it applies, else F.linear itself
     patch_linear(model)           the FP16 nn.Linear modules of a model on an SM 6.0 GPU run fused_linear

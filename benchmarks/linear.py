@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FP16 linear layers on the P100 (docs/PLAN.md, P8): fused_linear (HFMA2, FP32 fold every 128 K-elements) vs
+"""FP16 linear layers on the P100 (docs/PLAN.md, P8): fused_linear (HFMA2, FP32 fold every 64 K-elements) vs
 F.linear (cuBLAS, FP32 accumulation) on the layer shapes y = x W^T of real models.
 
 Each shape is timed with CUDA events in ROUNDS rounds, every round timing both implementations back to back

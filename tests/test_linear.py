@@ -34,8 +34,9 @@ sm60_only = pytest.mark.skipif(not _is_sm60(), reason="the HFMA2 linear kernel r
 compile_ready = pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="torch >= 2.4 required")
 
 DEV = "cuda"
-# Relative Frobenius error vs FP64 of the chunked kernel (C = 128). Measured worst over the prototype's 98 edge
-# shapes: 1.2e-3 (cuBLAS COMPUTE_32F: ~2e-4; the chunked cuBLAS COMPUTE_16F emulation: up to 1.4e-3).
+# Relative Frobenius error vs FP64 of the chunked kernel: 8.7e-4 on real layer shapes with CHUNK = 64 (1.2e-3 with
+# 128; cuBLAS COMPUTE_32F: ~2e-4; a chunked cuBLAS COMPUTE_16F emulation: up to 1.4e-3).
+CHUNK = 64  # kChunk in csrc/kernels/linear_pascal.cu
 TOL = 2.5e-3
 _STREAM_K_ENV = "FLASH_ATTN_LEGACY_LINEAR_STREAM_K"
 
@@ -306,20 +307,23 @@ int64_t hog_started() { return g_started == nullptr ? 0 : *(volatile int*)g_star
     @pytest.mark.parametrize("stream_k", [True, False], ids=["default", "data-parallel"])
     def test_lane_overflow(self, stream_k):
         """Each fp16 lane sums ~40000 per chunk (the two lanes' fp16 sum would overflow, the fp32 fold must not);
-        the second chunk cancels 80% of it: y ~ 16000."""
-        C = 128
+        every second chunk cancels 80% of the one before: y ~ 32000. Four chunks, so that the default plan splits K
+        (stream-K) on the P100."""
+        C = CHUNK
         wv = 40000.0 / (C // 2) / 25.0
-        M, N, K = 256, 256, 2 * C
+        M, N, K = 256, 256, 4 * C
+        if stream_k:
+            assert plan(M, N, K)[2] > 0, "must use stream-K"
         x = torch.full((M, K), 25.0, device=DEV, dtype=torch.float16)
         W = torch.empty(N, K, device=DEV, dtype=torch.float16)
-        W[:, :C] = wv
-        W[:, C:] = -0.8 * wv
+        for c in range(4):
+            W[:, c * C:(c + 1) * C] = wv if c % 2 == 0 else -0.8 * wv
         with contextlib.ExitStack() as stack:
             if not stream_k:
                 stack.enter_context(data_parallel_only())
             y = ops().linear(x, W)
         ref = ref64(x, W)
-        scale = ref64(x.abs(), W.abs())  # sum |x_k w_k|: the two chunks cancel 80%
+        scale = ref64(x.abs(), W.abs())  # sum |x_k w_k|: the chunk pairs cancel 80%
         assert torch.isfinite(y).all()
         assert ((y.double() - ref).abs() / scale).max().item() < 5e-3
 

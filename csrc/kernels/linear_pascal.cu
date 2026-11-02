@@ -8,7 +8,7 @@
 // flip). Here:
 //   - inner products with HFMA2 paired along K: acc += half2(x[k], x[k+1]) *
 //     half2(w[k], w[k+1]), each fp16 lane a chain of at most kChunk / 2 products;
-//   - every kChunk = 128 K elements (chunks aligned to k = 0) both lanes are
+//   - every kChunk = 64 K elements (chunks aligned to k = 0) both lanes are
 //     widened to fp32 and added to an fp32 accumulator (a fold in fp32: two
 //     lanes of e.g. 40000 do not overflow, as their fp16 sum would), and the
 //     half2 accumulator restarts (the first K pair of a chunk is an HMUL2: no
@@ -60,7 +60,9 @@ namespace {
 constexpr int kTile = kLinearTile;                   // block tile: rows of x and of W
 constexpr int kThreads = (kTile / 8) * (kTile / 8);  // 8 x 8 outputs per thread
 constexpr int kStagePairs = 16;                      // K pairs per stage (32 halves)
-constexpr int kChunk = 128;                          // K elements per fp16 chain, then the fp32 fold
+// K elements per fp16 chain, then the fp32 fold. 64 (measured on the P100 against 128 and 32, docs/bench/linear.md):
+// top-1 flips against FP32 1.1-1.3x stock FP16's (128: 1.3-1.7x), 4% slower than 128; 32 is 8% slower, not measurably better
+constexpr int kChunk = 64;
 constexpr int kStagesPerChunk = kChunk / (2 * kStagePairs);
 constexpr int kStride = kTile + 4;                   // shared-memory row stride in half2 (rows stay 16-byte aligned)
 constexpr int kLoads = kTile * 4 / kThreads;         // 16-byte global chunks per thread, stage and operand
