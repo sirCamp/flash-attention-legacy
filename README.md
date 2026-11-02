@@ -10,11 +10,13 @@ This project started as a fun experiment to avoid throwing away a couple of old 
 
 ### The problem
 
-Many HuggingFace models and libraries explicitly require `attn_implementation="flash_attention_2"` — and the official [flash-attn](https://github.com/Dao-AILab/flash-attention) package only supports Ampere and newer (SM 8.0+). If you try to use it on a **V100, P100, or GTX 1080**, you get an error:
+Many HuggingFace models and libraries explicitly require `attn_implementation="flash_attention_2"` — and the official [flash-attn](https://github.com/Dao-AILab/flash-attention) package only supports Ampere and newer (SM 8.0+). On a **V100, P100, or GTX 1080** transformers refuses to load the model without the package:
 
 ```
-ValueError: FlashAttention2 is not supported on this GPU architecture (sm_70).
+ImportError: FlashAttention2 has been toggled on, but it cannot be used due to the following error: the package for FlashAttention2 doesn't seem to be installed.
 ```
+
+and with the package installed, its kernels refuse the GPU (`FlashAttention only supports Ampere GPUs or newer.`).
 
 This leaves perfectly functional GPUs locked out — not because the hardware can't handle attention efficiently, but because the software won't run on it.
 
@@ -22,10 +24,10 @@ This leaves perfectly functional GPUs locked out — not because the hardware ca
 
 PyTorch's `scaled_dot_product_attention` (SDPA) runs on these GPUs too, with no extra dependencies, but without a flash
 backend: its `memory_efficient` kernel, or the `math` one that materializes the N x N scores. Kernel against kernel, ours takes
-0.54-0.92x of SDPA memory-efficient's time on SM 7.x at d=64 and is slower on the P100 at d=128 / 256 (1.24x / 1.81x; table in
+0.54-0.92x of SDPA memory-efficient's forward time on SM 7.x at d=64; the forward is slower on the V100 at d=128 (1.06x) and on the P100 at d=128 / 256 (1.24x / 1.81x; table in
 Benchmarks). End to end in transformers the gap grows: with GQA, HF's SDPA path repeats the KV heads, and SDPA has no split-KV
 decode, paged-cache or varlen kernel. Measured on real models: up to 3.97x faster prefill, contexts up to 32x longer on the
-same GPU, continuous batching 4.9-15.5x faster.
+same GPU, continuous batching 4.9-15.5x faster (33-117x on the 1080 Ti).
 
 And some models, training frameworks and research codebases require `flash_attention_2` outright and won't fall back to SDPA.
 This package covers both cases: one `attn_implementation`, with SDPA kept as its fallback for the few cases the kernels do not
@@ -38,6 +40,8 @@ handle (listed in "What runs on the kernel").
 2. **A from-scratch CUDA implementation** of Flash Attention v2 — hand-written kernels with WMMA tensor cores (Volta), `mma.sync` tensor cores (Turing) and fp32 math on CUDA cores (Pascal). No cuDNN, no ATen, no black boxes. If you want to understand how flash attention works at the CUDA level, this is a readable reference.
 
 3. **Variable-length sequence support** (`flash_attn_varlen_func`) for packed batching without padding waste — useful for training with heterogeneous sequence lengths.
+
+4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.88x and LoRA training up to 1.35x faster on top of the attention kernels.
 
 ## Supported Hardware
 
@@ -54,6 +58,8 @@ The kernels compute in **FP16**.
 - **Outside autocast**, BF16 and FP32 inputs (e.g. a checkpoint loaded in bf16 as it is) run on the kernels for inference: q, k, v are scaled by powers of 2 into the FP16 range on the GPU (exact, no host sync, any magnitude) and the output comes back in the input dtype; the decode kernel reads BF16 caches natively. Training with BF16/FP32 inputs outside fp16 autocast is not supported by the kernels (FP16 gradients without loss scaling may underflow; transformers' Trainer itself requires fp16 AMP before Ampere); through HuggingFace it falls back to SDPA.
 
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
+
+The P100 (SM 6.0) also has an opt-in kernel for the FP16 linear layers ([below](#fp16-linear-layers-on-the-p100-opt-in)); on every other GPU it is a no-op.
 
 ## Installation
 
@@ -96,7 +102,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained(
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     attn_implementation="flash_attn_legacy",
-    torch_dtype=torch.float16,
+    dtype=torch.float16,
     device_map="cuda",
 )
 tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -204,24 +210,35 @@ out = attn(x)  # [2, 1024, 512]
 
 ### FP16 linear layers on the P100 (opt-in)
 
-On the Tesla P100 (compute capability 6.0) torch runs FP16 matrix multiplications with FP32 accumulation at 5-8.7
-TFLOPS, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model onto a GEMM kernel that
-multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 128 elements: 13-14 TFLOPS. It is
-**off by default** and a no-op on every other GPU:
+On the Tesla P100 (compute capability 6.0) torch runs FP16 matrix multiplications with FP32 accumulation at 4.6-8.7
+TFLOPS on real layer shapes, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model onto a
+GEMM kernel that multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 128 elements: up
+to 14.3 TFLOPS (12.7 or more from 512 rows per call, except the smallest layers). It is **off by default** and a no-op on every other GPU:
 
 ```python
 import flash_attn_legacy
 flash_attn_legacy.patch_linear(model)                # or: FLASH_ATTN_LEGACY_LINEAR=1 in the environment, for models
                                                      # loaded with attn_implementation="flash_attn_legacy"
 flash_attn_legacy.patch_linear(model, enable=False)  # back to stock
+y = flash_attn_legacy.fused_linear(x, W, bias)       # the function itself, F.linear's arguments
 ```
 
 Calls with fewer than 128 rows (decode) and anything the kernel does not take (other dtypes, K % 8 != 0, ...) run on
-`F.linear` unchanged; the backward computes dX on the kernel when the shapes allow it, dW and the bias gradient stock. Measured on the P100
-([`docs/bench/linear.md`](docs/bench/linear.md)): prefill 1.37-1.88x (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B,
-Llama-3.1-8B), LoRA training 1.24-1.35x (the same but Llama), decode unchanged (-1% at batch 1 on small models: the Python check per layer).
-Accuracy: perplexity within 0.0013 of stock FP16; 0.26-0.59% of top-1 predictions differ from FP32, against 0.18-0.35%
-for stock FP16. A LoRA fine-tune reaches the same validation loss (±1.5e-4, seeds differ by 1e-3).
+`F.linear` unchanged (`fallback_stats()` counts them, decode excluded). The backward computes dX on the kernel when the
+shapes allow it (torch >= 2.4), dW and the bias gradient stock. Measured on the P100, against the same model with stock
+`F.linear` and our attention in both ([`docs/bench/linear.md`](docs/bench/linear.md), `python benchmarks/linear.py`):
+
+| | speedup |
+|---|---|
+| Linear layers alone (80 shapes of Qwen2.5 0.5B-3B and Llama 3.1 8B, 128-8192 rows) | 1.83x geomean (1.61-2.87x from 512 rows) |
+| Prefill, 1k-8k tokens (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B, Llama-3.1-8B at 1k) | 1.37-1.88x |
+| LoRA training, 1k-4k tokens (the same models without Llama, which does not fit) | 1.24-1.35x, same loss |
+| Decode | unchanged (0.6-1.0% slower at batch 1 on 1-1.5B models: the patched layer's Python check) |
+
+Accuracy: perplexity on wikitext-2 within 0.0013 of stock FP16 and of FP32. The kernel's element-wise error is about 6x
+stock's (1.2e-3 vs 2.1e-4), so more near-ties flip: 0.26-0.59% of top-1 predictions differ from FP32, against 0.18-0.35%
+for stock FP16. A 300-step LoRA fine-tune of Qwen2.5-0.5B reaches the same validation loss (±1.5e-4; two seeds differ by
+1e-3), 1.34x faster.
 
 ### GPU compatibility check
 
@@ -304,9 +321,13 @@ full-vocabulary fp32 logits of HF's loss take most of the memory, so the length 
 for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.54x V100, 2.68x T4); on TinyLlama (32k
 vocabulary) checkpointing with our kernel trains 4-8x longer sequences. On the 1080 Ti SDPA with a padding mask runs its fp16
 kernel, which sm_61 executes at 1/64 rate: hence 5.65x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
-layers in 4, here on transformers' PyTorch reference) run at parity or a little faster (compiled decode 1.00-1.32x), with the memory saving. Decode reads the cache in place with
+layers in 4, here on transformers' PyTorch reference) run at parity or faster (compiled decode 1.00-1.32x), with the memory saving. Decode reads the cache in place with
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
+
+The tables above use stock `F.linear` for the linear layers. On the P100 the opt-in `patch_linear` adds 1.37-1.88x to
+prefill and 1.24-1.35x to LoRA training on top of them (`python benchmarks/models.py ... --linear`,
+[`docs/bench/linear.md`](docs/bench/linear.md)).
 
 Task accuracy is unchanged (`python benchmarks/tasks.py`, [`docs/bench/tasks.md`](docs/bench/tasks.md)): Llama 3.1 8B
 Instruct on the V100 with lm-evaluation-harness, every document scored with each implementation:
@@ -316,14 +337,14 @@ Instruct on the V100 with lm-evaluation-harness, every document scored with each
 | ARC-Easy, acc (2376) | 0.8220 | 0.8215 | 0.8224 |
 | ARC-Challenge, acc_norm (1172) | 0.5589 | 0.5589 | 0.5589 |
 | HellaSwag, acc_norm (10042) | 0.7950 | 0.7953 | 0.7953 |
-| GSM8K 5-shot, exact match (1319) | 0.7733 | 0.7741 | 0.7756 |
+| GSM8K 5-shot, exact match, flexible extract (1319) | 0.7733 | 0.7741 | 0.7756 |
 | Passkey retrieval at 4k / 8k / 16k / 32k tokens | 1.00 / 1.00 / 1.00 / 1.00 | 1.00 / OOM / OOM / OOM | 1.00 / OOM / OOM / OOM |
 
-Ours changes as many answers relative to eager as SDPA does (2-21 per task: fp16 near-ties), all within a fraction of the
+Ours changes about as many answers relative to eager as SDPA does (2-21 per task: fp16 near-ties), all within a fraction of the
 standard error.
 
 Speculative / assisted decoding (`python benchmarks/speculative.py`, [`docs/bench/speculative.md`](docs/bench/speculative.md)):
-a verification step of 16 tokens on a 16k cache costs one layer 186 us on the V100 (the plain forward 1376, SDPA 1269), 297 on
+a verification step of 16 tokens on a 16k cache costs one layer 186 us on the V100 16 GB (the plain forward 1376, SDPA 1269), 297 on
 the T4 (594 / 1196), 1164 on the P100 (7506 / 4577); HF prompt lookup and assisted generation run fastest with our backend
 on every GPU.
 
@@ -331,7 +352,7 @@ Serving with transformers' continuous batching (`model.generate_batch`, paged ca
 [`docs/bench/serving.md`](docs/bench/serving.md)): generated tokens/s 4.9-15.5x SDPA's best on V100, T4, P100 and 2080 Ti
 (Qwen2.5-0.5B and 3B, up to 8 x 8192-token prompts), 33-117x on the 1080 Ti; `paged|eager` runs out of memory.
 
-Kernel level, against SDPA's memory-efficient backend on every supported GPU and head dimension: `python benchmarks/benchmark.py`,
+Kernel level, against SDPA's memory-efficient backend on every supported GPU at d = 64 / 128 / 256: `python benchmarks/benchmark.py`,
 results in `docs/bench/<gpu>.json`. Causal, B=2, H=16, N=4096, time relative to SDPA (< 1 = faster):
 
 | | fwd d=64 | fwd d=128 | fwd d=256 | fwd+bwd d=64 | fwd+bwd d=128 | fwd+bwd d=256 |
@@ -358,7 +379,7 @@ All families share one band forward (`csrc/include/flash_attn_fwd_band.h`): each
 
 **Turing (SM 7.5):** `mma.sync` m16n8k8 with `ldmatrix`, as FlashAttention-2: S and O stay in accumulator registers with a known layout, Q in registers (d <= 128), the online softmax runs on the S registers and P packed to half2 is the A operand of P @ V as it is (no shared-memory staging).
 
-**Volta (SM 7.0):** S = Q @ K^T and O += P @ V with `wmma::mma_sync` (16x16x16 tensor cores); S goes through a small per-warp staging tile for the softmax, P is written back as half, O stays in accumulator fragments (registers). Tiles of 128 query rows (8 warps); d=128/256 use larger tiles where the GPU has 96 KB of shared memory per block and 64 KB ones otherwise.
+**Volta (SM 7.0):** S = Q @ K^T and O += P @ V with `wmma::mma_sync` (16x16x16 tensor cores); S goes through a small per-warp staging tile for the softmax, P is written back as half, O stays in accumulator fragments (registers). Tiles of 128 query rows (8 warps; 64 for d=256 with 64 KB of shared memory); d=128/256 use larger tiles where the GPU has 96 KB of shared memory per block and 64 KB ones otherwise.
 
 **Pascal (SM 6.0 / 6.1):** fp32 register micro-tiles on CUDA cores: each lane holds 4 rows x Bc/8 keys and d/8 output columns; Q, K, V are converted to fp32 once, when stored to shared memory, so the inner products have no conversions and no fp16 products (no overflow; fp16 math runs at 1/64 rate on SM 6.1).
 
@@ -392,11 +413,15 @@ FA_HF_MODELS="TinyLlama/TinyLlama-1.1B-Chat-v1.0,Qwen/Qwen3-0.6B" pytest tests/t
 
 # Run the Pascal (CUDA-core) kernels on any GPU (correctness only, not performance)
 FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
+
+# P100 linear layers (on other GPUs only the no-op / fallback tests run), and their benchmark
+pytest tests/test_linear.py -v
+python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / --decode <hf id>
 ```
 
 ## Limitations
 
-1. **Head dimensions**: d = 32, 64, 72, 80, 96, 128, 256; other sizes run on the SDPA fallback
+1. **Head dimensions**: d = 32, 64, 72, 80, 96, 128, 256; other sizes run on the SDPA fallback through HuggingFace (the direct API raises `ValueError`)
 2. **FP16 compute**: BF16/FP32 for inference only (see above); no native BF16
 3. **Kernel features**: causal (bottom-right aligned) or no mask, sliding window (`window_size=(left, right)`, as upstream flash-attn), logit softcapping (`softcap`), attention sinks (`sinks`, one logit per query head), packed segments. No dropout or additive position bias in the kernel yet: those layers run on the fallbacks
 4. **Causal mask is bottom-right aligned** when `N_q != N_kv` (query i sees keys `j <= i + N_kv - N_q`, as in upstream flash-attn). Rows with no visible key (`N_kv < N_q`) output zeros
@@ -406,6 +431,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
    - decoders with bidirectional attention (`is_causal=False`) and a static cache attend to the empty cache slots, exactly as HF's SDPA does
    - padded batches and static caches get FlashAttention-2's 2D `[batch, keys]` mask; models that index the attention mask as 4D (e.g. Doge) fail with it
    - Llama 4 (chunked attention) is not supported yet: transformers refuses chunked attention for backends whose name contains "flash"
+7. **P100 linear layers** (`patch_linear`, opt-in): SM 6.0 only, FP16 weights and inputs only (FP16 autocast does not cast them for it); slightly less accurate than stock FP16 on near-ties (see above); the weight gradient stays on cuBLAS; with `FLASH_ATTN_LEGACY_LINEAR=1` a model moved to the GPU after its first forward needs `patch_linear(model)` by hand
 
 ## Roadmap
 
@@ -415,7 +441,7 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 - [x] WMMA-based backward on Volta
 - [x] Variable-length sequence support (`flash_attn_varlen_func`), forward and backward in one launch each
 - [x] Turing (SM 7.5)
-- [x] FlashAttention-2 style kernels (warp bands, register accumulators): at or above PyTorch SDPA memory-efficient speed (`docs/bench/`)
+- [x] FlashAttention-2 style kernels (warp bands, register accumulators): at or above PyTorch SDPA memory-efficient speed in most cases (exceptions in Benchmarks, `docs/bench/`)
 - [x] head_dim 72 / 80
 - [x] Sliding window in the kernel (forward and backward, out-of-window blocks skipped)
 - [x] Logit softcapping in the kernel (forward and backward)

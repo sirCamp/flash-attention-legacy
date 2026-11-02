@@ -4,7 +4,7 @@ PLAN P8. Every FP16 `nn.Linear` on a compute capability 6.0 GPU (Tesla P100) can
 (`csrc/kernels/linear_pascal.cu`) instead of torch's cuBLAS call. **Off by default**: `flash_attn_legacy.patch_linear(model)`,
 or `FLASH_ATTN_LEGACY_LINEAR=1` for models loaded with `attn_implementation="flash_attn_legacy"`; a no-op on every other GPU.
 
-Why: torch runs FP16 GEMMs on sm_60 with cuBLAS `COMPUTE_32F` (7-8.5 TFLOPS, below the card's FP32 rate), while its
+Why: torch runs FP16 GEMMs on sm_60 with cuBLAS `COMPUTE_32F` (4.6-8.7 TFLOPS on the shapes below, under the card's FP32 rate), while its
 HFMA2 peak is ~19 TFLOPS. The kernel multiplies with HFMA2 (`half2` pairs along K) and folds each lane into FP32 every 128
 K-elements (chunked accumulation, IBM arXiv 1812.08011; DeepSeek-V3's FP32 promotion every 128), so the error does not
 grow with K as in a pure FP16 accumulation (cuBLAS `COMPUTE_16F`, llama.cpp's P100 path). Calls with fewer than 128 rows
@@ -102,7 +102,8 @@ inputs (first 2048 rows).
 | llama3.1-8b | lm_head | 2048 | 128256 | 4096 | 7.55 | 14.21 | 1.88x | 2.1e-04 | 1.2e-03 |
 | llama3.1-8b | lm_head | 8192 | 128256 | 4096 | 7.49 | 14.33 | 1.91x | 2.1e-04 | 1.2e-03 |
 
-The kernel reaches 12.7-14.4 TFLOPS from M = 512 on (67-76% of the HFMA2 peak; 10-11 on the smallest Qwen2.5-0.5B qkv / o shapes at M = 512), stock 4.7-8.7. Its element-wise error is about 6x
+From M = 512 on the kernel reaches 12.7-14.3 TFLOPS (67-75% of the HFMA2 peak), except the two smallest shapes at M = 512
+(Qwen2.5-0.5B qkv / o: 10.2 / 10.9); stock 4.6-8.7. Its element-wise error is about 6x
 stock's (1.2e-3 vs 2.1e-4: products and the first 64 partial sums per lane in FP16), and does not depend on K. The one
 case below 1 is the smallest shape (M = 128, N = K = 896: 7 output tiles for 56 SMs, ~40 us): 0.48x in this run, 0.94x
 re-measured in a sweep over M = 128-512, N = 896-2048, K = 896 / 1536, where every other shape is 1.09-1.89x
