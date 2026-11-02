@@ -241,9 +241,13 @@ top-1. Shipped figures with C = 64: prefill 1.35-1.82x (geomean 1.51x), LoRA tra
 1.22-1.33x, LoRA fine-tune validation loss ±1.4e-4 of stock, 1.31x faster; same registers (221 / 251), 0 spills,
 `tests/test_linear.py` 52 passed + the two-GPU test skipped (GPU1 off the bus), the full suite green.
 
-Open, after P8: dX reading W in its [N,K] layout (no W^T copy), dW on the kernel, a hand-scheduled SASS main loop (cuBLAS's
-`maxwell_hgemm` reaches ~89% of peak, our main loop ~80% by its instruction count; 64-72% measured at C = 64), and attention's QK^T / PV on HFMA2 with the same chunking. A llama.cpp PR
-(its P100 path is cuBLAS `COMPUTE_16F`, same speed, lower accuracy) once P8 is proven.
+Open, after P8 (analysis and proposed order in `docs/analysis/kernels/p8_followups.md`, 2026-11-02, reviewed; to be
+decided): P8.6 dX without the W^T copy; P8.7 a PyTorch emulation gate for HFMA2 attention (S's error becomes P's
+relative error through exp2); P8.8 fp32 weights under autocast (the standard full fine-tuning recipe reaches the kernel
+in neither direction today); P8.9 the HFMA2 attention forward, if the gate passes; P8.10 dW on the kernel; P8.11 the
+HFMA2 attention backward; P8.12 a hand-scheduled SASS main loop (ceiling ~79% of peak with the fold, ours 64-72%;
+assembler to choose). A llama.cpp PR (its P100 path is cuBLAS `COMPUTE_16F`, same speed, lower accuracy) once P8 is
+proven.
 
 ---
 
