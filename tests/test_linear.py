@@ -656,7 +656,7 @@ class TestCompile:
     @staticmethod
     def _compiled(fn):
         torch._dynamo.reset()
-        linear_mod._SM60.clear()  # the compute capability read while tracing (a folded constant)
+        flash_attn_legacy.utils._CAPABILITY.clear()  # the compute capability read while tracing (a folded constant)
         return torch.compile(fn, backend="aot_eager", fullgraph=True)
 
     def test_fwd_bwd(self):

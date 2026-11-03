@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from .flash_attn import _ops
 from .integrations import _record_fallback
-from .utils import cuda_autocast_dtype, is_compiling
+from .utils import cuda_autocast_dtype, device_capability, is_compiling
 
 # Fewer rows than this go to F.linear: decode and small batches, where cuBLAS is faster
 MIN_M = 128
@@ -34,17 +34,9 @@ _HAS_OP = hasattr(_ops, "linear")
 # ... and its W [K, N] layout (P8.6; an older build: dX stock)
 _HAS_W_KN = _HAS_OP and "w_kn" in str(_ops.linear.default._schema)
 
-# Device index -> compute capability 6.0. Read through torch.cuda.get_device_properties, which torch.compile
-# folds into a constant.
-_SM60 = {}
-
 
 def _sm60(index):
-    ok = _SM60.get(index)
-    if ok is None:
-        props = torch.cuda.get_device_properties(index)
-        ok = _SM60[index] = (props.major, props.minor) == (6, 0)
-    return ok
+    return device_capability(index) == (6, 0)
 
 
 def _int32_ok(M, N, K, w_kn=False):

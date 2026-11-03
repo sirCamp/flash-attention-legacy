@@ -53,7 +53,9 @@ class FallbackReason(NamedTuple):
     # "sdpa": torch SDPA, with position_bias added to its mask; a call with a
     # softcap or sinks (which SDPA would ignore) goes to _eager_attention
     # instead, which applies them and position_bias. "raise": NotImplementedError.
-    # "linear": F.linear (fused_linear, bitwise the stock result)
+    # "linear": F.linear (fused_linear, bitwise the stock result). "reference":
+    # transformers' PyTorch reference of a function bound to another package
+    # (gated_delta.py)
     action: str = "sdpa"
     expected: bool = False   # expected by design: counted but not logged
     hint: str = ""           # what to use instead (for action="raise")
@@ -95,6 +97,10 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "linear_unavailable": FallbackReason("the extension was built without the linear op: rebuild it", "linear"),
     "linear_autograd": FallbackReason("gradients without torch.library.register_autograd (torch < 2.4)",
                                       "linear"),
+    # -- Gated DeltaNet layers of HF hybrid models (gated_delta.py, docs/PLAN.md P6.10) --
+    "gated_delta_chunk_arch": FallbackReason(
+        "fla's chunk gated delta rule does not run below compute capability 8.0 (its Triton kernel fails to "
+        "compile); fla's recurrent kernel is kept for decode", "reference"),
 }
 
 # 2D masks follow HF's flash_attention_2 convention: a [B, n] mask means only the
@@ -127,7 +133,7 @@ def _warn_once(key: str, message: str, *args) -> None:
 
 def _record_fallback(reason: str, detail: str = "") -> str:
     """Count a fallback; warn once per reason (unless expected); raise if the
-    reason has no correct fallback. Returns the action ("sdpa" or "linear")."""
+    reason has no correct fallback. Returns the action ("sdpa", "linear" or "reference")."""
     if reason not in FALLBACK_REASONS:
         raise KeyError(f"unknown fallback reason {reason!r}")
     info = FALLBACK_REASONS[reason]
@@ -137,8 +143,9 @@ def _record_fallback(reason: str, detail: str = "") -> str:
             f"flash_attn_legacy: {info.message}{detail} is not supported yet, and the SDPA "
             f"fallback would silently ignore it: {info.hint}.")
     if not info.expected:
-        _warn_once(reason, "flash_attn_legacy: falling back to %s: %s%s",
-                   "F.linear" if info.action == "linear" else info.action + " attention", info.message, detail)
+        target = {"linear": "F.linear", "reference": "transformers' PyTorch reference"}.get(
+            info.action, info.action + " attention")
+        _warn_once(reason, "flash_attn_legacy: falling back to %s: %s%s", target, info.message, detail)
     return info.action
 
 
@@ -914,7 +921,8 @@ def register():
        needs lazy_import_flash_attention(), which tries to load hub kernels
        or the flash_attn package — neither of which we use. It is also where
        FLASH_ATTN_LEGACY_LINEAR=1 hooks patch_linear onto the model
-       (_patch_linear_on_first_forward).
+       (_patch_linear_on_first_forward), and where the Gated DeltaNet layers of
+       hybrid models get their guard for `fla` below SM 8.0 (gated_delta.py).
 
     After registration, users can do:
         model = AutoModelForCausalLM.from_pretrained(
@@ -980,6 +988,8 @@ def register():
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
                 _patch_linear_on_first_forward(self)
+                from .gated_delta import guard_gated_delta  # lazy: gated_delta imports this module
+                guard_gated_delta(self)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)
 

@@ -3,11 +3,24 @@ GPU detection, compatibility checking, and benchmarking utilities.
 """
 
 import torch
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Single source of truth for the head dimensions the CUDA kernels are compiled for
 # (keep in sync with the dispatch switches in csrc/).
 SUPPORTED_HEAD_DIMS = (32, 64, 72, 80, 96, 128, 256)
+
+# Device index -> (major, minor) compute capability. Read through torch.cuda.get_device_properties, which
+# torch.compile folds into a constant (a cache filled while tracing: clear it with _CAPABILITY.clear() to re-read).
+_CAPABILITY: Dict[int, Tuple[int, int]] = {}
+
+
+def device_capability(index: int) -> Tuple[int, int]:
+    """(major, minor) of CUDA device `index`, cached."""
+    cc = _CAPABILITY.get(index)
+    if cc is None:
+        props = torch.cuda.get_device_properties(index)
+        cc = _CAPABILITY[index] = (props.major, props.minor)
+    return cc
 
 
 def cuda_autocast_dtype() -> Optional[torch.dtype]:

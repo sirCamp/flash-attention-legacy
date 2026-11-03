@@ -120,6 +120,23 @@ def tiny_llama(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, vocab=512, seed
     return LlamaForCausalLM(cfg).eval()
 
 
+def tiny_qwen35(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=4, vocab=512, seed=0, key_dim=64, value_dim=128,
+                **extra):
+    """Random-weight Qwen3.5 text model (no download): Gated DeltaNet layers (3 in 4) with key head dim != value head
+    dim (a state layout mix-up is then a shape error or a wrong result, not hidden by K == V), full attention every
+    4th layer."""
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    torch.manual_seed(seed)
+    cfg = Qwen3_5TextConfig(
+        hidden_size=head_dim * n_heads, num_attention_heads=n_heads, num_key_value_heads=n_kv_heads,
+        head_dim=head_dim, intermediate_size=2 * head_dim * n_heads, num_hidden_layers=n_layers,
+        linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=key_dim,
+        linear_value_head_dim=value_dim, vocab_size=vocab, max_position_embeddings=4096, **extra,
+    )
+    return Qwen3_5ForCausalLM(cfg).eval()
+
+
 def tiny_mistral(head_dim=64, n_heads=4, n_kv_heads=2, n_layers=2, sliding_window=8, vocab=512,
                  seed=0, **extra):
     """Random-weight Mistral (v0.1 style): every layer has the sliding window."""
