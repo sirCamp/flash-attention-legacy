@@ -77,6 +77,25 @@ def _register_fakes():
         def _(x, W, bias=None, w_kn=False):
             return x.new_empty((x.shape[0], W.shape[1] if w_kn else W.shape[0]))
 
+    if hasattr(_ops, "causal_conv1d"):  # nor before P6.10 b the conv ops; their outputs are channel-last
+        def channel_last(x):
+            return x.new_empty((x.shape[0], x.shape[2], x.shape[1])).transpose(1, 2)
+
+        @register("flash_attn_legacy::causal_conv1d")
+        def _(x, weight, bias=None, silu=False):
+            return channel_last(x)
+
+        @register("flash_attn_legacy::causal_conv1d_backward")
+        def _(dy, x, weight, bias, silu, need_dw):
+            w = weight.contiguous()
+            dw = w.new_empty(w.shape if need_dw else (0,))
+            db = w.new_empty(bias.shape if need_dw and bias is not None else (0,))
+            return channel_last(x), dw, db
+
+        @register("flash_attn_legacy::causal_conv1d_update")
+        def _(x, conv_state, weight, bias=None, silu=False):
+            return channel_last(x)
+
 
 _register_fakes()
 

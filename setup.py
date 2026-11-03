@@ -50,6 +50,7 @@ cuda_sources = [
     str(csrc_dir / "kernels" / "flash_attn_bwd.cu"),
     str(csrc_dir / "kernels" / "flash_attn_decode.cu"),
     str(csrc_dir / "kernels" / "linear_pascal.cu"),  # SM 6.0 only (a stub on the other archs)
+    str(csrc_dir / "kernels" / "causal_conv1d.cu"),
 ]
 
 include_dirs = [

@@ -1,8 +1,8 @@
 # Qwen3.5's causal conv1d on pre-Ampere GPUs (P6.10 b)
 
-Status: analysis and proposal (2026-11-02), revised after an independent review (the hook point verified against the
-installed transformers 5.20.2). Order decided 2026-11-03: P6.10 (a) the `fla` / `causal-conv1d` guard, then this
-conv (b), then the delta-rule kernel (c).
+Status: done (2026-11-03): analysed, reviewed, implemented (`csrc/kernels/causal_conv1d.cu`,
+`flash_attn_legacy/gated_delta.py`), reviewed again, measured. Section 6 records how it was built and the results.
+Order decided 2026-11-03: P6.10 (a) the `fla` guard, then this conv (b), then the delta-rule kernel (c).
 
 Qwen3.5 interleaves Gated DeltaNet layers (3 in 4) with full-attention layers. Each Gated DeltaNet layer runs a
 depthwise causal conv1d (kernel 4, SiLU) on its fused q / k / v projection before the delta rule. This note measures
@@ -228,3 +228,80 @@ Each item has a test or a measurement:
      least 4 rounds per arm.
    - The prefill gain is reported with its spread.
 7. **Other GPUs.** The full suite stays green on all five boxes.
+
+## 6. As implemented, and the results
+
+**Ops.**
+- `causal_conv1d(x, weight, bias, silu)`, `causal_conv1d_backward(dy, x, weight, bias, silu, need_dw)` and
+  `causal_conv1d_update(x, conv_state!, weight, bias, silu)`, with fake implementations; autograd is registered on the
+  forward op.
+- The kernels read 16-byte vectors along the channels (8 fp16 / bf16 or 4 fp32 channels per thread) over runs of 32
+  tokens, with a W-1 token halo re-read per run.
+  - Run lengths measured on the P100: 64 tokens gave 2.01x the floor at 4k, 32 gave 1.82x, 16 gave 1.83x with a slower
+    dW pass.
+  - Unaligned inputs or C % 8 != 0 take a scalar path.
+- The backward recomputes z in the forward's order.
+  - dW / db come from per-run fp32 partials, reduced in run order by a second kernel. The summation order does not
+    depend on the GPU; the SFU's exp in SiLU' may.
+  - dW / db are computed only when the weight or bias needs a gradient: a frozen conv under LoRA gets dX only.
+- The decode update uses one thread per channel and supports runtime dtypes. It writes the state shift in place, as
+  exact values, while the reference rounds an fp32 state of an fp16 model through the weight's dtype. With the state
+  in x's dtype the result is bitwise the reference's.
+- Registers: at most 168, no spills on sm_60 / 61 / 70 / 75.
+
+**Deviations from the plan, after the reviews.**
+- An fp16 x with fp32 weights (the AMP recipe) runs directly in the fp32-weight instance. That is more accurate than
+  the reference's cast to fp16, and dW comes back in fp32. There is no autocast cast.
+- The output is compact channel-last ([B, L, C] memory), not x's strides when x is a slice of a wider tensor.
+- A package bound by transformers is kept on SM 7.5 and newer by capability, not probed.
+- Torch below 2.4 has no `register_autograd`, but transformers 5.x requires torch >= 2.6, so the hook never meets it.
+- The wrappers take both call styles of Qwen3.5 / Qwen3.5-MoE / Qwen3-Next (positional) and OLMo-hybrid (`weight=`,
+  `bias=`, `activation=` keywords), verified on the 5.20.2 call sites.
+- HF's compiled decode with this model was not exercised (a raw CUDA-graph capture of the update was).
+- The backward's fp32 partials take B·⌈L/32⌉·C·(W+1)·4 bytes: 0.31x an fp16 x at W = 4.
+
+**The conv alone** (`qwen35_conv_ab.py`: C = 6144, W = 4, SiLU, fp16, the model's layout; ours vs transformers'
+reference; the floor is one read of x and one write of y at the nominal bandwidth):
+
+| GPU | forward, L = 4096 | ours vs floor (L = 1k-16k) | fwd + bwd (dX), L = 4096 | update, per call |
+|---|---|---|---|---|
+| P100 | 3.02 -> 0.25 ms (12.1x) | 1.55-2.16x | 9.6 -> 0.93 ms (10.4x) | 60 -> 8 µs |
+| 1080 Ti | 6.26 -> 0.31 ms (20.1x) | 1.48-1.95x | 17.8 -> 2.07 ms (8.6x) | 144 -> 21 µs |
+| V100 | 0.98 -> 0.16 ms (6.3x) | 1.28-1.83x | 3.69 -> 0.62 ms (6.0x) | 121 -> 14 µs |
+| 2080 Ti | 1.27 -> 0.21 ms (5.9x) | 1.24-1.47x | 4.70 -> 0.80 ms (5.9x) | 163 -> 19 µs |
+| T4 | 3.13 -> 0.48 ms (6.6x) | 1.47-1.63x | 11.9 -> 1.76 ms (6.8x) | 129 -> 17 µs |
+
+The forward is at most 2x the floor at 4k on every GPU (1.31-1.81x); at 1k it exceeds that only on the P100 (2.16x).
+
+Forward + backward against its floor (5 passes: the forward's read and write, then dy and x read and dx written):
+- At 4k it is 1.95-2.7x on four GPUs without dW, 3.3x on the P100 with dW.
+- The 1080 Ti is at 4.0x without dW and 4.4x with it: its backward is slower than the bandwidth suggests.
+- So the plan's "forward + backward ≤ 3x" holds without dW except on the 1080 Ti.
+
+**In the model** (`qwen35_conv_model_ab.py`: Qwen3.5-2B fp16, our attention; prefill 4096, generate 2048 + 64, a LoRA
+forward + backward at 1024; one process per run, A = `FLASH_ATTN_LEGACY_CONV1D=0`, B = our conv, alternated A B B A
+A B B A, medians):
+
+| GPU | prefill | generate | LoRA step |
+|---|---|---|---|
+| P100 | 1920 -> 1867 ms (1.029x) | 2534 -> 2438 ms (1.039x) | 2300 -> 2252 ms (1.022x) |
+| V100 | 369 -> 356 ms (1.038x) | 2619 -> 2472 ms (1.060x) | 1113 -> 1110 ms (1.004x, within noise) |
+| 2080 Ti | 529 -> 508 ms (1.041x) | 3356 -> 3186 ms (1.053x) | 1452 -> 1425 ms (1.019x) |
+| T4 | 1186 -> 1139 ms (1.041x) | 3507 -> 3359 ms (1.044x) | 1736 -> 1686 ms (1.030x) |
+
+No fallback was counted in either arm. Prefill and generate ranges do not overlap on any of the four GPUs.
+
+The 1080 Ti could not be measured. Its GPU was shared with another tenant's process (4.4 GiB, outside our
+container) during these runs: the LoRA step ran out of memory, and the prefill / generate times varied by 40-80%
+between runs, far more than the effect.
+
+**Tests** (`tests/test_causal_conv1d.py`).
+- Forward: every dtype, W = 2..4, fp32 and x-dtype weights, L < W, C not a multiple of 8, and layouts (a slice, a
+  misaligned view). Within one rounding of fp64 and no worse than the reference.
+- Backward: against fp64 and the reference, fp32 weights included, reproducible. The dW pass runs only when needed.
+- Update: against the forward (bitwise in fp32) and transformers' function (the state bitwise when it has x's dtype),
+  in place, under CUDA-graph capture.
+- opcheck and a compiled forward + backward.
+- Qwen3.5 tiny model: prefill, 64 greedy tokens until a near-tie, and gradients against the reference path; padding
+  with gradient checkpointing; the opt-out; the fallback count; packed sequences raising.
+- The other hybrid models' call styles, and a bound package kept on SM 7.5 and newer.

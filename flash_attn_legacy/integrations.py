@@ -101,6 +101,10 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "gated_delta_chunk_arch": FallbackReason(
         "fla's chunk gated delta rule does not run below compute capability 8.0 (its Triton kernel fails to "
         "compile); fla's recurrent kernel is kept for decode", "reference"),
+    "conv1d_input": FallbackReason(
+        "Gated DeltaNet causal conv1d: an input the kernel does not take (not CUDA, a channel stride other than 1, "
+        "width other than 2-4, dtype, activation other than SiLU, a decode step with gradients, or an extension "
+        "built without the conv ops)", "reference"),
 }
 
 # 2D masks follow HF's flash_attention_2 convention: a [B, n] mask means only the
@@ -988,8 +992,9 @@ def register():
         def _patched_check(self, attn_implementation, is_init_check=False, allow_all_kernels=False):
             if attn_implementation == "flash_attn_legacy":
                 _patch_linear_on_first_forward(self)
-                from .gated_delta import guard_gated_delta  # lazy: gated_delta imports this module
+                from .gated_delta import guard_gated_delta, patch_conv1d  # lazy: gated_delta imports this module
                 guard_gated_delta(self)
+                patch_conv1d(self)
                 return "flash_attn_legacy"
             return original_check(self, attn_implementation, is_init_check, allow_all_kernels)
 

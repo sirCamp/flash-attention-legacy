@@ -47,6 +47,7 @@ from .utils import (
 
 from .integrations import register, fallback_stats, reset_fallback_stats
 from .linear import fused_linear, patch_linear
+from . import gated_delta as _gated_delta  # noqa: F401 (registers the conv op's autograd)
 
 __all__ = [
     "flash_attention",

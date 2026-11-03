@@ -243,6 +243,30 @@ struct LinearPlan {
 };
 
 // ---------------------------------------------------------------------------
+// Depthwise causal conv1d of Gated DeltaNet layers (causal_conv1d.cu, docs/PLAN.md
+// P6.10 b): y[b, c, t] = act(sum_k w[c, k] x[b, c, t - (W-1) + k] + bias[c]),
+// x / y channel-last ([B, C, L] logically, the channel stride 1), W = 2..4, fp32
+// accumulation. dtype codes: 0 float16, 1 bfloat16, 2 float32.
+// ---------------------------------------------------------------------------
+struct ConvParams {
+    const void* __restrict__ x;       // [B, C, L], strides (x_batch_stride, 1, x_seq_stride)
+    const void* __restrict__ weight;  // [C, W] contiguous
+    const void* __restrict__ bias;    // [C] or nullptr (the weight's dtype)
+    void* __restrict__ y;             // forward: [B, C, L], strides (y_batch_stride, 1, y_seq_stride)
+    const void* __restrict__ dy;      // backward: [B, C, L], strides (dy_batch_stride, 1, dy_seq_stride)
+    void* __restrict__ dx;            // backward: [B, C, L] as y
+    float* __restrict__ partial;      // backward: [B * runs, C, W + 1] fp32 (dW, then db), or nullptr
+    void* __restrict__ dweight;       // backward: [C, W] in the weight's dtype, or nullptr
+    void* __restrict__ dbias;         // backward: [C] in the weight's dtype, or nullptr
+    void* __restrict__ state;         // update: [B, C, state_len], strides below (in place)
+    index_t x_batch_stride, x_seq_stride, y_batch_stride, y_seq_stride, dy_batch_stride, dy_seq_stride;
+    index_t state_batch_stride, state_channel_stride, state_seq_stride;
+    int batch, channels, seqlen, width, state_len, runs;
+    int x_dtype, w_dtype, state_dtype;
+    bool silu;
+};
+
+// ---------------------------------------------------------------------------
 // Backward kernel launch parameters — shared between all kernels
 // ---------------------------------------------------------------------------
 struct FlashAttnBwdParams {

@@ -49,6 +49,9 @@ int flash_attn_num_splits(int blocks, int sms, int resident, int max_len, int ro
 int flash_attn_max_splits();
 LinearPlan linear_pascal_plan(int M, int N, int K);
 void linear_pascal_launch(const LinearParams& p, const LinearPlan& plan, cudaStream_t stream);
+int causal_conv1d_runs(int seqlen);
+void causal_conv1d_launch(const ConvParams& p, bool vec, bool backward, cudaStream_t stream);
+void causal_conv1d_update_launch(const ConvParams& p, cudaStream_t stream);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -999,7 +1002,8 @@ torch::Tensor linear_forward(torch::Tensor x, torch::Tensor W, c10::optional<tor
     // (w_kn: the last stage addresses W rows up to K rounded up to 32, its loads beyond K masked)
     const int64_t w_elems = w_kn ? N * ((K + 31) / 32 * 32) : N * K + 32;
     TORCH_CHECK(M * N < (int64_t(1) << 31) && M * K + 32 < (int64_t(1) << 31) && w_elems < (int64_t(1) << 31),
-                "M * N, M * K and N * K must fit the kernel's int32 offsets", w_kn ? " (W [K, N]: N * K rounded up to 32)" : "",
+                "M * N, M * K and N * K must fit the kernel's int32 offsets",
+                w_kn ? " (W [K, N]: N * K rounded up to 32)" : "",
                 ", got M=", M, " N=", N, " K=", K);
     torch::Tensor b;
     if (bias.has_value() && bias->defined()) {
@@ -1065,6 +1069,143 @@ std::vector<int64_t> linear_plan(int64_t M, int64_t N, int64_t K) {
     return {plan.tiles, plan.tile0, plan.sk_blocks, plan.resident};
 }
 
+// ---------------------------------------------------------------------------
+// Depthwise causal conv1d of Gated DeltaNet layers (causal_conv1d.cu, ConvParams;
+// docs/PLAN.md P6.10 b): x [B, C, L] channel-last (stride 1 along C: transformers
+// passes mixed_qkv [B, L, C] transposed), weight [C, W] (W = 2..4, x's dtype or
+// float32), bias [C] (the weight's dtype); float16 / bfloat16 / float32. Outputs
+// channel-last too ([B, L, C] memory, returned as [B, C, L]): transformers
+// transposes them back. The Python wrapper (gated_delta.py) sends other inputs to
+// transformers' reference.
+// ---------------------------------------------------------------------------
+static int conv_dtype(const torch::Tensor& t, const char* name) {
+    if (t.dtype() == torch::kFloat16) return 0;
+    if (t.dtype() == torch::kBFloat16) return 1;
+    TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float16, bfloat16 or float32, got ", t.dtype());
+    return 2;
+}
+
+// Checks x / weight / bias; returns (weight, bias) contiguous and fills the shape, dtypes and pointers of p
+static std::pair<torch::Tensor, torch::Tensor> conv_inputs(
+    const torch::Tensor& x, torch::Tensor weight, c10::optional<torch::Tensor> bias, bool silu, ConvParams& p
+) {
+    TORCH_CHECK(x.is_cuda() && x.dim() == 3, "x must be a CUDA tensor [B, C, L], got ", x.sizes());
+    TORCH_CHECK(x.stride(1) == 1 || x.size(1) == 1, "x must be channel-last (stride 1 along C), got strides ",
+                x.strides());
+    TORCH_CHECK(weight.device() == x.device() && weight.dim() == 2 && weight.size(0) == x.size(1) &&
+                weight.size(1) >= 2 && weight.size(1) <= 4, "weight must be [C, W] (W = 2..4) on x's device, got ",
+                weight.sizes());
+    TORCH_CHECK(x.size(1) <= INT32_MAX && x.size(2) <= INT32_MAX, "x too large, got ", x.sizes());
+    // grid: (channel groups, runs of tokens, batch rows): y and z at most 65535
+    TORCH_CHECK(x.size(0) <= 65535 && causal_conv1d_runs(x.size(2)) <= 65535,
+                "x too large for the conv kernels' grid (B and the runs of tokens at most 65535), got ", x.sizes());
+    p.x_dtype = conv_dtype(x, "x");
+    p.w_dtype = conv_dtype(weight, "weight");
+    TORCH_CHECK(p.w_dtype == p.x_dtype || p.w_dtype == 2, "weight must be x's dtype or float32");
+    weight = weight.contiguous();
+    torch::Tensor b;
+    if (bias.has_value() && bias->defined()) {
+        TORCH_CHECK(bias->device() == x.device() && bias->dim() == 1 && bias->size(0) == x.size(1) &&
+                    bias->dtype() == weight.dtype(), "bias must be [C] in the weight's dtype on x's device");
+        b = bias->contiguous();
+    }
+    p.batch = x.size(0); p.channels = x.size(1); p.seqlen = x.size(2); p.width = weight.size(1);
+    p.silu = silu;
+    p.x = x.data_ptr();
+    p.x_batch_stride = x.stride(0); p.x_seq_stride = x.stride(2);
+    p.weight = weight.data_ptr();
+    p.bias = b.defined() ? b.data_ptr() : nullptr;
+    return {weight, b};
+}
+
+// An empty [B, C, L] tensor laid out as [B, L, C] (x's options)
+static torch::Tensor conv_out_like(const torch::Tensor& x) {
+    return torch::empty({x.size(0), x.size(2), x.size(1)}, x.options()).transpose(1, 2);
+}
+
+// 16-byte loads: C a multiple of the vector, every operand's start and batch / token strides aligned to it
+static bool conv_vec(const ConvParams& p, std::initializer_list<const torch::Tensor*> ts) {
+    const int n = 16 / ts.begin()[0]->element_size();
+    if (p.channels % n) return false;
+    for (const torch::Tensor* t : ts) {
+        if (reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 || t->stride(0) % n || t->stride(2) % n) return false;
+    }
+    return true;
+}
+
+torch::Tensor causal_conv1d_forward(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias,
+                                    bool silu) {
+    ConvParams p = {};
+    const auto held = conv_inputs(x, weight, bias, silu, p);
+    torch::Tensor y = conv_out_like(x);
+    p.y = y.data_ptr();
+    p.y_batch_stride = y.stride(0); p.y_seq_stride = y.stride(2);
+    const at::cuda::CUDAGuard device_guard(x.device());
+    causal_conv1d_launch(p, conv_vec(p, {&x, &y}), false, at::cuda::getCurrentCUDAStream());
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return y;
+}
+
+// (dx, dweight, dbias); dweight / dbias empty (0 elements) unless need_dw (dbias also without a bias)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> causal_conv1d_backward(
+    torch::Tensor dy, torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias, bool silu,
+    bool need_dw) {
+    ConvParams p = {};
+    const auto held = conv_inputs(x, weight, bias, silu, p);
+    TORCH_CHECK(dy.sizes() == x.sizes() && dy.dtype() == x.dtype() && dy.device() == x.device(),
+                "dy must match x [B, C, L]");
+    if (dy.stride(1) != 1 && dy.size(1) != 1) dy = dy.transpose(1, 2).contiguous().transpose(1, 2);
+    torch::Tensor dx = conv_out_like(x);
+    torch::Tensor dw = torch::empty({0}, held.first.options()), db = torch::empty({0}, held.first.options());
+    torch::Tensor partial;
+    p.dy = dy.data_ptr();
+    p.dy_batch_stride = dy.stride(0); p.dy_seq_stride = dy.stride(2);
+    p.dx = dx.data_ptr();
+    p.y_batch_stride = dx.stride(0); p.y_seq_stride = dx.stride(2);
+    p.runs = causal_conv1d_runs(p.seqlen);
+    if (need_dw && p.seqlen > 0 && p.batch > 0) {
+        partial = torch::empty({int64_t(p.batch) * p.runs, p.channels, p.width + 1},
+                               x.options().dtype(torch::kFloat32));
+        dw = torch::empty_like(held.first);
+        p.partial = partial.data_ptr<float>();
+        p.dweight = dw.data_ptr();
+        if (held.second.defined()) {
+            db = torch::empty_like(held.second);
+            p.dbias = db.data_ptr();
+        }
+    } else if (need_dw) {
+        dw = torch::zeros_like(held.first);
+        if (held.second.defined()) db = torch::zeros_like(held.second);
+    }
+    const at::cuda::CUDAGuard device_guard(x.device());
+    causal_conv1d_launch(p, conv_vec(p, {&x, &dy, &dx}), true, at::cuda::getCurrentCUDAStream());
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return {dx, dw, db};
+}
+
+// One decode step: x [B, C, S] the new tokens, conv_state [B, C, state_len] (state_len >= W - 1, any dtype of the
+// three, any strides) updated in place (transformers' causal_conv1d_update); returns y [B, C, S] channel-last
+torch::Tensor causal_conv1d_update(torch::Tensor x, const torch::Tensor& conv_state, torch::Tensor weight,
+                                   c10::optional<torch::Tensor> bias, bool silu) {
+    ConvParams p = {};
+    const auto held = conv_inputs(x, weight, bias, silu, p);
+    TORCH_CHECK(conv_state.device() == x.device() && conv_state.dim() == 3 && conv_state.size(0) == x.size(0) &&
+                conv_state.size(1) == x.size(1) && conv_state.size(2) >= p.width - 1 && conv_state.size(2) <= INT32_MAX,
+                "conv_state must be [B, C, state_len >= W - 1] on x's device, got ", conv_state.sizes());
+    p.state_dtype = conv_dtype(conv_state, "conv_state");
+    p.state = conv_state.data_ptr();
+    p.state_batch_stride = conv_state.stride(0); p.state_channel_stride = conv_state.stride(1);
+    p.state_seq_stride = conv_state.stride(2);
+    p.state_len = conv_state.size(2);
+    torch::Tensor y = conv_out_like(x);
+    p.y = y.data_ptr();
+    p.y_batch_stride = y.stride(0); p.y_seq_stride = y.stride(2);
+    const at::cuda::CUDAGuard device_guard(x.device());
+    causal_conv1d_update_launch(p, at::cuda::getCurrentCUDAStream());
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return y;
+}
+
 }  // namespace flash_attn_legacy
 
 // The kernels are dispatcher operators (torch.ops.flash_attn_legacy.*): torch.compile
@@ -1090,6 +1231,11 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
     m.def("kvcache_append(Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor k, Tensor v, Tensor? cache_seqlens, "
           "int uniform_seqlen=-1, Tensor? block_table=None) -> ()");
     m.def("linear(Tensor x, Tensor W, Tensor? bias=None, bool w_kn=False) -> Tensor");
+    m.def("causal_conv1d(Tensor x, Tensor weight, Tensor? bias=None, bool silu=False) -> Tensor");
+    m.def("causal_conv1d_backward(Tensor dy, Tensor x, Tensor weight, Tensor? bias, bool silu, bool need_dw) "
+          "-> (Tensor, Tensor, Tensor)");
+    m.def("causal_conv1d_update(Tensor x, Tensor(a!) conv_state, Tensor weight, Tensor? bias=None, "
+          "bool silu=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
@@ -1100,6 +1246,9 @@ TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
     m.impl("with_kvcache", &flash_attn_legacy::flash_attn_with_kvcache);
     m.impl("kvcache_append", &flash_attn_legacy::flash_attn_kvcache_append);
     m.impl("linear", &flash_attn_legacy::linear_forward);
+    m.impl("causal_conv1d", &flash_attn_legacy::causal_conv1d_forward);
+    m.impl("causal_conv1d_backward", &flash_attn_legacy::causal_conv1d_backward);
+    m.impl("causal_conv1d_update", &flash_attn_legacy::causal_conv1d_update);
 }
 
 // Helpers (host-side queries, not traced)
