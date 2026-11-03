@@ -132,6 +132,35 @@ So 2b has two steps:
   what loss scaling is there to prevent.
 - First step: a histogram of max |dY·X| and max |lane partial| on real layers under GradScaler.
 
+**Measured (P8.10's first step, 2026-11-03; `p8_dw_hist.py` in this directory).** Full fine-tune of Qwen2.5-0.5B
+(FP32 weights, fp16 autocast, GradScaler, 2048 wikitext-2 tokens per step, 4 steps after the scale settled at 2^15),
+every `nn.Linear`'s backward:
+
+- **Overflow.**
+  - No 32-term lane of dY·X exceeds 65504. The largest is 1.52e4, in the k / v projections and a down_proj; the
+    largest lane is about the largest single product (1.52e4): one token dominates.
+  - That is a 4.3x margin at this scale. GradScaler doubles its scale after 2000 clean steps, and stock never
+    overflows in dW (fp32 accumulation), so stock's scale keeps climbing until dY itself overflows fp16.
+  - A kernel dW would overflow first: at 2^17 here. Its skips would hold the scale lower than stock's, which brings
+    more underflow into dX as well.
+- **Underflow.**
+  - The lm_head's dY (softmax minus one-hot, over the tokens, times the scale) is mostly below fp16's smallest normal:
+    96% of its nonzero values.
+  - 91% of its products dY·X are below 2^-14, where an fp16 product loses bits that cuBLAS's fp32 product keeps.
+    Qwen2.5-0.5B ties the lm_head to the embedding, so this dW matters.
+  - Other layers: a median of 1.5% of products below 2^-14.
+
+**So a plain HFMA2 dW is not safe.** A version that would be safe applies a power-of-2 prescale per call.
+- The scale comes from amax(dY) · amax(X), computed on the device (no host sync) by one extra read of both operands.
+- dY is scaled at staging (exact) and the fp32 result unscaled.
+- The scale targets a largest product of ~2^13: it removes the overflow and lifts the lm_head's products out of the
+  subnormals.
+
+Its gain is bounded. dW is ~18% of the full fine-tuning step (P8.8's profile: the `TN` kernels), so at the kernel's
+1.5-1.7x it is worth ~6-8% of the step, before the amax pass. **P8.10 is left to a decision**: that gain against a new
+reduction, a scaled staging path and a training-accuracy acceptance (skips ≤ stock's, loss within the seed noise over
+a long enough run to see the scale's equilibrium, not 300 steps).
+
 **Acceptance (2b.1 and 2b.2).**
 - dW error against FP64 ≤ 2.5e-3 relative Frobenius on edge shapes, including M odd and M % 32 != 0.
 - A 300-step full fine-tune of Qwen2.5-0.5B with the standard recipe (autocast fp16, fp32 weights, GradScaler):

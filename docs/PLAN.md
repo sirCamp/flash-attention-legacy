@@ -273,7 +273,9 @@ GradScaler is the FP16 recipe anyway. Tests: `tests/test_linear.py` 114 passed +
 suite 4604 passed on the P100; 1080 Ti, V100, 2080 Ti, T4 green (21 passed / 94 skipped in `test_linear.py`).
 
 Open, after P8 (analysis and proposed order in `docs/analysis/kernels/p8_followups.md`, 2026-11-02, reviewed): P8.10
-dW on the kernel (an overflow / underflow histogram of dY·X under GradScaler first); P8.12 a hand-scheduled SASS main
+dW on the kernel, to be decided (measured 2026-11-03, section 2b: under GradScaler a 32-term lane reaches 1.52e4, a
+4.3x margin stock's rising scale would eat, and 91% of the lm_head's products fall below fp16's normals; safe only with
+a per-call power-of-2 prescale from amax(dY)·amax(X), for ~6-8% of a full fine-tuning step); P8.12 a hand-scheduled SASS main
 loop (ceiling ~79% of peak with the fold, ours 64-72%; assembler to choose). A llama.cpp PR (its P100 path is cuBLAS
 `COMPUTE_16F`, same speed, lower accuracy) once P8 is proven.
 
