@@ -1,7 +1,7 @@
 # P8 follow-ups on the P100: where the time goes, and what to change next
 
-Status: analysis and proposal (2026-11-02), revised after an independent review; to be decided before any
-implementation. Follow-up 1 (fold every 64 K elements) is done and measured (`docs/bench/linear.md`, "Fold interval");
+Status: closed (2026-11-03). Analysis and proposal of 2026-11-02, revised after an independent review; the decisions
+and results are in section 5 and in docs/PLAN.md (P8.6-P8.12). Follow-up 1 (fold every 64 K elements) is done and measured (`docs/bench/linear.md`, "Fold interval");
 so is 2a (docs/PLAN.md P8.6, `docs/bench/linear.md`, "The backward: dX").
 This note covers the other three:
 
@@ -159,7 +159,8 @@ every `nn.Linear`'s backward:
 Its gain is bounded. dW is ~18% of the full fine-tuning step (P8.8's profile: the `TN` kernels), so at the kernel's
 1.5-1.7x it is worth ~6-8% of the step, before the amax pass. **P8.10 is left to a decision**: that gain against a new
 reduction, a scaled staging path and a training-accuracy acceptance (skips ≤ stock's, loss within the seed noise over
-a long enough run to see the scale's equilibrium, not 300 steps).
+a long enough run to see the scale's equilibrium, not 300 steps). **Decided 2026-11-03: not taken up** (the gain is
+P100-only and small for the risk).
 
 **Acceptance (2b.1 and 2b.2).**
 - dW error against FP64 ≤ 2.5e-3 relative Frobenius on edge shapes, including M odd and M % 32 != 0.
@@ -351,17 +352,23 @@ fp32 math on fp16 storage, not HFMA2.
 - GEMM ≥ 1.08x on the 80 shapes (geomean, A/B alternated).
 - `tests/test_linear.py` passes; the build on non-sm_60 GPUs is unchanged.
 
+**Decided 2026-11-03: not taken up** (~+10% on the P100's linear layers alone, against unverified tooling and the
+upkeep of hand-written SASS). If ever revisited: option A with D, once CuAssembler is verified on HFMA2 / HMUL2 /
+F2F.
+
 ## 5. Proposed order
 
-1. **P8.6 (2a)**: dX without the W^T copy. It is small, bitwise-verifiable and removes a 467 MB transient.
+1. **P8.6 (2a)**: dX without the W^T copy. It is small, bitwise-verifiable and removes a 467 MB transient. Done.
 2. **P8.7 (3.0)**: the emulation gate for HFMA2 attention. It is cheap (PyTorch only) and decides whether 3 exists.
+   Done: failed.
 3. **P8.8 (2b.1)**: fp32 weights under autocast. It brings the standard full fine-tuning recipe onto the kernel. It is
-   profiled first, then estimated.
+   profiled first, then estimated. Done.
 4. ~~**P8.9 (3)**: the HFMA2 attention forward, if the gate passed.~~ The gate failed for S (section 3, "Gate result");
    not scheduled.
-5. **P8.10 (2b.2)**: dW on the kernel, after the overflow histogram.
+5. ~~**P8.10 (2b.2)**: dW on the kernel, after the overflow histogram.~~ Measured; not taken up (section 2b).
 6. ~~**P8.11 (3')**: the HFMA2 attention backward.~~ Not scheduled (as P8.9).
-7. **P8.12 (4)**: the SASS main loop, after the tooling decision (A-D) and the assembler verification.
+7. ~~**P8.12 (4)**: the SASS main loop, after the tooling decision (A-D) and the assembler verification.~~ Not taken
+   up (section 4).
 
 Each one follows the usual process: analysis, plan, review, implement. Tests run on all boxes and get an independent
 review before the next one, and perf claims are confirmed with alternated A/B against a HEAD build.

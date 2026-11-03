@@ -272,12 +272,13 @@ way: without loss scaling, dX's FP16 products underflow (toy MLP: 14x stock's er
 GradScaler is the FP16 recipe anyway. Tests: `tests/test_linear.py` 114 passed + the two-GPU test skipped, the full
 suite 4604 passed on the P100; 1080 Ti, V100, 2080 Ti, T4 green (21 passed / 94 skipped in `test_linear.py`).
 
-Open, after P8 (analysis and proposed order in `docs/analysis/kernels/p8_followups.md`, 2026-11-02, reviewed): P8.10
-dW on the kernel, to be decided (measured 2026-11-03, section 2b: under GradScaler a 32-term lane reaches 1.52e4, a
-4.3x margin stock's rising scale would eat, and 91% of the lm_head's products fall below fp16's normals; safe only with
-a per-call power-of-2 prescale from amax(dY)·amax(X), for ~6-8% of a full fine-tuning step); P8.12 a hand-scheduled SASS main
-loop (ceiling ~79% of peak with the fold, ours 64-72%; assembler to choose). A llama.cpp PR (its P100 path is cuBLAS
-`COMPUTE_16F`, same speed, lower accuracy) once P8 is proven.
+Closed after P8 (decided 2026-11-03): P8.10 dW on the kernel (measured, `docs/analysis/kernels/p8_followups.md` 2b:
+under GradScaler a 32-term lane reaches 1.52e4, a 4.3x margin stock's rising scale would eat, and 91% of the lm_head's
+products fall below fp16's normals; safe only with a per-call power-of-2 prescale, for ~6-8% of a full fine-tuning
+step on the P100 alone: not worth the risk) and P8.12 the hand-scheduled SASS main loop (~+10% on the P100's linear
+layers alone, no official assembler, tooling unverified for Pascal's fp16 instructions; if ever taken up: a prebuilt
+cubin assembled with CuAssembler once verified). The effort goes to P6.10 (c). Still open: a llama.cpp PR (its P100
+path is cuBLAS `COMPUTE_16F`, same speed, lower accuracy).
 
 ---
 
