@@ -53,6 +53,7 @@ int causal_conv1d_runs(int seqlen);
 void causal_conv1d_launch(const ConvParams& p, bool vec, bool backward, cudaStream_t stream);
 void causal_conv1d_update_launch(const ConvParams& p, cudaStream_t stream);
 void gdn_scan_launch(const GdnScanParams& p, int vs, bool backward, cudaStream_t stream);
+void gdn_prep_launch(const GdnPrepParams& p, cudaStream_t stream);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -1079,7 +1080,8 @@ std::vector<int64_t> linear_plan(int64_t M, int64_t N, int64_t K) {
 // transposes them back. The Python wrapper (gated_delta.py) sends other inputs to
 // transformers' reference.
 // ---------------------------------------------------------------------------
-static int conv_dtype(const torch::Tensor& t, const char* name) {
+// The dtype code of the fp16 / bf16 / fp32 kernels (the conv, the delta rule's prep): 0, 1, 2
+static int dtype_code(const torch::Tensor& t, const char* name) {
     if (t.dtype() == torch::kFloat16) return 0;
     if (t.dtype() == torch::kBFloat16) return 1;
     TORCH_CHECK(t.dtype() == torch::kFloat32, name, " must be float16, bfloat16 or float32, got ", t.dtype());
@@ -1100,8 +1102,8 @@ static std::pair<torch::Tensor, torch::Tensor> conv_inputs(
     // grid: (channel groups, runs of tokens, batch rows): y and z at most 65535
     TORCH_CHECK(x.size(0) <= 65535 && causal_conv1d_runs(x.size(2)) <= 65535,
                 "x too large for the conv kernels' grid (B and the runs of tokens at most 65535), got ", x.sizes());
-    p.x_dtype = conv_dtype(x, "x");
-    p.w_dtype = conv_dtype(weight, "weight");
+    p.x_dtype = dtype_code(x, "x");
+    p.w_dtype = dtype_code(weight, "weight");
     TORCH_CHECK(p.w_dtype == p.x_dtype || p.w_dtype == 2, "weight must be x's dtype or float32");
     weight = weight.contiguous();
     torch::Tensor b;
@@ -1193,7 +1195,7 @@ torch::Tensor causal_conv1d_update(torch::Tensor x, const torch::Tensor& conv_st
     TORCH_CHECK(conv_state.device() == x.device() && conv_state.dim() == 3 && conv_state.size(0) == x.size(0) &&
                 conv_state.size(1) == x.size(1) && conv_state.size(2) >= p.width - 1 && conv_state.size(2) <= INT32_MAX,
                 "conv_state must be [B, C, state_len >= W - 1] on x's device, got ", conv_state.sizes());
-    p.state_dtype = conv_dtype(conv_state, "conv_state");
+    p.state_dtype = dtype_code(conv_state, "conv_state");
     p.state = conv_state.data_ptr();
     p.state_batch_stride = conv_state.stride(0); p.state_channel_stride = conv_state.stride(1);
     p.state_seq_stride = conv_state.stride(2);
@@ -1297,6 +1299,58 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gdn_chunk_scan_backward(
     return gdn_scan_run(w, kt, d, dv_new, v_dim, d_final_state, dh, true);
 }
 
+// ---------------------------------------------------------------------------
+// The intra-chunk phase of the chunk gated delta rule (gdn_prep.cu, GdnPrepParams;
+// docs/PLAN.md P6.10 c2): q, k [B, L, H, K] and v [B, L, H, V] in one dtype
+// (float16 / bfloat16 / float32, any strides with the last dimension contiguous),
+// g and beta [B, L, H] (cast to float32 here). Returns, fp32, NC = ceil(L / 64):
+// (q~, k~, w [B, H, NC, 64, K], u [B, H, NC, 64, V], d [B, H, NC], A, T
+// [B, H, NC, 64, 64]). The analytic backward is registered in gated_delta.py.
+// ---------------------------------------------------------------------------
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+gdn_chunk_prep(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, double scale) {
+    TORCH_CHECK(q.is_cuda() && q.dim() == 4 && k.sizes() == q.sizes(), "q and k must be CUDA tensors [B, L, H, K]");
+    TORCH_CHECK(v.dim() == 4 && v.size(0) == q.size(0) && v.size(1) == q.size(1) && v.size(2) == q.size(2),
+                "v must be [B, L, H, V]");
+    const int64_t B = q.size(0), L = q.size(1), H = q.size(2), K = q.size(3), V = v.size(3);
+    TORCH_CHECK(K % 16 == 0 && K > 0 && V % 16 == 0 && V > 0, "K and V must be positive multiples of 16, got ", K,
+                " and ", V);
+    TORCH_CHECK(g.dim() == 3 && g.size(0) == B && g.size(1) == L && g.size(2) == H && beta.sizes() == g.sizes(),
+                "g and beta must be [B, L, H]");
+    TORCH_CHECK(B <= 65535 && H <= 65535 && L <= INT32_MAX - 64, "too many rows / heads / tokens");
+    const int dtype = dtype_code(q, "q");
+    TORCH_CHECK(k.dtype() == q.dtype() && v.dtype() == q.dtype(), "q, k and v must have one dtype");
+    for (const torch::Tensor* t : {&k, &v, &g, &beta}) {
+        TORCH_CHECK(t->device() == q.device(), "inputs must be on q's device");
+    }
+    TORCH_CHECK(g.is_floating_point() && beta.is_floating_point(), "g and beta must be floating point");
+    if (q.stride(3) != 1) q = q.contiguous();
+    if (k.stride(3) != 1) k = k.contiguous();
+    if (v.stride(3) != 1) v = v.contiguous();
+    g = g.to(torch::kFloat32).contiguous();
+    beta = beta.to(torch::kFloat32).contiguous();
+    const int64_t NC = (L + 63) / 64;
+    const auto f32 = q.options().dtype(torch::kFloat32);
+    torch::Tensor qt = torch::empty({B, H, NC, 64, K}, f32), kt = torch::empty({B, H, NC, 64, K}, f32);
+    torch::Tensor w = torch::empty({B, H, NC, 64, K}, f32), u = torch::empty({B, H, NC, 64, V}, f32);
+    torch::Tensor d = torch::empty({B, H, NC}, f32);
+    torch::Tensor A = torch::empty({B, H, NC, 64, 64}, f32), T = torch::empty({B, H, NC, 64, 64}, f32);
+    GdnPrepParams p = {};
+    p.q = q.data_ptr(); p.k = k.data_ptr(); p.v = v.data_ptr();
+    p.g = g.data_ptr<float>(); p.beta = beta.data_ptr<float>();
+    p.qt = qt.data_ptr<float>(); p.kt = kt.data_ptr<float>(); p.w = w.data_ptr<float>(); p.u = u.data_ptr<float>();
+    p.d = d.data_ptr<float>(); p.A = A.data_ptr<float>(); p.T = T.data_ptr<float>();
+    p.q_batch_stride = q.stride(0); p.q_seq_stride = q.stride(1); p.q_head_stride = q.stride(2);
+    p.k_batch_stride = k.stride(0); p.k_seq_stride = k.stride(1); p.k_head_stride = k.stride(2);
+    p.v_batch_stride = v.stride(0); p.v_seq_stride = v.stride(1); p.v_head_stride = v.stride(2);
+    p.scale = static_cast<float>(scale);
+    p.batch = B; p.seqlen = L; p.heads = H; p.chunks = NC; p.k_dim = K; p.v_dim = V; p.dtype = dtype;
+    const at::cuda::CUDAGuard device_guard(q.device());
+    gdn_prep_launch(p, at::cuda::getCurrentCUDAStream());
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return {qt, kt, w, u, d, A, T};
+}
+
 }  // namespace flash_attn_legacy
 
 // The kernels are dispatcher operators (torch.ops.flash_attn_legacy.*): torch.compile
@@ -1331,6 +1385,8 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "-> (Tensor, Tensor, Tensor)");
     m.def("gdn_chunk_scan_backward(Tensor w, Tensor kt, Tensor d, Tensor? dh, Tensor? dv_new, "
           "Tensor? d_final_state, int v_dim) -> (Tensor, Tensor, Tensor)");
+    m.def("gdn_chunk_prep(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float scale) "
+          "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
@@ -1346,6 +1402,7 @@ TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
     m.impl("causal_conv1d_update", &flash_attn_legacy::causal_conv1d_update);
     m.impl("gdn_chunk_scan", &flash_attn_legacy::gdn_chunk_scan);
     m.impl("gdn_chunk_scan_backward", &flash_attn_legacy::gdn_chunk_scan_backward);
+    m.impl("gdn_chunk_prep", &flash_attn_legacy::gdn_chunk_prep);
 }
 
 // Helpers (host-side queries, not traced)

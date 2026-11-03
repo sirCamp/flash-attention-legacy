@@ -109,6 +109,18 @@ def _register_fakes():
             V = v_dim
             return w.new_empty((B, H, NC, K, V)), w.new_empty((B, H, NC, 64, V)), w.new_empty((B, H, K, V))
 
+    if hasattr(_ops, "gdn_chunk_prep"):  # nor before P6.10 c2 the intra-chunk phase
+        @register("flash_attn_legacy::gdn_chunk_prep")
+        def _(q, k, v, g, beta, scale):
+            B, L, H, K = q.shape
+            V = v.shape[-1]
+            NC = (L + 63) // 64
+            f = dict(dtype=torch.float32, device=q.device)
+            tile = (B, H, NC, 64)
+            return (q.new_empty(tile + (K,), **f), q.new_empty(tile + (K,), **f), q.new_empty(tile + (K,), **f),
+                    q.new_empty(tile + (V,), **f), q.new_empty((B, H, NC), **f), q.new_empty(tile + (64,), **f),
+                    q.new_empty(tile + (64,), **f))
+
 
 _register_fakes()
 

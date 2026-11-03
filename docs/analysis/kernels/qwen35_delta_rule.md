@@ -1,7 +1,7 @@
 # The chunk gated delta rule of Qwen3.5-class models on pre-Ampere GPUs (P6.10 c)
 
-Status: c1 and c3 done (2026-11-03): each planned, reviewed, implemented, reviewed again, measured (sections 5 and
-7). c2 planned, reviewed and gated (section 8), being implemented. Last of the order decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
+Status: c1, c3 and c2 done (2026-11-03): each planned, reviewed, implemented, reviewed again, measured (sections 5, 7
+and 9). c2b (a fused backward kernel) open. Last of the order decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
 
 ## 1. Today
 
@@ -487,3 +487,99 @@ The op: `gdn_chunk_prep(q, k, v, g, beta) -> (q̃, k̃, w, u, d, A, T)`.
    - ptxas: spills, shared memory, registers and blocks per SM reported per arch and instantiation. Spills only if the
      A/B shows no cost.
    - The full suite green on all five GPUs, with and without `fla`.
+
+## 9. c2 as implemented, and the results
+
+**Kernel** (`csrc/kernels/gdn_prep.cu`, op `gdn_chunk_prep(q, k, v, g, beta, scale) -> (q̃, k̃, w, u, d, A, T)`).
+- As planned (section 8): one block of 256 threads per chunk, two passes over K (and V) in 64 x 16 sub-tiles, the
+  Gram matrices in registers, T by forward substitution in shared memory.
+- 27 KB static shared memory and 82-111 registers, without spills on sm_60 / 61 / 70 / 75. It is register-bound at two
+  blocks per SM on every target; section 8 expected three on the V100, which is wrong.
+- **The cumulative decay c is summed in fp64** (64 values per chunk, a warp scan), and its differences are taken in
+  fp64 before `expf`. This was not in the plan.
+  - Found by the strong-decay tests. With c ~ -700 by a chunk's end, the fp32 differences of prefix sums lose their
+    low bits. Our first version's final state was then 20x further from the fp64 rule than the reference's.
+  - With c in fp64 it is 10-100x closer than the reference: final state 1.7e-7 against 1.8e-5 at (2, 63, 16, 128).
+  - It costs nothing measurable. The backward takes c in fp64 too.
+- **Pass 2 reads T's rows as float4** (row stride 68). After the first A/B the T4 missed the op's 3 ms mark, at
+  3.45 ms. The scalar reads of T (five shared loads per four FMAs) were the limit. With float4 reads: 2.85-3.02 ms
+  on the T4 (two runs) and 1.64 ms on the P100 (was 1.79).
+- The conversions `to_f` / `from_f` moved from `causal_conv1d.cu` into `flash_attn_common.h` (one copy).
+  `conv_dtype` became `dtype_code`, shared by the two ops.
+
+**Python** (`flash_attn_legacy/gated_delta.py`).
+- `_chunk_scan` takes the op when q / k / v share a dtype and `FLASH_ATTN_LEGACY_GDN_PREP` is not 0. Otherwise it
+  takes the reference's lines (c3's path).
+- `_prep_grads` is the analytic backward of section 8, from the inputs, w and T (u recomputed), with the None
+  gradients skipped term by term.
+
+**Accuracy.**
+- **The op against transformers' lines in fp64**, per head: each output within 3x the fp32 lines' own error, or within
+  5e-7 (T: 1e-6), whichever is larger.
+  - w and u are T·X where the lines substitute. With nearly parallel keys they come to 2.0-2.2x the lines' error,
+    3.7e-6 absolute.
+  - Elsewhere the op is at the lines' level or better.
+- **The whole function**: the c1 / c3 tests unchanged, plus the strong-decay regime. Where the fp32 reference is
+  itself off the fp64 rule (strong decays), the bound is no further from the fp64 rule than twice the reference.
+- **The backward** against autograd of the lines, in fp32 and fp64: within 1e-4 per head in the five regimes, for all
+  six outputs' gradients and for subsets.
+- **The tiny Qwen3.5 training test in fp16** (model level).
+  - A_log's and dt_bias's gradients differ from the reference's by up to 2.3e-2 on the 2080 Ti, against c3's 2.8e-4.
+  - The cause is the gradient itself: it is a sum of dg·g over all tokens with up to 330x cancellation (g down to -27
+    per token in the tiny model).
+  - On layer 0's real inputs, dg of the reference, c3 and c2 is equally far from the fp64 rule (2.4e-4). In that sum
+    the reference is 5.9e-3 from the fp64 rule and c2 5.4e-3.
+  - c3 matched the reference only because it runs the same operations. The test's bound for these two parameters
+    is 5e-2.
+
+**Speed of the function** (`qwen35_delta_c2_ab.py`, L = 4096, 16 heads, fp16 inputs; A = c3's path, B = c2,
+alternated, medians):
+
+| GPU | prep op | inference A -> B | training fwd + bwd A -> B |
+|---|---|---|---|
+| P100 | 1.64 ms | 9.68 -> 4.50 ms (2.15x) | 29.5 -> 24.3 ms (1.21x) |
+| V100 | 0.85 ms | 5.32 -> 2.54 ms (2.09x) | 16.2 -> 14.7 ms (1.11x) |
+| 2080 Ti | 1.53 ms | 7.93 -> 3.58 ms (2.22x) | 23.4 -> 20.0 ms (1.17x) |
+| T4 | 2.85-3.02 ms | 19.1 -> 9.28 ms (2.06x) | 55.0 -> 46.9 ms (1.17x) |
+| 1080 Ti | 2.51 ms | 13.4 -> 7.29 ms (1.84x) | 40.5 -> 35.3 ms (1.15x) |
+
+Peak memory over the call: inference 339 -> 258 MiB, training 739 -> 626 MiB.
+
+**In the model** (Qwen3.5-2B fp16, `qwen35_conv_model_ab.py`; A = `FLASH_ATTN_LEGACY_GDN_PREP=0`, B = c2; 4 rounds per
+arm alternated, medians; LoRA as in section 7):
+
+| GPU | prefill 4096 | generate 2048 + 64 | LoRA step |
+|---|---|---|---|
+| V100 | 307 -> 258 ms (1.19x) | 1.03x (overlapping) | 411 -> 373 ms (1.10x) |
+| 2080 Ti | 465 -> 388 ms (1.20x) | 1.04x (overlapping) | 536 -> 490 ms (1.09x) |
+| T4 | 1123 -> 972 ms (1.16x) | 1.02x (overlapping) | 1164 -> 1118 ms (1.04x, overlapping) |
+| P100 | 1796 -> 1704 ms (1.05x) | 2406 -> 2359 ms (1.02x) | 1913 -> 1856 ms (1.03x) |
+| 1080 Ti | 3546 -> 3391 ms (1.05x, overlapping) | 1.02x (overlapping) | 2878 -> 2780 ms (1.04x, overlapping) |
+
+- No regression anywhere. The 1080 Ti's prefill (1.1% slower with c3, section 7) is now ahead of c3's.
+- The prefill gains match section 8's estimate: ~1.15-1.2x on the T4 / V100 / 2080 Ti, ~1.05x on the P100.
+- Peak memory: prefill 4108 -> 4027 MiB. The LoRA step's peak is unchanged (6662 MiB): under gradient checkpointing
+  the delta rule's graph is not what sets it.
+
+**Plan review and code review points applied.**
+- The plan review's changes are in section 8.
+- From the code review:
+  - a test of the prep op's own double-backward guard;
+  - the flat regime in the backward test, and a K = 48 / V = 16 case;
+  - a 5e-7 floor in place of 2e-6;
+  - `empty_cache` before the 64-bit offset test;
+  - the occupancy comment;
+  - `cuda_bf16.h` included at the top of the common header.
+- Left as they are:
+  - the op writes T even for no-gradient calls (16 MB at 4k with 16 heads);
+  - `_prep_grads` computes every input's gradient before the mask;
+  - the tests' fp64 copy of the reference's lines, which is the independent truth.
+
+**Suite.** The full suite is green on all five GPUs, apart from the A_log bound above, which was fixed and re-run:
+P100 4906 passed, V100 4815, T4 4813, 1080 Ti 4796, 2080 Ti 4793.
+- After the float4 change, test_gated_delta and test_causal_conv1d are green everywhere: 302 passed without `fla`, 300
+  with.
+- ptxas: gdn_prep has no spills on any arch. gdn_scan keeps c1 / c3's two one-register spills (section 7).
+- c2b (a fused backward kernel) remains open. The training backward's elementwise passes and the solve's
+  backward-shaped matmuls are its target, and the training gain above (1.11-1.21x on the function) is all from the
+  forward.

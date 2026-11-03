@@ -52,6 +52,7 @@ cuda_sources = [
     str(csrc_dir / "kernels" / "linear_pascal.cu"),  # SM 6.0 only (a stub on the other archs)
     str(csrc_dir / "kernels" / "causal_conv1d.cu"),
     str(csrc_dir / "kernels" / "gdn_scan.cu"),
+    str(csrc_dir / "kernels" / "gdn_prep.cu"),
 ]
 
 include_dirs = [

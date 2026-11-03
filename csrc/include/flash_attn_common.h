@@ -2,6 +2,7 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdio>
@@ -283,6 +284,31 @@ struct GdnScanParams {
     float* __restrict__ v_new;       // [B, H, NC, 64, V]
     float* __restrict__ s_final;     // [B, H, K, V]
     int batch, heads, chunks, k_dim, v_dim;
+};
+
+// ---------------------------------------------------------------------------
+// The intra-chunk phase of the chunk gated delta rule (gdn_prep.cu, docs/PLAN.md
+// P6.10 c2): from the model's q / k / v (one dtype, code as ConvParams) and fp32
+// g / beta, the scan's inputs and the output products' operands, fp32.
+// ---------------------------------------------------------------------------
+struct GdnPrepParams {
+    const void* __restrict__ q;      // [B, L, H, K], strides (q_batch_stride, q_seq_stride, q_head_stride, 1)
+    const void* __restrict__ k;      // as q
+    const void* __restrict__ v;      // [B, L, H, V]
+    const float* __restrict__ g;     // [B, L, H] contiguous: the per-token log decay
+    const float* __restrict__ beta;  // [B, L, H] contiguous
+    float* __restrict__ qt;          // [B, H, NC, 64, K]: q~ = qn e^c
+    float* __restrict__ kt;          // [B, H, NC, 64, K]: k~ = kn e^(c_63 - c)
+    float* __restrict__ w;           // [B, H, NC, 64, K]: T (beta e^c kn)
+    float* __restrict__ u;           // [B, H, NC, 64, V]: T (beta v)
+    float* __restrict__ d;           // [B, H, NC]: e^(c_63)
+    float* __restrict__ A;           // [B, H, NC, 64, 64]: (qn kn^T) P, zeros above the diagonal
+    float* __restrict__ T;           // [B, H, NC, 64, 64]: (I + M)^-1
+    index_t q_batch_stride, q_seq_stride, q_head_stride;
+    index_t k_batch_stride, k_seq_stride, k_head_stride;
+    index_t v_batch_stride, v_seq_stride, v_head_stride;
+    float scale;                     // q's scale after its l2norm (K^-1/2)
+    int batch, seqlen, heads, chunks, k_dim, v_dim, dtype;
 };
 
 // ---------------------------------------------------------------------------
@@ -622,6 +648,17 @@ __host__ __device__ __forceinline__ int gqa_rows_per_token(bool packed, int num_
 // Device helpers shared by every kernel (one implementation each).
 // ---------------------------------------------------------------------------
 #ifdef __CUDACC__
+// Scalar conversions of the fp16 / bf16 / fp32 kernels (the conv, the delta rule's prep)
+template <typename T> __device__ __forceinline__ float to_f(T v);
+template <> __device__ __forceinline__ float to_f<half>(half v) { return __half2float(v); }
+template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <> __device__ __forceinline__ float to_f<float>(float v) { return v; }
+
+template <typename T> __device__ __forceinline__ T from_f(float v);
+template <> __device__ __forceinline__ half from_f<half>(float v) { return __float2half_rn(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
+template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
+
 // ---------------------------------------------------------------------------
 // Global -> shared tile copies with 128-bit transactions, split in two halves so
 // that a kernel can issue the global loads of the next tile early (into

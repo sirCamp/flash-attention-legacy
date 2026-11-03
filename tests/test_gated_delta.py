@@ -363,10 +363,32 @@ def _reference_chunk():
     return reference
 
 
+def _record_ops(monkeypatch, *names, calls=None, label=None):
+    """Route gated_delta._ops through a proxy recording each call of the named ops (as `label`, or the op's name);
+    the other ops pass through. Returns the list of calls."""
+    calls = [] if calls is None else calls
+    real = gated_delta._ops
+
+    class Recorder:
+        def __getattr__(self, name):
+            op = getattr(real, name)
+            if name not in names:
+                return op
+
+            def recorded(*args, **kwargs):
+                calls.append(label or name)
+                return op(*args, **kwargs)
+            return recorded
+
+    monkeypatch.setattr(gated_delta, "_ops", Recorder())
+    return calls
+
+
 def _gdn_inputs(B, L, H, K, V, dtype, regime, seed=0):  # noqa: C901
     """q / k / v / g / beta as the layer passes them ([B, L, H, .]); regime: "fast" (decays forget the state within a
     chunk), "slow" (g ~ -1e-3, beta near 1: the state carries across chunks), "flat" (g = 0, beta = 1), "parallel"
-    (nearly parallel keys: an ill-conditioned UT system)."""
+    (nearly parallel keys: an ill-conditioned UT system), "strong" (g down to -20 per token: e^c underflows in fp32
+    within a chunk)."""
     gen = torch.Generator("cuda").manual_seed(seed)
     q = torch.randn(B, L, H, K, device="cuda", generator=gen)
     k = torch.randn(B, L, H, K, device="cuda", generator=gen)
@@ -378,6 +400,9 @@ def _gdn_inputs(B, L, H, K, V, dtype, regime, seed=0):  # noqa: C901
         beta = torch.rand(B, L, H, device="cuda", generator=gen)
     elif regime == "flat":
         g, beta = torch.zeros(B, L, H, device="cuda"), torch.ones(B, L, H, device="cuda")
+    elif regime == "strong":
+        g = -torch.rand(B, L, H, device="cuda", generator=gen) * 20
+        beta = torch.rand(B, L, H, device="cuda", generator=gen)
     else:
         g = -torch.rand(B, L, H, device="cuda", generator=gen) * 1e-3
         beta = 0.9 + 0.1 * torch.rand(B, L, H, device="cuda", generator=gen)
@@ -402,26 +427,28 @@ def test_scan_copy_bitwise(L, K, state):
 
 
 @scan_only
-@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel"])
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel", "strong"])
 @pytest.mark.parametrize("B,L,H,K", [(1, 1, 1, 128), (2, 63, 16, 128), (1, 64, 16, 64), (2, 65, 1, 128),
                                      (1, 1000, 16, 128), (2, 300, 4, 64), (2, 70, 32, 128), (1, 4096, 16, 128)],
                          ids=["1tok", "63", "64-K64", "65", "1000", "300-K64", "VS32-H32", "4096"])
 def test_scan_kernel(regime, B, L, H, K):
     """The scan on the kernel against the reference in fp32 (inputs fp32: no output rounding in between): every
-    head's output and final state within 1e-5 relative (fp32 reassociation over the chunks)."""
+    head's output and final state within 1e-5 relative (fp32 reassociation over the chunks), or, where the reference
+    itself is further from the fp64 rule (strong decays: its fp32 prefix sums of g), no further from it than twice the
+    reference."""
     reference = _reference_chunk()
     q, k, v, g, beta = _gdn_inputs(B, L, H, K, 128, torch.float32, regime)
     s0 = torch.randn(B, H, K, 128, device="cuda") * 0.1
     kw = dict(initial_state=s0, output_final_state=True, use_qk_l2norm_in_kernel=True)
     want = reference(q, k, v, g=g, beta=beta, **kw)
     got = gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)
-
-    def rel(a, b, dims):  # per head: relative Frobenius over the other dims
-        err = (a.double() - b.double()).pow(2).sum(dims).sqrt()
-        return (err / b.double().pow(2).sum(dims).sqrt().clamp_min(1e-30)).max().item()
-
-    assert rel(got[0], want[0], (0, 1, 3)) < 1e-5, "output"
-    assert rel(got[1], want[1], (0, 2, 3)) < 1e-5, "final state"
+    truth = None
+    for name, i, head in (("output", 0, 2), ("final state", 1, 1)):
+        if _per_head(got[i], want[i], head) < 1e-5:
+            continue
+        truth = truth or _rule64(q, k, v, g, beta, s0)
+        err, ref = _per_head(got[i], truth[i], head), _per_head(want[i], truth[i], head)
+        assert err <= 2 * ref, f"{name}: {err:.1e} from fp64, the reference {ref:.1e}"
     assert torch.equal(gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)[0], got[0]), "not deterministic"
 
 
@@ -436,16 +463,7 @@ def test_scan_routing(monkeypatch):
     reference = _reference_chunk()
     monkeypatch.setattr(mq, "torch_chunk_gated_delta_rule", mq.torch_chunk_gated_delta_rule)
     assert gated_delta.guard_gated_delta(tiny_qwen35(attn_implementation="flash_attn_legacy"))
-    calls = []
-    real = gated_delta._ops
-
-    class Recorder:
-        @staticmethod
-        def gdn_chunk_scan(*args):
-            calls.append(1)
-            return real.gdn_chunk_scan(*args)
-
-    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    calls = _record_ops(monkeypatch, "gdn_chunk_scan")
     q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
     run = mq.torch_chunk_gated_delta_rule
 
@@ -560,15 +578,7 @@ def test_scan_fla_bound_route(monkeypatch):
 
     cells = {"implementation": fla_chunk, "torch_function": reference, "is_new_implementation": True}
     wrapper = gated_delta._chunk_wrapper(fla_chunk, cells)
-    real = gated_delta._ops
-
-    class Recorder:
-        @staticmethod
-        def gdn_chunk_scan(*args):
-            calls.append("scan")
-            return real.gdn_chunk_scan(*args)
-
-    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    _record_ops(monkeypatch, "gdn_chunk_scan", calls=calls, label="scan")
     q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
     for cc, expected in (((7, 0), ["scan"]), ((8, 0), ["fla"])):
         calls.clear()
@@ -588,16 +598,7 @@ def test_scan_routing_more(monkeypatch):
         pytest.skip("fla is installed here")
     _reference_chunk()
     assert gated_delta.guard_gated_delta(tiny_qwen35(attn_implementation="flash_attn_legacy"))
-    calls = []
-    real = gated_delta._ops
-
-    class Recorder:
-        @staticmethod
-        def gdn_chunk_scan(*args):
-            calls.append(1)
-            return real.gdn_chunk_scan(*args)
-
-    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    calls = _record_ops(monkeypatch, "gdn_chunk_scan")
     q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
     s0 = torch.randn(1, 2, 128, 128, device="cuda")
     run = mq.torch_chunk_gated_delta_rule
@@ -622,7 +623,7 @@ backward_only = pytest.mark.skipif(not (torch.cuda.is_available() and gated_delt
 
 
 @backward_only
-@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel"])
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel", "strong"])
 @pytest.mark.parametrize("L,H,K,V", [(65, 4, 128, 128), (300, 4, 64, 128), (130, 4, 128, 48), (1000, 4, 128, 128),
                                      (300, 32, 128, 128), (4096, 4, 128, 128)],
                          ids=["65", "300-K64", "130-V48", "1000", "VS32-H32", "4096"])
@@ -711,16 +712,7 @@ def test_tiny_qwen35_training(monkeypatch, checkpointing):
             gradient_checkpointing_kwargs={"use_reentrant": checkpointing == "reentrant"})
     model.train()
     ids = torch.randint(0, 512, (2, 140), device="cuda", generator=torch.Generator("cuda").manual_seed(6))
-    calls = []
-    real = gated_delta._ops
-
-    class Recorder:
-        def __getattr__(self, name):
-            if name == "gdn_chunk_scan_backward":
-                calls.append(name)
-            return getattr(real, name)
-
-    monkeypatch.setattr(gated_delta, "_ops", Recorder())
+    calls = _record_ops(monkeypatch, "gdn_chunk_scan_backward")
 
     def step():
         model.zero_grad(set_to_none=True)
@@ -735,7 +727,10 @@ def test_tiny_qwen35_training(monkeypatch, checkpointing):
     assert abs(ours[0] - stock[0]) < 2e-3
     for n, g in ours[1].items():
         r = stock[1][n].double()
-        assert ((g.double() - r).norm() / r.norm().clamp_min(1e-30)).item() < 2e-2, n
+        # A_log / dt_bias: sums of dg g over all tokens with cancellation up to 330x here (strong decays, g to -27): on
+        # layer 0's inputs the reference itself is 5.9e-3 from the fp64 rule there, our path 5.4e-3 (2080 Ti, c2)
+        bound = 5e-2 if n.endswith(("linear_attn.A_log", "linear_attn.dt_bias")) else 2e-2
+        assert ((g.double() - r).norm() / r.norm().clamp_min(1e-30)).item() < bound, n
 
 
 @backward_only
@@ -831,3 +826,204 @@ def test_tiny_qwen35_optimizer_steps(monkeypatch):
             losses.append(loss.item())
         curves.append(losses)
     assert all(abs(a - b) < 1e-3 for a, b in zip(*curves)), curves
+
+
+# ---------------------------------------------------------------------------
+# The prologue and the intra-chunk phase in one op (P6.10 c, c2): gdn_chunk_prep and its analytic backward
+# ---------------------------------------------------------------------------
+
+prep_only = pytest.mark.skipif(not (torch.cuda.is_available() and gated_delta._HAS_PREP),
+                               reason="needs CUDA and the prep op")
+
+
+def _prep_lines(q, k, v, g, beta, dtype=torch.float32):
+    """transformers' lines of the prologue and the intra-chunk phase (5.20.2) in `dtype`, as the op's outputs (q~, k~,
+    w, u, d, A), plus M (the strictly lower UT system the unitriangular solve uses)"""
+    F = torch.nn.functional
+    L, K = q.shape[1], q.shape[-1]
+    q, k, v, beta, g = [x.transpose(1, 2).to(dtype) for x in (q, k, v, beta, g)]
+    q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+    k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    q = q * K ** -0.5
+    pad = (64 - L % 64) % 64
+    q, k, v = (F.pad(x, (0, 0, 0, pad)) for x in (q, k, v))
+    beta, g = (F.pad(x, (0, pad)) for x in (beta, g))
+    vb, kb = v * beta.unsqueeze(-1), k * beta.unsqueeze(-1)
+    q, k, kb, vb = [x.reshape(x.shape[0], x.shape[1], -1, 64, x.shape[-1]) for x in (q, k, kb, vb)]
+    c = g.reshape(g.shape[0], g.shape[1], -1, 64).cumsum(-1)
+    upper = torch.ones(64, 64, dtype=torch.bool, device=q.device).triu(1)
+    pw = (c.unsqueeze(-1) - c.unsqueeze(-2)).masked_fill(upper, float("-inf")).exp()
+    ut = (kb @ k.transpose(-1, -2)) * pw
+    A = (q @ k.transpose(-1, -2)) * pw
+    u = torch.linalg.solve_triangular(ut, vb, upper=False, unitriangular=True)
+    w = torch.linalg.solve_triangular(ut, kb * c.exp().unsqueeze(-1), upper=False, unitriangular=True)
+    qt, kt = q * c.exp().unsqueeze(-1), k * (c[..., -1:] - c).exp().unsqueeze(-1)
+    return (qt, kt, w, u, c[..., -1].exp(), A), ut.tril(-1)
+
+
+def _rule64(q, k, v, g, beta, s0):
+    """The chunk rule in fp64 from transformers' lines (the truth the fp32 paths are measured against): output
+    [B, L, H, V] and final state"""
+    (qt, kt, w, u, d, A), _ = _prep_lines(q, k, v, g, beta, torch.float64)
+    S, outs = s0.double(), []
+    for c in range(w.shape[2]):
+        vn = u[:, :, c] - w[:, :, c] @ S
+        outs.append(qt[:, :, c] @ S + A[:, :, c] @ vn)
+        S = d[:, :, c, None, None] * S + kt[:, :, c].transpose(-1, -2) @ vn
+    return torch.stack(outs, 2).flatten(2, 3)[:, :, :q.shape[1]].transpose(1, 2), S
+
+
+def _per_head(a, b, head=1):
+    """the largest relative Frobenius error over the heads (dimension `head`)"""
+    dims = tuple(i for i in range(a.dim()) if i != head)
+    err = (a.double() - b.double()).pow(2).sum(dims).sqrt()
+    return (err / b.double().pow(2).sum(dims).sqrt().clamp_min(1e-30)).max().item()
+
+
+def _prep(q, k, v, g, beta):
+    return torch.ops.flash_attn_legacy.gdn_chunk_prep(q, k, v, g, beta, q.shape[-1] ** -0.5)
+
+
+@prep_only
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel", "strong"])
+@pytest.mark.parametrize("B,L,H,K,V", [(1, 1, 1, 128, 128), (2, 63, 3, 128, 128), (1, 64, 2, 64, 128),
+                                       (2, 65, 3, 128, 48), (1, 100, 2, 48, 16), (2, 130, 32, 128, 128),
+                                       (1, 4096, 16, 128, 128)],
+                         ids=["1tok", "63", "64-K64", "65-V48", "K48-V16", "H32", "4096"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=["fp16", "bf16", "fp32"])
+def test_prep_op(regime, B, L, H, K, V, dtype):
+    """The op against transformers' lines (from the same inputs) in fp64: q~, k~, w, u, d, A and T each within 3x the
+    fp32 lines' own error per head, or 5e-7 (T: 1e-6), whichever is larger (w and u are T X, the explicit inverse,
+    where the lines substitute: up to 2.2x their error with nearly parallel keys); A exactly 0 above the diagonal; all
+    finite; run-to-run bitwise."""
+    if L == 4096 and dtype != torch.float16:
+        pytest.skip("4096 tokens: fp16 only")
+    q, k, v, g, beta = _gdn_inputs(B, L, H, K, V, dtype, regime)
+    got = _prep(q, k, v, g, beta)
+    (want32, M32), (want64, M64) = (_prep_lines(q, k, v, g, beta, t) for t in (torch.float32, torch.float64))
+    eye = torch.eye(64, dtype=torch.float64, device="cuda")
+    want32 += (torch.linalg.solve_triangular(eye.float() + M32, eye.float().expand_as(M32), upper=False),)
+    want64 += (torch.linalg.inv(eye + M64),)
+    for name, a, b32, b64 in zip(("q~", "k~", "w", "u", "d", "A", "T"), got, want32, want64):
+        assert a.shape == b32.shape and a.dtype == torch.float32 and torch.isfinite(a).all(), name
+        err, ref = _per_head(a, b64), _per_head(b32, b64)
+        assert err <= max(3 * ref, 1e-6 if name == "T" else 5e-7), f"{name}: {err:.1e} (fp32 lines {ref:.1e})"
+    assert (got[5].triu(1) == 0).all(), "A above the diagonal"
+    assert all(torch.equal(a, b) for a, b in zip(got, _prep(q, k, v, g, beta))), "not deterministic"
+
+
+@prep_only
+def test_prep_layouts():
+    """Non-contiguous q / k / v (slices of a wider projection; a non-unit last stride, copied by the op), and g / beta
+    in other dtypes than the layer's (cast by the op): the same outputs."""
+    q, k, v, g, beta = _gdn_inputs(2, 130, 4, 128, 128, torch.float16, "fast")
+    want = _prep(q.contiguous(), k.contiguous(), v.contiguous(), g, beta)
+    wide = torch.cat([q, k, v], -1)
+    views = [(wide[..., :128], wide[..., 128:256], wide[..., 256:])]
+    views.append(tuple(x.transpose(-1, -2).contiguous().transpose(-1, -2) for x in (q, k, v)))  # stride(-1) != 1
+    for qv, kv, vv in views:
+        assert all(torch.equal(a, b) for a, b in zip(_prep(qv, kv, vv, g, beta), want))
+    got = _prep(q, k, v, g.half(), beta.float())
+    for name, a, b in zip(("q~", "k~", "w", "u", "d", "A"), got[:6], _prep_lines(q, k, v, g.half(), beta)[0]):
+        assert _per_head(a, b) < 1e-5, name
+
+
+@prep_only
+def test_prep_routing(monkeypatch):
+    """_chunk_scan takes the op by default; FLASH_ATTN_LEGACY_GDN_PREP=0 and q / k / v of mixed dtypes take the
+    PyTorch lines (still the scan): the same results within fp32 noise."""
+    reference = _reference_chunk()
+    calls = _record_ops(monkeypatch, "gdn_chunk_prep", "gdn_chunk_scan")
+    q, k, v, g, beta = _gdn_inputs(1, 130, 4, 128, 128, torch.float32, "slow")
+    kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True)
+    on = gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)
+    assert calls == ["gdn_chunk_prep", "gdn_chunk_scan"]
+    for case in ("env", "dtypes"):
+        calls.clear()
+        with monkeypatch.context() as m:
+            if case == "env":
+                m.setenv("FLASH_ATTN_LEGACY_GDN_PREP", "0")
+                off = gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)
+            else:
+                off = gated_delta._chunk_scan(reference, q, k.double(), v, g, beta, **kw)
+        assert calls == ["gdn_chunk_scan"], case
+        assert _per_head(on[0], off[0], 2) < 1e-5 and _per_head(on[1], off[1]) < 1e-5, case
+
+
+@prep_only
+def test_prep_64bit_offsets():
+    """q / k / v of a second batch row more than 2^31 elements into one buffer: the op's input offsets are 64-bit."""
+    torch.cuda.empty_cache()  # what the caching allocator holds counts as used
+    free, _ = torch.cuda.mem_get_info()
+    if free < 6 * 2**30:
+        pytest.skip("needs ~5 GB of free GPU memory")
+    q, k, v, g, beta = _gdn_inputs(2, 70, 2, 128, 128, torch.float16, "fast")
+    big = torch.empty(2**31 + 3 * 70 * 2 * 128, dtype=torch.float16, device="cuda")
+    n = 70 * 2 * 128
+    for i, t in enumerate((q, k, v)):  # batch row 0 at the start, row 1 past 2^31
+        big[i * n:(i + 1) * n].copy_(t[0].flatten())
+        big[2**31 + i * n:2**31 + (i + 1) * n].copy_(t[1].flatten())
+    views = [big.as_strided((2, 70, 2, 128), (2**31, 256, 128, 1), i * n) for i in range(3)]
+    got = _prep(*views, g, beta)
+    want = _prep(q, k, v, g, beta)
+    del big, views
+    assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@prep_only
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel", "strong"])
+def test_prep_backward(regime):
+    """The op's analytic backward against autograd of transformers' lines (fp32, and fp64 for the reference itself),
+    all six outputs' gradients random, and subsets of them (the others None): every input's gradient within 1e-4
+    relative per head. T is non-differentiable; double backward raises."""
+    B, L, H = 2, 150, 3
+    inputs = [t.requires_grad_(True) for t in _gdn_inputs(B, L, H, 128, 128, torch.float32, regime)]
+    out = _prep(*inputs)
+    assert not out[6].requires_grad, "T must be non-differentiable"
+    torch.manual_seed(2)
+    douts = [torch.randn_like(o) for o in out[:6]]
+    for used in ((0, 1, 2, 3, 4, 5), (3,), (2, 5), (0, 1, 4)):
+        got = torch.autograd.grad([out[i] for i in used], inputs, [douts[i] for i in used], retain_graph=True,
+                                  allow_unused=True)
+        for dtype, bound in ((torch.float32, 1e-4), (torch.float64, 1e-4)):
+            lines = _prep_lines(*inputs, dtype)[0]
+            want = torch.autograd.grad([lines[i] for i in used], inputs, [douts[i].to(dtype) for i in used],
+                                       allow_unused=True)
+            for name, a, b in zip(("q", "k", "v", "g", "beta"), got, want):
+                if b is None or not b.abs().max():
+                    assert a is None or not a.abs().max(), f"{name} {used}"
+                    continue
+                err = _per_head(a, b, 2)
+                assert err < bound, f"d{name} {used} vs {dtype}: {err:.1e}"
+    with pytest.raises(RuntimeError, match="gdn_chunk_prep: double backward"):
+        torch.autograd.grad(_prep(*inputs)[0].sum(), inputs[0], create_graph=True)
+
+
+@prep_only
+@pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="torch >= 2.4 required")
+def test_prep_opcheck():
+    q, k, v, g, beta = _gdn_inputs(1, 70, 2, 64, 48, torch.float16, "fast")
+    args = [t.float().requires_grad_(True) for t in (q, k, v, g, beta)]
+    torch.library.opcheck(torch.ops.flash_attn_legacy.gdn_chunk_prep.default, (q, k, v, g, beta, 0.125),
+                          test_utils=("test_schema", "test_faketensor"))
+    torch.library.opcheck(torch.ops.flash_attn_legacy.gdn_chunk_prep.default, (*args, 0.125),
+                          test_utils=("test_autograd_registration", "test_aot_dispatch_dynamic"))
+
+
+@prep_only
+def test_prep_compile():
+    """torch.compile of the whole function (aot_eager, one graph: Triton has no code for these GPUs), forward and
+    backward, against eager: the same within fp32 noise."""
+    reference = _reference_chunk()
+    a = [t.requires_grad_(True) for t in _gdn_inputs(1, 130, 2, 128, 128, torch.float32, "slow")]
+
+    def fn(q, k, v, g, beta):
+        o, s = gated_delta._chunk_scan(reference, q, k, v, g, beta, output_final_state=True,
+                                       use_qk_l2norm_in_kernel=True)
+        return (o * o).sum() + s.sum()
+
+    eager = torch.autograd.grad(fn(*a), a)
+    torch._dynamo.reset()
+    compiled = torch.autograd.grad(torch.compile(fn, backend="aot_eager", fullgraph=True)(*a), a)
+    for name, x, y in zip(("q", "k", "v", "g", "beta"), compiled, eager):
+        assert _per_head(x, y, 2) < 1e-5, name

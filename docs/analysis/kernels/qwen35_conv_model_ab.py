@@ -1,7 +1,8 @@
 """P6.10 b A/B, one process per run: Qwen3.5-2B fp16 on our attention, prefill of 4096 tokens, generate 2048 + 64
 (greedy, 64 forced) and a LoRA step at 1024 tokens (peft r16 on the projections, gradient checkpointing, fp16
-autocast, forward + backward), wall clock medians after a warm-up. A: FLASH_ATTN_LEGACY_CONV1D=0 (transformers'
-reference conv), B: our kernels. Prints one JSON line.
+autocast, forward + backward), wall clock medians after a warm-up, and the peak memory of a prefill and of a step.
+The arms are set by the caller's environment (P6.10 b: FLASH_ATTN_LEGACY_CONV1D=0, transformers' reference conv,
+against our kernels; c1 / c3: FLASH_ATTN_LEGACY_GDN_SCAN=0; c2: FLASH_ATTN_LEGACY_GDN_PREP=0). Prints one JSON line.
 
 Usage: python docs/analysis/kernels/qwen35_conv_model_ab.py LABEL (NO_LORA=1: prefill and generate only)
 """
@@ -39,6 +40,9 @@ with torch.inference_mode():
     decode = lambda: model.generate(prompt, max_new_tokens=64, min_new_tokens=64, do_sample=False)  # noqa: E731
     prefill(), decode()
     res["prefill_ms"], res["generate_ms"] = timed(prefill, 3), timed(decode, 3)
+    torch.cuda.reset_peak_memory_stats()
+    prefill()
+    res["prefill_peak_mib"] = round(torch.cuda.max_memory_allocated() / 2**20)
 
 import os  # noqa: E402
 
@@ -67,5 +71,8 @@ def step():
 
 step()
 res["lora_ms"] = timed(step, 3)
+torch.cuda.reset_peak_memory_stats()
+step()
+res["lora_peak_mib"] = round(torch.cuda.max_memory_allocated() / 2**20)
 res["fallbacks"] = flash_attn_legacy.fallback_stats()
 print(json.dumps(res))

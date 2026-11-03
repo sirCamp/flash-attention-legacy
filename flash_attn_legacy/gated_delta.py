@@ -16,10 +16,12 @@ kernel in place (a newer fla / Triton that compiles it); a guard already install
 
 The chunk function also runs the reference with its sequential scan on our kernel (P6.10 c1 / c3,
 docs/analysis/kernels/qwen35_delta_rule.md: torch.ops.flash_attn_legacy.gdn_chunk_scan, with its backward as a
-reverse scan; the function 1.4-3.4x faster at 4k tokens, forward + backward 5-8x on the P100) wherever `fla`'s chunk
-does not run, for the reference's supported arguments; only for the reference source it was copied from
-(transformers 5.20.2, by fingerprint: another version runs the reference, with a warning). FLASH_ATTN_LEGACY_GDN_SCAN=0
-opts out. torch.func transforms and forward-mode AD are not supported on this path (an old-style autograd Function).
+reverse scan; the function 1.4-3.4x faster at 4k tokens, forward + backward 5-8x on the P100) and its prologue and
+intra-chunk phase in one kernel (c2: gdn_chunk_prep, with an analytic backward in PyTorch; another ~2x for inference)
+wherever `fla`'s chunk does not run, for the reference's supported arguments; only for the reference source it was
+copied from (transformers 5.20.2, by fingerprint: another version runs the reference, with a warning).
+FLASH_ATTN_LEGACY_GDN_SCAN=0 opts out; FLASH_ATTN_LEGACY_GDN_PREP=0 keeps the reference's lines for the prologue and
+the intra-chunk phase. torch.func transforms and forward-mode AD are not supported on this path (an old-style autograd Function).
 Like the guard, the wrapper is process-wide for the modeling module: other models of its classes get it too.
 
 The layers' depthwise causal conv1d (P6.10 b, docs/analysis/kernels/qwen35_conv1d.md): transformers' reference
@@ -90,6 +92,9 @@ _HAS_SCAN_OP = hasattr(_ops, "gdn_chunk_scan")  # an extension built before P6.1
 # ... and its backward (c3): gradient calls take the scan too
 _HAS_SCAN_AUTOGRAD = (_HAS_SCAN_OP and hasattr(_ops, "gdn_chunk_scan_backward")
                       and hasattr(torch.library, "register_autograd"))
+# ... and the prologue and intra-chunk phase in one op (c2); FLASH_ATTN_LEGACY_GDN_PREP=0 keeps their PyTorch lines
+_PREP_ENV = "FLASH_ATTN_LEGACY_GDN_PREP"
+_HAS_PREP = _HAS_SCAN_AUTOGRAD and hasattr(_ops, "gdn_chunk_prep")
 # sha1 prefixes of the reference our copy below follows (and of its l2norm): transformers 5.20.2, the same in
 # modeling_qwen3_5 / qwen3_5_moe / qwen3_next / olmo_hybrid. Another source: the reference itself runs.
 _REFERENCE_SHA1 = {"d2f00f2b07183377"}
@@ -132,7 +137,8 @@ def _chunk_scan(reference, query, key, value, g, beta, chunk_size=64, initial_st
     """transformers' torch_chunk_gated_delta_rule (5.20.2, _REFERENCE_SHA1) with its sequential scan on our kernel
     (gdn_chunk_scan: the state at each chunk's start and the corrected values; the outputs then two batched matmuls,
     parallel over the chunks). kernel=False runs the reference's own loop instead (a test checks that this copy is then
-    bitwise the reference). The prologue and the intra-chunk phase are the reference's lines."""
+    bitwise the reference). The prologue and the intra-chunk phase are one op (gdn_chunk_prep, c2), or the reference's
+    lines (kernel=False, FLASH_ATTN_LEGACY_GDN_PREP=0, q / k / v of mixed dtypes)."""
     F = torch.nn.functional
     l2norm = reference.__globals__["l2norm"]
     initial_dtype = query.dtype
@@ -140,49 +146,59 @@ def _chunk_scan(reference, query, key, value, g, beta, chunk_size=64, initial_st
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
     padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)
-    decay = g
-    query, key, value, beta, decay = [
-        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
-        for x in (query, key, value, beta, decay)
-    ]
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    scaling = query.shape[-1] ** -0.5
-    query = query * scaling
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
-    beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
-    total_sequence_length = sequence_length + pad_size
-    num_chunks = total_sequence_length // chunk_size
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, k_beta, v_beta)
-    ]
-    decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
-    strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
-    cum_decay = decay.cumsum(dim=3)
-    pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
-    pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf"))
-    pairwise_decay = pairwise_decay.exp()
-    ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
-    intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
-    decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
-    new_values = torch.linalg.solve_triangular(ut_system, v_beta, upper=False, unitriangular=True)
-    k_cumdecay = torch.linalg.solve_triangular(ut_system, decayed_k_beta, upper=False, unitriangular=True)
-    if kernel:  # the reference keeps these alive to its end; ours frees them before the scan's own buffers
-        del ut_system, pairwise_decay, decayed_k_beta, k_beta, v_beta
+    prep = (kernel and _HAS_PREP and use_qk_l2norm_in_kernel and chunk_size == 64
+            and os.environ.get(_PREP_ENV) != "0" and key.dtype == query.dtype and value.dtype == query.dtype)
+    if prep:
+        # c2: the prologue and the intra-chunk phase in one op (fp32, row-major; its backward: _prep_backward)
+        query, key, k_cumdecay, new_values, chunk_decay, intra_chunk_attn, _ = _ops.gdn_chunk_prep(
+            query, key, value, g, beta, k_head_dim ** -0.5)
+        num_chunks = chunk_decay.shape[-1]
+        chunk_decay = chunk_decay[..., None, None]
+    else:
+        decay = g
+        query, key, value, beta, decay = [
+            x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+            for x in (query, key, value, beta, decay)
+        ]
+        if use_qk_l2norm_in_kernel:
+            query = l2norm(query, dim=-1, eps=1e-6)
+            key = l2norm(key, dim=-1, eps=1e-6)
+        scaling = query.shape[-1] ** -0.5
+        query = query * scaling
+        pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+        query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
+        beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
+        total_sequence_length = sequence_length + pad_size
+        num_chunks = total_sequence_length // chunk_size
+        v_beta = value * beta.unsqueeze(-1)
+        k_beta = key * beta.unsqueeze(-1)
+        query, key, k_beta, v_beta = [
+            x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, k_beta, v_beta)
+        ]
+        decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
+        strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
+        cum_decay = decay.cumsum(dim=3)
+        pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
+        pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf"))
+        pairwise_decay = pairwise_decay.exp()
+        ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
+        intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
+        decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
+        new_values = torch.linalg.solve_triangular(ut_system, v_beta, upper=False, unitriangular=True)
+        k_cumdecay = torch.linalg.solve_triangular(ut_system, decayed_k_beta, upper=False, unitriangular=True)
+        if kernel:  # the reference keeps these alive to its end; ours frees them before the scan's own buffers
+            del ut_system, pairwise_decay, decayed_k_beta, k_beta, v_beta
+        query = query * cum_decay.exp().unsqueeze(-1)
+        key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
+        chunk_decay = cum_decay[..., -1].exp()[..., None, None]
     if initial_state is None:
         last_recurrent_state = torch.zeros(recurrent_state_shape, dtype=new_values.dtype, device=new_values.device)
     else:
         last_recurrent_state = initial_state.to(new_values)
-    query = query * cum_decay.exp().unsqueeze(-1)
-    key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
-    chunk_decay = cum_decay[..., -1].exp()[..., None, None]
     if kernel:
-        # solve_triangular's results are column-major: the op copies them to rows (transient); under autograd it keeps
-        # what its backward needs (w, k~, d and its outputs h, v_new), w being solve_triangular's own saved result
+        # solve_triangular's results are column-major: the op copies them to rows (transient; the prep op's are rows);
+        # under autograd it keeps what its backward needs (w, k~, d and its outputs h, v_new), w being the producer's
+        # own saved result
         states, v_new, last_recurrent_state = _ops.gdn_chunk_scan(
             k_cumdecay, new_values, key, chunk_decay[..., 0, 0], last_recurrent_state)
         del k_cumdecay, new_values
@@ -449,3 +465,116 @@ def _scan_backward(ctx, dh, dv_new, d_final):
 if _HAS_SCAN_AUTOGRAD:
     torch.library.register_autograd("flash_attn_legacy::gdn_chunk_scan", _scan_backward,
                                     setup_context=_scan_setup_context)
+
+
+# Autograd of torch.ops.flash_attn_legacy.gdn_chunk_prep (q, k, v, g, beta, scale) -> (q~, k~, w, u, d, A, T): the
+# analytic backward of the prologue and the intra-chunk phase (docs/analysis/kernels/qwen35_delta_rule.md section 8,
+# checked against autograd of the reference's lines in qwen35_delta_c2_backward.py), from the inputs and the saved w and
+# T; u = T (beta v) is recomputed. In the op's padded chunk layout: a padded row's dc reaches the real tokens through
+# the cumulative sum's reverse.
+def _chunks(x, nc):
+    """[B, L, H] or [B, L, H, X] in any dtype -> fp32 [B, H, NC, 64(, X)], zero-padded (the op's layout)"""
+    x = x.transpose(1, 2).to(torch.float32)
+    pad = nc * 64 - x.shape[2]
+    if x.dim() == 3:
+        return torch.nn.functional.pad(x, (0, pad)).reshape(x.shape[0], x.shape[1], nc, 64)
+    return torch.nn.functional.pad(x, (0, 0, 0, pad)).reshape(x.shape[0], x.shape[1], nc, 64, x.shape[-1])
+
+
+def _unchunk(x, like):
+    """fp32 [B, H, NC, 64(, X)] -> `like`'s [B, L, H(, X)] and dtype"""
+    B, H, nc = x.shape[:3]
+    x = x.reshape(B, H, nc * 64, *x.shape[4:])[:, :, :like.shape[1]]
+    return x.transpose(1, 2).to(like.dtype)
+
+
+def _prep_grads(q, k, v, g, beta, w, T, scale, dqt, dkt, dw, du, dd, dA):
+    """(dq, dk, dv or None, dg, dbeta) from the gradients of (q~, k~, w, u, d, A), each possibly None (zeros)"""
+    nc = T.shape[2]
+    qc, kc, vc, gc, bc = (_chunks(x, nc) for x in (q, k, v, g, beta))
+    rq = torch.rsqrt((qc * qc).sum(-1, keepdim=True) + 1e-6)
+    rk = torch.rsqrt((kc * kc).sum(-1, keepdim=True) + 1e-6)
+    qn, kn = qc * (rq * scale), kc * rk
+    c = gc.double().cumsum(-1)  # in fp64, as the op: its differences, under strong decays (gdn_prep.cu)
+    ec, el = c.float().exp(), (c[..., -1:] - c).float().exp()
+    low = torch.ones(64, 64, dtype=torch.bool, device=q.device).tril()
+    P = (c.unsqueeze(-1) - c.unsqueeze(-2)).float().masked_fill(~low, float("-inf")).exp()
+    c_end = c[..., -1].float()
+    del c
+    Tt = T.transpose(-1, -2)
+    dc, dqn, dkn, dbeta = torch.zeros_like(gc), torch.zeros_like(qn), torch.zeros_like(kn), torch.zeros_like(bc)
+    dv = dM = E = None
+    # u = T (beta v), w = T (beta e^c kn): the right-hand sides' gradients T^T dY; M's -T^T dY Y^T (below)
+    if du is not None:
+        u = torch.matmul(T, vc * bc.unsqueeze(-1))
+        dvb = torch.matmul(Tt, du)
+        dv = dvb * bc.unsqueeze(-1)
+        dbeta += (dvb * vc).sum(-1)
+        dM = torch.matmul(du, u.transpose(-1, -2))
+        del u, dvb
+    if dw is not None:
+        dkbe = torch.matmul(Tt, dw)
+        t = (dkbe * kn).sum(-1) * ec
+        dbeta += t
+        dc += t * bc
+        dkn += dkbe * (bc * ec).unsqueeze(-1)
+        del dkbe
+        dww = torch.matmul(dw, w.transpose(-1, -2))
+        dM = dww if dM is None else dM + dww
+        del dww
+    if dM is not None:  # M_ij = beta_i kn_i.kn_j P_ij (j < i)
+        dM = -torch.matmul(Tt, dM).tril(-1)
+        KK = torch.matmul(kn, kn.transpose(-1, -2))
+        S = dM * P * bc.unsqueeze(-1)
+        dbeta += (dM * P * KK).sum(-1)
+        dkn += torch.matmul(S, kn) + torch.matmul(S.transpose(-1, -2), kn)
+        E = S * KK  # dM_ij M_ij: P's share, below
+        del dM, KK, S
+    if dA is not None:  # A_ij = qn_i.kn_j P_ij (j <= i)
+        R = dA * P
+        dqn += torch.matmul(R, kn)
+        dkn += torch.matmul(R.transpose(-1, -2), qn)
+        RA = R * torch.matmul(qn, kn.transpose(-1, -2))
+        E = RA if E is None else E + RA
+        del R, RA
+    if E is not None:  # P_ij = exp(c_i - c_j)
+        dc += E.sum(-1) - E.sum(-2)
+        del E
+    if dqt is not None:  # q~ = qn e^c
+        dqn += dqt * ec.unsqueeze(-1)
+        dc += (qn * dqt).sum(-1) * ec
+    if dkt is not None:  # k~ = kn e^(c_63 - c)
+        dkn += dkt * el.unsqueeze(-1)
+        kdk = (kn * dkt).sum(-1) * el
+        dc -= kdk
+        dc[..., -1] += kdk.sum(-1)
+    if dd is not None:  # d = e^(c_63)
+        dc[..., -1] += dd * c_end.exp()
+    dg = dc.flip(-1).cumsum(-1).flip(-1)  # the cumulative sum's backward
+    # transformers' l2norm, x r with r = rsqrt(|x|^2 + eps): dx = r dx^ - r^3 x (x . dx^); q's scale
+    dq = scale * (rq * dqn - rq ** 3 * qc * (qc * dqn).sum(-1, keepdim=True))
+    dk = rk * dkn - rk ** 3 * kc * (kc * dkn).sum(-1, keepdim=True)
+    return (_unchunk(dq, q), _unchunk(dk, k), None if dv is None else _unchunk(dv, v), _unchunk(dg, g),
+            _unchunk(dbeta, beta))
+
+
+def _prep_setup_context(ctx, inputs, output):
+    q, k, v, g, beta, scale = inputs
+    w, T = output[2], output[6]
+    ctx.scale = scale
+    ctx.mark_non_differentiable(T)
+    ctx.set_materialize_grads(False)  # unused outputs' gradients stay None
+    ctx.save_for_backward(q, k, v, g, beta, w, T)
+
+
+def _prep_backward(ctx, dqt, dkt, dw, du, dd, dA, dT):
+    if torch.is_grad_enabled():
+        raise RuntimeError("flash_attn_legacy gdn_chunk_prep: double backward is not supported")
+    q, k, v, g, beta, w, T = ctx.saved_tensors
+    grads = _prep_grads(q, k, v, g, beta, w, T, ctx.scale, dqt, dkt, dw, du, dd, dA)
+    return tuple(x if need else None for x, need in zip(grads, ctx.needs_input_grad[:5])) + (None,)
+
+
+if _HAS_PREP:
+    torch.library.register_autograd("flash_attn_legacy::gdn_chunk_prep", _prep_backward,
+                                    setup_context=_prep_setup_context)

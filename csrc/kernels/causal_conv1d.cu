@@ -22,9 +22,7 @@
 // GPU, the SFU's exp in SiLU' may). No arch-specific code.
 // ============================================================================
 
-#include "flash_attn_common.h"
-
-#include <cuda_bf16.h>
+#include "flash_attn_common.h"  // to_f / from_f
 
 namespace flash_attn_legacy {
 
@@ -34,16 +32,6 @@ namespace {
 // 2.01x, 16: 1.83x and a slower dW pass)
 constexpr int kRun = 32;
 constexpr int kThreads = 128;   // channel groups per block
-
-template <typename T> __device__ __forceinline__ float to_f(T v);
-template <> __device__ __forceinline__ float to_f<half>(half v) { return __half2float(v); }
-template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
-template <> __device__ __forceinline__ float to_f<float>(float v) { return v; }
-
-template <typename T> __device__ __forceinline__ T from_f(float v);
-template <> __device__ __forceinline__ half from_f<half>(float v) { return __float2half_rn(v); }
-template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
-template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
 
 // N consecutive elements at p as fp32 (N * sizeof(T) == 16: one 16-byte load; N == 1: one element)
 template <typename T, int N>
