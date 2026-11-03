@@ -3,10 +3,12 @@ FP16 linear layers on the P100 (compute capability 6.0): HFMA2 with chunked accu
 
 torch runs FP16 nn.Linear on SM 6.0 through cuBLAS with FP32 accumulation, at about half the card's HFMA2 rate. The
 kernel (csrc/kernels/linear_pascal.cu, torch.ops.flash_attn_legacy.linear) multiplies FP16 pairs along K and folds
-each lane into FP32 every 64 K elements: the stock FP16 accuracy, faster from a few hundred rows on. Off by default:
+each lane into FP32 every 64 K elements: the stock FP16 accuracy, faster from a few hundred rows on. FP32 tensors
+under FP16 autocast (the usual mixed-precision training recipe) are cast to FP16 as autocast casts them for F.linear.
+Off by default:
 
     fused_linear(x, W, bias)      F.linear(x, W, bias) on the kernel when it applies, else F.linear itself
-    patch_linear(model)           the FP16 nn.Linear modules of a model on an SM 6.0 GPU run fused_linear
+    patch_linear(model)           the FP16 / FP32 nn.Linear modules of a model on an SM 6.0 GPU run fused_linear
     FLASH_ATTN_LEGACY_LINEAR=1    patch_linear on HF models loaded with attn_implementation="flash_attn_legacy"
 
 The kernel is real SM 6.0 code only: FLASH_ATTN_LEGACY_FORCE_ARCH does not apply (fp16 arithmetic runs at 1/64 of
@@ -23,6 +25,8 @@ from .utils import cuda_autocast_dtype, is_compiling
 
 # Fewer rows than this go to F.linear: decode and small batches, where cuBLAS is faster
 MIN_M = 128
+# patch_linear leaves layers with fewer inputs or outputs than this (one kernel tile) to F.linear
+MIN_FEATURES = 128
 _INT32 = 1 << 31
 _PLAIN_TYPES = (torch.Tensor, nn.Parameter)
 # The extension has the op (an extension built before P8 does not: fused_linear is then F.linear, with a warning)
@@ -66,7 +70,10 @@ def _fallback_reason(x, W, bias):
         return "linear_layout"
     if not x.is_cuda or any(t.device != x.device for t in tensors):
         return "linear_device"
-    if any(t.dtype != torch.float16 for t in tensors) or cuda_autocast_dtype() not in (None, torch.float16):
+    autocast = cuda_autocast_dtype()
+    # float16; under float16 autocast also float32 (cast to float16 in fused_linear, as autocast casts for F.linear)
+    dtypes = (torch.float16,) if autocast is None else (torch.float16, torch.float32)
+    if autocast not in (None, torch.float16) or any(t.dtype not in dtypes for t in tensors):
         return "linear_dtype"
     if not _sm60(x.device.index):
         return "linear_arch"
@@ -88,9 +95,15 @@ def _fallback_reason(x, W, bias):
 def fused_linear(x, W, bias=None):
     """F.linear(x, W, bias) (x [..., K], W [N, K], bias [N]) on the HFMA2 kernel of compute capability 6.0 GPUs.
 
+    Under float16 autocast, float32 inputs are cast to float16 first, as autocast casts them for F.linear (the
+    gradients flow back through the casts: float32 for float32 inputs). Unlike autocast, the cast of a weight is not
+    cached across calls: a weight used several times in one autocast region is cast each time (no fp16 copy kept
+    alive for the whole forward, which also suits gradient checkpointing).
+
     Falls back to F.linear itself (bitwise the stock result) when the kernel does not apply: not CUDA, not SM 6.0,
-    not float16 (or autocast to another dtype), fewer than MIN_M rows (decode), K % 8 != 0, non-contiguous,
-    misaligned or tensor-subclass inputs, beyond int32 offsets. The reasons are counted in fallback_stats(), except
+    dtypes other than float16 (float32 is accepted under float16 autocast) or autocast to another dtype, fewer than
+    MIN_M rows (decode), K % 8 != 0, non-contiguous, misaligned or tensor-subclass inputs (checked before the casts),
+    beyond int32 offsets. The reasons are counted in fallback_stats(), except
     the small-M one (the designed decode path) and not under torch.compile (this code only runs while tracing).
     Differentiable: dX on the kernel, dW and db stock; no double backward."""
     reason = _fallback_reason(x, W, bias)
@@ -101,6 +114,9 @@ def fused_linear(x, W, bias=None):
             _record_fallback(reason)
         return F.linear(x, W, bias)
     K = W.shape[1]
+    if x.dtype != torch.float16 or W.dtype != torch.float16 or (bias is not None and bias.dtype != torch.float16):
+        x, W = x.to(torch.float16), W.to(torch.float16)  # float32 under float16 autocast (_fallback_reason)
+        bias = bias.to(torch.float16) if bias is not None else None
     # The op takes and returns 2-D tensors (autograd sees those): the reshapes stay outside, so that in-place ops
     # on the output (activations) never modify a view created inside the op
     return _ops.linear(x.reshape(-1, K), W, bias).reshape(*x.shape[:-1], W.shape[0])
@@ -159,25 +175,31 @@ class _FusedLinear(nn.Linear):
 
     def forward(self, input):
         # decode (fewer than MIN_M rows) straight to F.linear: an HF decode step calls hundreds of these and is
-        # bound by the host, where fused_linear's checks cost 1-2% of the decode rate
-        if input.numel() < MIN_M * self.in_features:
+        # bound by the host, where fused_linear's checks cost 1-2% of the decode rate. So is an FP32 layer outside
+        # FP16 autocast (by design, not counted as a fallback)
+        if input.numel() < MIN_M * self.in_features or (
+                self.weight.dtype == torch.float32 and cuda_autocast_dtype() != torch.float16):
             return F.linear(input, self.weight, self.bias)
         return fused_linear(input, self.weight, self.bias)
 
 
 def _patchable(module):
     """An nn.Linear (exactly) with no instance forward (e.g. accelerate hooks), plain nn.Parameter weight / bias
-    (no DTensor / FSDP2 or other subclasses) and an FP16 weight on a compute capability 6.0 GPU."""
+    (no DTensor / FSDP2 or other subclasses), at least MIN_FEATURES inputs and outputs (narrower layers, such as
+    LoRA adapters, fill a fraction of the kernel's 128 x 128 tiles: left to cuBLAS) and an FP16 or FP32 weight (the
+    latter runs the kernel under FP16 autocast) on a compute capability 6.0 GPU."""
     weight, bias = module.weight, module.bias
     return (type(module) is nn.Linear and "forward" not in module.__dict__ and type(weight) is nn.Parameter
-            and (bias is None or type(bias) is nn.Parameter) and weight.dtype == torch.float16 and weight.is_cuda
+            and (bias is None or type(bias) is nn.Parameter) and weight.dtype in (torch.float16, torch.float32)
+            and min(module.in_features, module.out_features) >= MIN_FEATURES and weight.is_cuda
             and _sm60(weight.device.index))
 
 
 def patch_linear(model: nn.Module, enable: bool = True) -> int:
-    """Route the forward of every nn.Linear of `model` (itself included) with an FP16 weight on a compute
-    capability 6.0 GPU through fused_linear (the module's class becomes a private nn.Linear subclass);
-    enable=False restores them all. Subclasses of nn.Linear, modules that already carry an instance forward
+    """Route the forward of every nn.Linear of `model` (itself included) with an FP16 or FP32 weight and at least
+    MIN_FEATURES inputs and outputs on a compute capability 6.0 GPU through fused_linear (the module's class becomes
+    a private nn.Linear subclass); FP32 layers run the kernel under FP16 autocast only, F.linear outside it (not
+    counted as a fallback). enable=False restores them all. Subclasses of nn.Linear, modules that already carry an instance forward
     (e.g. accelerate hooks) and weights that are not plain nn.Parameter are left alone; so are other dtypes and
     GPUs (a no-op there), and everything when the extension has no linear op. Idempotent. Returns the number of
     patched modules after the call.

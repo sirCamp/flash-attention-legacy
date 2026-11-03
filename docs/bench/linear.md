@@ -244,6 +244,40 @@ evaluated with stock `F.linear` for both variants. Two seeds (data order and LoR
 Fused vs stock: |Δ val loss| ≤ 1.4e-4, the per-step training loss 2.3-2.6e-4 apart on average; the two seeds differ by 1e-3.
 Training 1.31x faster (169 layers patched; the fp32 adapters stay stock).
 
+## Full fine-tuning: FP32 weights under FP16 autocast
+
+The usual mixed-precision recipe (FP32 weights, `torch.autocast(dtype=torch.float16)`, `GradScaler`; HF Trainer
+`fp16=True`) reached the kernel in neither direction before P8.8: `patch_linear` took FP16 weights only. Now an FP32
+layer under FP16 autocast runs the kernel on the FP16 casts of x, W and bias (the casts autocast makes for
+`F.linear`), dX on the kernel, dW stock (bitwise autocast's); the gradients flow back through the casts in FP32.
+Layers narrower than 128 (LoRA adapters) stay stock. The casts are not cached across calls, unlike autocast's.
+
+Before (stock, `prof_split.py full32`, CUDA time of one step): cuBLAS 66.0% of Qwen2.5-0.5B at 2048 tokens, 78.6% of
+Qwen2.5-1.5B at 1024.
+
+Step, A (stock) and B (`patch_linear`) alternated in blocks of 4 steps, 32 steps each (`p88_ab.py`, a one-off script;
+gradient checkpointing, GradScaler):
+
+| model | tokens | optimizer | stock | patched | speedup |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 2048 | AdamW | 1486.0 ms | 1246.9 ms | 1.192x |
+| Qwen2.5-1.5B | 1024 | none (FP32 AdamW states do not fit 16 GB) | 1874.0 ms | 1474.5 ms | 1.271x |
+
+A 300-step full fine-tune (`ft_full.py`, a one-off script: Qwen2.5-0.5B, wikitext-2 train, 4 x 512 tokens, AdamW lr
+2e-5, warmup 20, clip 1.0), then the validation loss (64 x 512 tokens) with stock `F.linear` for both:
+
+| seed | val loss stock | val loss fused | skipped steps stock / fused | train time stock | train time fused |
+|---|---|---|---|---|---|
+| 0 | 2.52579 | 2.52515 | 3 / 3 | 377.9 s | 306.0 s |
+| 1 | 2.53598 | 2.53600 | 2 / 2 | 378.3 s | 306.2 s |
+
+Fused vs stock: |Δ val loss| ≤ 6.4e-4, the two seeds 1.0e-2 apart; the same GradScaler skips; 1.24x faster.
+
+Loss scaling matters more than for stock. The kernel multiplies in FP16, so unscaled gradients of ~1e-5 underflow in
+dX's products, where cuBLAS multiplies in FP32. On a toy MLP without a loss scale, dX was 14x stock's error against
+FP32; with a scale of 2^10 or 2^16 it was 2x, the kernel's usual ratio. `GradScaler`, which FP16 autocast training uses
+anyway, provides the scale.
+
 ## The flag path
 
 `FLASH_ATTN_LEGACY_LINEAR=1`, Qwen2.5-1.5B loaded with `attn_implementation="flash_attn_legacy"` (transformers 5.20.2): 0

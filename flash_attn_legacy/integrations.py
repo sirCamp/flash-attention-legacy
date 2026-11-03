@@ -82,7 +82,8 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
         "scaling (docs/PLAN.md P6.2)"),
     # -- linear layers (fused_linear, docs/PLAN.md P8): F.linear ------------
     "linear_device": FallbackReason("not on CUDA, or x / W / bias on different devices", "linear"),
-    "linear_dtype": FallbackReason("not float16, or autocast to another dtype", "linear"),
+    "linear_dtype": FallbackReason("not float16 (float32 runs under float16 autocast only), or autocast to "
+                                   "another dtype", "linear"),
     "linear_arch": FallbackReason("not a compute capability 6.0 GPU (the HFMA2 kernel is P100 only)",
                                   "linear"),
     "linear_shape": FallbackReason("K == 0, K % 8 != 0, or shapes F.linear handles itself", "linear"),

@@ -41,7 +41,7 @@ handle (listed in "What runs on the kernel").
 
 3. **Variable-length sequence support** (`flash_attn_varlen_func`) for packed batching without padding waste — useful for training with heterogeneous sequence lengths.
 
-4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.82x and LoRA training up to 1.33x faster on top of the attention kernels.
+4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.82x, LoRA training up to 1.33x and full fine-tuning 1.19x (with the AdamW step; 1.27x forward + backward) faster on top of the attention kernels.
 
 ## Supported Hardware
 
@@ -211,7 +211,9 @@ out = attn(x)  # [2, 1024, 512]
 ### FP16 linear layers on the P100 (opt-in)
 
 On the Tesla P100 (compute capability 6.0) torch runs FP16 matrix multiplications with FP32 accumulation at 4.6-8.7
-TFLOPS on real layer shapes, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model onto a
+TFLOPS on real layer shapes, below the card's FP32 rate. `patch_linear` moves every FP16 `nn.Linear` of a model (and
+every FP32 one while FP16 autocast is on: the usual mixed-precision training recipe; layers narrower than 128, such as
+LoRA adapters, stay on cuBLAS) onto a
 GEMM kernel that multiplies with paired FP16 FMAs (HFMA2) and folds the partial sums into FP32 every 64 elements: up
 to 13.7 TFLOPS (12.3 or more from 512 rows per call, except the smallest layers). It is **off by default** and a no-op on every other GPU:
 
@@ -233,12 +235,15 @@ the P100, against the same model with stock `F.linear` and our attention in both
 | Linear layers alone (80 shapes of Qwen2.5 0.5B-3B and Llama 3.1 8B, 128-8192 rows) | 1.77x geomean (1.54-2.76x from 512 rows) |
 | Prefill, 1k-8k tokens (TinyLlama, Qwen2.5-1.5B, Qwen3.5-2B / 4B, Llama-3.1-8B at 1k) | 1.35-1.82x |
 | LoRA training, 1k-4k tokens (the same models without Llama, which does not fit) | 1.22-1.33x, same loss |
+| Full fine-tuning, FP32 weights + FP16 autocast + GradScaler (Qwen2.5-0.5B 2k with AdamW; 1.5B 1k forward + backward, its FP32 AdamW states do not fit) | 1.19x / 1.27x, same loss |
 | Decode | unchanged (0.6-1.0% slower at batch 1 on 1-1.5B models: the patched layer's Python check) |
 
 Accuracy: perplexity on wikitext-2 within 0.001 of stock FP16 and of FP32. The kernel's element-wise error is about 4x
 stock's (8.7e-4 vs 2.1e-4); 0.21-0.42% of top-1 predictions differ from FP32, against 0.18-0.35% for stock FP16. A
 300-step LoRA fine-tune of Qwen2.5-0.5B reaches the same validation loss (±1.4e-4; two seeds differ by 1e-3), 1.31x
-faster.
+faster; a 300-step full fine-tune (FP32 weights, autocast, GradScaler) too (±6.4e-4; seeds 1e-2 apart; the same skipped
+steps), 1.24x faster. Training needs loss scaling (GradScaler), as FP16 training does anyway: the kernel multiplies in
+FP16, so tiny unscaled gradients underflow where cuBLAS's FP32 products do not.
 
 ### GPU compatibility check
 
@@ -431,7 +436,7 @@ python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / -
    - decoders with bidirectional attention (`is_causal=False`) and a static cache attend to the empty cache slots, exactly as HF's SDPA does
    - padded batches and static caches get FlashAttention-2's 2D `[batch, keys]` mask; models that index the attention mask as 4D (e.g. Doge) fail with it
    - Llama 4 (chunked attention) is not supported yet: transformers refuses chunked attention for backends whose name contains "flash"
-7. **P100 linear layers** (`patch_linear`, opt-in): SM 6.0 only, FP16 weights and inputs only (FP16 autocast does not cast them for it); slightly less accurate than stock FP16 on near-ties (see above); the weight gradient stays on cuBLAS; with `FLASH_ATTN_LEGACY_LINEAR=1` a model moved to the GPU after its first forward needs `patch_linear(model)` by hand
+7. **P100 linear layers** (`patch_linear`, opt-in): SM 6.0 only, FP16 tensors, or FP32 ones under FP16 autocast (bf16 and other autocast dtypes stay on `F.linear`); training needs a loss scale (GradScaler); slightly less accurate than stock FP16 on near-ties (see above); the weight gradient stays on cuBLAS; with `FLASH_ATTN_LEGACY_LINEAR=1` a model moved to the GPU after its first forward needs `patch_linear(model)` by hand
 
 ## Roadmap
 
@@ -452,7 +457,7 @@ python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / -
 - [x] BF16 / FP32 inference
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
 - [x] Short queries against a cache beyond 8 query rows per KV head (assisted / speculative decoding, MQA / GQA > 8:1): key splits and packed GQA rows in the forward (`docs/analysis/kernels/spec_decode_design.md`)
-- [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.82x, LoRA training up to 1.33x
+- [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.82x, LoRA training up to 1.33x, full fine-tuning 1.19x
 - [ ] Serving: one grid for mixed prefill + decode batches (they run today on the varlen kernel), a vLLM backend plugin
   (Turing only, see `docs/analysis/vllm_feasibility.md`)
 - [ ] Dropout and deterministic dQ in the kernel

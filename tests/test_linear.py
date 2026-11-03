@@ -457,6 +457,12 @@ int64_t hog_started() { return g_started == nullptr ? 0 : *(volatile int*)g_star
 # Autograd (register_autograd on the op: 2-D in and out, reshapes outside)
 # ---------------------------------------------------------------------------
 
+# (x, W, bias) dtypes under FP16 autocast, all but all-fp16 (bias None: no bias)
+_F16, _F32 = torch.float16, torch.float32
+_AUTOCAST_DTYPES = [(x, w, b) for x in (_F16, _F32) for w in (_F16, _F32) for b in (_F16, _F32, None)
+                    if (x, w, b) not in ((_F16, _F16, _F16), (_F16, _F16, None))]
+
+
 @sm60_only
 @pytest.mark.skipif(not hasattr(torch.library, "register_autograd"), reason="torch >= 2.4 required")
 class TestAutograd:
@@ -548,6 +554,80 @@ class TestAutograd:
             err = ((g.float() - r).norm() / r.norm()).item()
             assert err < 3e-3, f"{name}: relF vs fp32 {err:.2e}"
 
+    @pytest.mark.parametrize("x_dtype,w_dtype,b_dtype", _AUTOCAST_DTYPES,
+                             ids=["-".join(str(t).replace("torch.float", "") for t in d) for d in _AUTOCAST_DTYPES])
+    @pytest.mark.parametrize("w_grad", [True, False], ids=["W-trained", "W-frozen"])
+    def test_autocast_mixed_dtypes(self, x_dtype, w_dtype, b_dtype, w_grad):
+        """FP32 tensors among x / W / bias under FP16 autocast: the kernel on their float16 casts (bitwise), an fp16
+        output, no fallback; the gradients come back through the casts in the inputs' dtypes: dW bitwise autocast
+        F.linear's (the same fp16 product of the same casts), dX and db within tolerance."""
+        torch.manual_seed(2)
+        x0 = torch.randn(3, 200, 896, device=DEV)
+        W0 = torch.randn(1152, 896, device=DEV) * 896 ** -0.5
+        b0 = torch.randn(1152, device=DEV)
+        gy = torch.randn(3, 200, 1152, device=DEV, dtype=torch.float16)
+
+        def run(fn):
+            x = x0.to(x_dtype).requires_grad_(True)
+            W = W0.to(w_dtype).requires_grad_(w_grad)
+            b = b0.to(b_dtype).requires_grad_(True) if b_dtype is not None else None
+            with torch.autocast("cuda", dtype=torch.float16):
+                y = fn(x, W, b)
+            y.backward(gy)
+            return y, x.grad, W.grad, (b.grad if b is not None else None)
+
+        got = run(fused_linear)
+        assert fallback_stats() == {}
+        b16 = b0.half() if b_dtype is not None else None
+        assert torch.equal(got[0], ops().linear(x0.half().view(-1, 896), W0.half(), b16).view(3, 200, 1152))
+        ref = run(F.linear)
+        for name, g, r in zip(("y", "dX", "dW", "db"), got, ref):
+            if r is None:
+                assert g is None, name
+                continue
+            assert g.dtype == r.dtype and torch.isfinite(g).all(), name
+            if name == "dW":
+                assert torch.equal(g, r), "dW differs from autocast F.linear's"
+            err = ((g.double() - r.double()).norm() / r.double().norm()).item()
+            assert err < 3e-3, f"{name}: relF vs autocast F.linear {err:.2e}"
+        assert got[1].dtype == x_dtype and (got[2] is None) == (not w_grad)
+
+    def test_autocast_disabled_inside(self):
+        """autocast(enabled=False) nested in an FP16 region: FP32 inputs go to F.linear (counted), bitwise stock."""
+        x, W, b = (t.float() for t in _base())
+        with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast("cuda", enabled=False):
+                y, expected = fused_linear(x, W, b), F.linear(x, W, b)
+        assert y.dtype == torch.float32 and torch.equal(y, expected)
+        assert fallback_stats() == {"linear_dtype": 1}
+
+    def test_grad_scaler_step(self):
+        """The mixed-precision recipe end to end on a patched FP32 model: autocast FP16, GradScaler, an optimizer
+        step; FP32 gradients, finite, within 3x (at least 5e-4) of the stock model's error against the FP32 model's
+        (no autocast). Measured 2.0-2.4x: the kernel's element error is ~4x stock's, and the ReLU's mask flips near 0
+        follow it (see test_grads_vs_fp32). The loss scale matters: without it dX's fp16 products underflow (dY
+        ~1e-5 here), 14x stock's error."""
+        x = torch.randn(2, 200, 256, device=DEV, generator=torch.Generator(DEV).manual_seed(3))
+        grads = {}
+        for variant in ("fp32", "stock", "patched"):
+            model = _tiny_model(torch.float32)
+            if variant == "patched":
+                assert patch_linear(model) == 2
+            opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+            scaler = torch.amp.GradScaler("cuda", enabled=variant != "fp32")
+            with torch.autocast("cuda", dtype=torch.float16, enabled=variant != "fp32"):
+                loss = model(x).float().square().mean()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            grads[variant] = [p.grad.clone() for p in model.parameters()]
+            assert all(p.grad.dtype == torch.float32 and torch.isfinite(p.grad).all() for p in model.parameters())
+            scaler.step(opt)
+            scaler.update()
+        assert fallback_stats() == {}
+        for i, ref in enumerate(grads["fp32"]):
+            err, floor = relf(grads["patched"][i], ref.double()), relf(grads["stock"][i], ref.double())
+            assert err < max(3 * floor, 5e-4), f"parameter {i}: {err:.2e} vs stock {floor:.2e}"
+
     @pytest.mark.parametrize("mode", ["no_grad", "inference_mode"])
     def test_no_grad_modes(self, mode):
         x, W, b = make(300, 1152, 896, 6)
@@ -597,6 +677,25 @@ class TestCompile:
         for fn in (step, self._compiled(step)):
             loss = fn(x, xs, W, b)
             results.append((loss, *torch.autograd.grad(loss, (x, xs, W, b))))
+        for a, b_ in zip(*results):
+            torch.testing.assert_close(a, b_, atol=1e-3, rtol=1e-3)
+
+    def test_autocast_fp32_weights(self):
+        """FP32 x / W / bias under FP16 autocast in one compiled graph (the casts traced), forward and backward equal
+        to eager."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 300, 896, device=DEV, requires_grad=True)
+        W = (torch.randn(1152, 896, device=DEV) * 896 ** -0.5).requires_grad_(True)
+        b = torch.randn(1152, device=DEV, requires_grad=True)
+
+        def step(x, W, b):
+            with torch.autocast("cuda", dtype=torch.float16):
+                return fused_linear(x, W, b).float().square().sum()
+
+        results = []
+        for fn in (step, self._compiled(step)):
+            loss = fn(x, W, b)
+            results.append((loss, *torch.autograd.grad(loss, (x, W, b))))
         for a, b_ in zip(*results):
             torch.testing.assert_close(a, b_, atol=1e-3, rtol=1e-3)
 
@@ -655,6 +754,15 @@ def test_fallback(name):
     y = fused_linear(x, W, b)
     assert type(y) is type(F.linear(x, W, b)) and torch.equal(y, F.linear(x, W, b))
     assert fallback_stats() == ({} if want == "linear_small_m" else {want: 1})  # decode: by design, not counted
+
+
+def test_fallback_autocast_bf16_weight():
+    """FP16 autocast casts bf16 too, fused_linear does not: F.linear under autocast, bitwise, counted."""
+    x, W, b = _base()
+    with torch.autocast("cuda", dtype=torch.float16):
+        y, expected = fused_linear(x, W.bfloat16(), b), F.linear(x, W.bfloat16(), b)
+    assert y.dtype == torch.float16 and torch.equal(y, expected)
+    assert fallback_stats() == {"linear_dtype": 1}
 
 
 def test_fallback_autocast_other_dtype():
@@ -726,19 +834,44 @@ def test_patch_linear():
         assert patch_linear(model, enable=False) == 0
         assert all(type(m) is not linear_mod._FusedLinear for m in model) and type(model[0]) is nn.Linear
         assert torch.equal(model(x), stock)
-    assert patch_linear(_tiny_model(torch.float32)) == 0
+    assert patch_linear(_tiny_model(torch.bfloat16)) == 0
+
+
+def test_patch_linear_fp32_autocast():
+    """An FP32 model (the usual mixed-precision training recipe): patched; under FP16 autocast the kernel runs on the
+    float16 casts (bitwise the patched FP16 model's output), outside it F.linear (bitwise stock, linear_dtype)."""
+    model = _tiny_model(torch.float32)
+    x = torch.randn(2, 200, 256, device=DEV)
+    with torch.no_grad():
+        stock = model(x)
+        with torch.autocast("cuda", dtype=torch.float16):
+            stock_autocast = model(x)
+        n = 2 if _is_sm60() else 0
+        assert patch_linear(model) == n
+        if not _is_sm60():
+            return
+        with torch.autocast("cuda", dtype=torch.float16):
+            got = model(x)
+        assert fallback_stats() == {} and got.dtype == torch.float16
+        model16 = copy.deepcopy(model).half()
+        assert torch.equal(got, model16(x.half()))
+        assert relf(got, stock_autocast.double()) < 5e-3
+        assert torch.equal(model(x), stock) and fallback_stats() == {}  # FP32 outside autocast: by design
 
 
 def test_patch_linear_skips():
     """Left alone: a Linear with an instance forward (accelerate's hooks), a subclass, a weight that is not a
-    plain nn.Parameter."""
+    plain nn.Parameter, layers narrower than one tile (LoRA adapters)."""
     hooked, sub, odd = (nn.Linear(256, 256), _Doubled(256, 256), nn.Linear(256, 256))
-    model = nn.Sequential(hooked, sub, odd).to(DEV, torch.float16)
+    lora_a, lora_b = nn.Linear(256, 16, bias=False), nn.Linear(16, 256, bias=False)
+    model = nn.Sequential(hooked, sub, odd, lora_a, lora_b).to(DEV, torch.float16)
     original = hooked.forward
     hooked.forward = lambda x: original(x)  # what accelerate's add_hook_to_module does, in short
     odd.weight = nn.Parameter(odd.weight.detach().as_subclass(_Sub), requires_grad=False)
     assert patch_linear(model) == 0
     assert type(hooked) is nn.Linear and type(sub) is _Doubled and type(odd) is nn.Linear
+    assert type(lora_a) is nn.Linear and type(lora_b) is nn.Linear
+    assert patch_linear(nn.Sequential(nn.Linear(256, 128)).to(DEV, torch.float16)) == (1 if _is_sm60() else 0)
 
 
 @compile_ready

@@ -124,8 +124,8 @@ def run_case(fn, result, on_oom=None):
 
 
 def load(name, impl, dtype, linear=False):
-    """The model on the GPU; with linear, its fp16 nn.Linear layers patched (patch_linear: layers loaded
-    in other dtypes, as the fp32 trainable ones of train_model, stay stock)."""
+    """The model on the GPU; with linear, its nn.Linear layers patched (patch_linear: fp16 layers, and fp32 ones
+    while fp16 autocast is on; layers narrower than 128, as LoRA adapters, stay stock)."""
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, attn_implementation=impl).cuda()
     if linear:
@@ -210,7 +210,8 @@ def train_model(name, impl, lora, linear=False):
         trainable = "lora_" in n if lora else any(proj in n for proj in ATTN_PROJ)
         p.data = p.data.float() if trainable else p.data.half()
         p.requires_grad_(trainable)
-    if linear:  # after the casts: the frozen fp16 layers (the LoRA base layers too), not the fp32 trainable ones
+    if linear:  # after the casts: the fp16 layers (the LoRA base layers too) and the fp32 trainable projections
+        # (on the kernel under fp16 autocast); the LoRA adapters (narrower than 128) stay stock
         from flash_attn_legacy import patch_linear
         patch_linear(model)
     return model
