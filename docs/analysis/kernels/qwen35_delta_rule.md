@@ -1,8 +1,7 @@
 # The chunk gated delta rule of Qwen3.5-class models on pre-Ampere GPUs (P6.10 c)
 
 Status: c1 and c3 done (2026-11-03): each planned, reviewed, implemented, reviewed again, measured (sections 5 and
-7). c2 open. Last of the order
-decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
+7). c2 planned, reviewed and gated (section 8), being implemented. Last of the order decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
 
 ## 1. Today
 
@@ -309,3 +308,182 @@ register.
 
 **Suite.** test_gated_delta and test_causal_conv1d, with and without fla, are green on all five GPUs: 179 passed
 without fla, 177 with. Opcheck covers the autograd registration (`test_aot_dispatch_dynamic`).
+
+## 8. c2: the intra-chunk phase (analysis and plan, 2026-11-03)
+
+**Where the time goes now.** Measured with `qwen35_delta_c2_phases.py` (this directory): our path (`_chunk_scan` with
+c1 / c3), B = 1, H = 16, K = V = 128, fp16 inputs, L = 4096, one layer. Inference is a no-gradient call, 10 warm-up
+calls then the median of 7, CUDA events between phases. Training is the function's forward + backward.
+
+| GPU | inference | prologue | decays | UT + attn matmuls | 2 solves | q / k scale | scan op | out matmuls | training fwd + bwd |
+|---|---|---|---|---|---|---|---|---|---|
+| P100 | 10.5 ms | 22% | 4% | 8% | 27% | 3% | 27% | 7% | 9.9 + 20.0 ms |
+| V100 | 5.8 ms | 22% | 5% | 10% | 23% | 3% | 27% | 9% | 5.8 + 11.5 ms |
+| 2080 Ti | 9.3 ms | 20% | 4% | 8% | 29% | 3% | 28% | 7% | 9.3 + 16.9 ms |
+| T4 | 18.5 ms | 21% | 4% | 9% | 26% | 3% | 28% | 8% | 18.9 + 35.2 ms |
+| 1080 Ti | 13.3 ms | 22% | 4% | 8% | 23% | 3% | 31% | 7% | 13.3 + 26.9 ms |
+
+The epilogue is 1% everywhere.
+- The T4 needs warm-up: its clocks ramp up over the first calls. With one warm-up call it read 24-30 ms, with the
+  scan op at 8-11 ms.
+- **The prologue and the intra-chunk phase are 59-65% of the inference call**: casts, transposes, l2norm, pads, the
+  decay matrix, two Gram matmuls, two batched `solve_triangular`, and the q / k scaling. All are many full passes over
+  [B, H, NC, 64, 128] fp32 tensors.
+- **Training backward**, by autograd node (profiler, GPU time):
+  - the 12 elementwise multiplies' backward (`MulBackward0`): 27-32%;
+  - the scan op's backward (c3): 19-23%;
+  - `solve_triangular`'s backward: 16-19%;
+  - the matmuls' backward: 10-13%;
+  - views, pads, casts and the rest: ~20%.
+
+**In the model**, estimated from these shares and section 5's measurements:
+- The function was 35% of Qwen3.5-2B's 4k prefill on the T4 (401 of 1142 ms, 18 calls).
+- Removing ~55% of its time gives ~1.15-1.2x prefill on the T4, ~1.2x on the V100 and ~1.05x on the P100 (where the
+  function is a smaller share).
+- The 1080 Ti's 1.1% prefill regression (section 7) is inside the same function and would be recovered.
+
+**Gate before the kernel** (the plan review's HIGH 2; `qwen35_delta_c2_gate.py`, this directory). The c2 contract was
+prototyped in PyTorch and timed against the reference's lines, at L = 4096, 16 heads, fp16 inputs, median of 7:
+- **forward**: the explicit T, then u = T·βv and w = T·βe^c·kn;
+- **backward**: the analytic one, from the inputs and T / u / w; the reference's is autograd.
+
+| GPU | reference forward | prototype forward | reference backward (autograd) | analytic backward |
+|---|---|---|---|---|
+| P100 | 6.72 ms | 4.91 ms | 12.71 ms | 11.11 ms |
+| V100 | 3.65 ms | 2.88 ms | 7.06 ms | 6.86 ms |
+| 2080 Ti | 5.92 ms | 4.19 ms | 9.45 ms | 9.48 ms |
+| T4 | 14.35 ms | 9.67 ms | 20.34 ms | 20.86 ms |
+| 1080 Ti | 8.11 ms | 6.50 ms | 17.00 ms | 14.75 ms |
+
+- The gradients agree: dg (fp32) within 6.6e-7. dq / dk / dv / dβ are within 2.1e-4, which is the reference's fp16
+  rounding of its gradients.
+- The reference's graph holds 402 MiB per call after its forward.
+- **Conclusion.**
+  - In PyTorch the analytic backward is as fast as autograd's (0.98-1.15x). c2's training gain comes from the fused
+    forward, which runs twice per step under gradient checkpointing, and from memory: inputs and T saved instead of
+    402 MiB.
+  - The backward's elementwise passes are what a fused backward kernel (c2b) would remove. It is decided after c2 is
+    measured.
+
+**Plan (c2): one fused "prep" kernel for the prologue and the intra-chunk phase, with an analytic backward in PyTorch**
+(revised after the independent review, 2026-11-03).
+
+The op: `gdn_chunk_prep(q, k, v, g, beta) -> (q̃, k̃, w, u, d, A, T)`.
+- **Inputs.**
+  - q / k / v: the model's [B, L, H, K | V] tensors in their dtype (fp16 / bf16 / fp32) and strides. The last
+    dimension must be contiguous; otherwise the op makes it so.
+  - g and β [B, L, H]: cast to fp32 on the host when they are not (tensors of B·L·H elements).
+  - The tail chunk is zero-padded in the kernel: q, k, v and β are 0 and g is 0, as the reference's pad. This removes
+    the prologue's casts, transposes and pads.
+- **Outputs.**
+  - q̃, k̃, w [B, H, NC, 64, K] and u [B, H, NC, 64, V], all fp32 and row-major. Today `solve_triangular` returns w
+    and u column-major, and the scan op copies them to rows; its `contiguous` calls become no-ops.
+  - d [B, H, NC] and A [B, H, NC, 64, 64]: A's upper triangle is written as exact zeros, because the output matmul
+    reads all 64 x 64.
+  - T = (I + M)⁻¹ [B, H, NC, 64, 64], marked non-differentiable, for the backward.
+- **The kernel: one block per (b, h, chunk), 256 threads.**
+  - Shared memory target ≤ 30 KB static: 2 blocks per SM on the P100 / T4 / 1080 Ti (64 KB per SM), 3 on the V100.
+  - Shared memory, registers and blocks per SM are reported per arch and instantiation.
+  1. **One pass over K** in 64 x 16 sub-tiles of q and k (4 KB each).
+     - It accumulates both Gram matrices, k·kᵀ and q·kᵀ, in registers: 16 + 16 per thread, a fixed 4 x 4 patch of each
+       64 x 64.
+     - It also accumulates the row norms: k's are the Gram diagonal, q's are summed in the same pass.
+     - The products are normalised afterwards (by r_i r_j, with q's scale). This differs from the reference, which
+       normalises first, in fp32 rounding only.
+  2. The cumulative sum of g (fp32, in shared memory) and the decays.
+     - P_ij = exp(c_i - c_j), never e^{c_i}·e^{-c_j}: once c < -88 that product is inf·0.
+     - M = strict_lower(β_i kn_i·kn_j P_ij) goes to shared memory (16 KB).
+     - A = (qn·knᵀ) ⊙ P goes straight from registers to global memory.
+  3. **T = (I + M)⁻¹ by forward substitution, row by row, in place of M**: T_i,<i = -M_i,<i · T_<i,<i.
+     - For row i, the 256 threads take its i entries, the j-sum of each split over 4 threads with a shuffle reduction.
+     - That is 63 `__syncthreads`, ~10 µs per block, overlapped by the SM's other block.
+     - This is the order whose fp32 accuracy was checked (below). The `fla`-style blocked inverse is not taken.
+  4. **A second pass over K and V** in 64 x 16 sub-tiles:
+     - w = T(β e^c kn) and u = T(βv): T times the tile, 4 outputs per thread;
+     - q̃ = qn e^c and k̃ = kn e^(c_last - c) from the same q / k tiles;
+     - d = e^(c_last).
+     - V needs only to be a multiple of 16.
+  - **Traffic**: q and k are read twice, v once. Per call at 4k with 16 heads that is ~100 MB read and ~165 MB written,
+    and ~4.6 GFLOP.
+  - **Estimate** (from the review's count): the kernel ~1-1.5 ms on the P100 and ~2 ms on the T4, against the 6.7 / 11.8
+    ms of the phases it replaces.
+- **Accuracy of the inverse** (checked in fp32 against fp64 on 256 chunks per regime):
+  - with the explicit inverse, u and w are within 3.8e-8 / 7.3e-8 / 7.5e-8 / 3.7e-7 (fast / slow / flat / parallel
+    keys);
+  - `solve_triangular` in fp32 gives 1.6-2.1e-7;
+  - max |T| is 1.0 in all four regimes. `fla` takes the inverse too.
+- **Backward: analytic, in PyTorch** (registered autograd on the op, traceable like c3's).
+  - Saved: the op's inputs, T, and w (the same tensor the scan op saves). u is recomputed as T·βv (one batched
+    matmul, 32 MB not kept per layer at 4k). kn, qn, c and P are recomputed elementwise.
+  - Then:
+    - dX = Tᵀ dY for u and w;
+    - dM = -strict_lower(Tᵀ (du uᵀ + dw wᵀ));
+    - the Gram and decay terms, the l2norm, and the cumsum's reverse sum, in the padded chunk layout (a padded row's dc
+      reaches the real tokens through the reverse sum; the review checked this case).
+  - The formulas are checked against autograd of the reference's lines in fp64 (`qwen35_delta_c2_backward.py`):
+    every gradient within 1.5e-15.
+  - The review's variants, run in its scratchpad and not added to the repo, also pass:
+    - strong decay (g x 20) and flat (g = 0, β = 1): ~2e-15 in fp64;
+    - fp32 at g x 0.5 / x 20 / x 60: ≤ 7e-7;
+    - fp32 parallel keys at K = V = 128: worst 1.2e-5 (dg).
+  - The alternatives were rejected:
+    - **Recompute under autograd** (`torch.autograd.grad` on the reference's lines inside the registered backward). It
+      traces; the review checked it with opcheck and `torch.compile`. But it rebuilds the reference's graph in the
+      backward, which is today's whole backward cost plus a third forward.
+    - **The fused forward for inference only**: two forward paths for one function, and training keeps today's
+      forward and memory.
+    - **One `solve_triangular` with the right-hand sides concatenated**: it keeps the prologue and the elementwise
+      passes, and it would be a third variant of the same lines.
+- **Python.** `_chunk_scan` keeps the reference's lines for `kernel=False` (the bitwise copy test). On the kernel path
+  the prep op replaces the prologue and the intra-chunk lines. The scan op and the output products stay as they are.
+  The routing and the fingerprint gating are unchanged.
+  - `FLASH_ATTN_LEGACY_GDN_SCAN=0` still opts out of both ops (the reference).
+  - `FLASH_ATTN_LEGACY_GDN_PREP=0` keeps c3's path: the scan with the PyTorch lines. It is for the A/B and as a way out
+    if the prep op misbehaves.
+  - The gate's PyTorch prototype (explicit T plus the analytic backward) is the fp32 reference in the tests, not a
+    route.
+- **Memory.**
+  - The forward no longer materialises the fp32 copies of q / k / v, the decay matrix or the UT system.
+  - Under autograd the op saves its inputs (fp16) and T (16 MB per layer at 4k, 16 heads), against the reference
+    graph's 402 MiB.
+- **Expected.**
+  - Inference: the function ~2x faster against c3 (P100 10.5 -> ~5 ms, T4 18.5 -> ~8.7 ms, V100 5.8 -> ~2.6 ms).
+  - Qwen3.5-2B 4k prefill: ~1.15-1.2x on the T4 and V100, ~1.05x on the P100.
+  - LoRA step: the backward unchanged; the forward's gain twice under checkpointing. ~2% on the P100, ~5-9% on the T4,
+    plus the memory.
+
+**Acceptance (c2).**
+1. **The op against the reference's lines, fp32**:
+   - q̃, k̃, w, u, d and A within 1e-5 relative per head;
+   - A's upper triangle exactly 0;
+   - T within 1e-6 of fp64 `inv(I + M)`.
+   - Regimes: fast, slow, flat, parallel keys, and strong decay (g down to -20 per token, e^c underflowing in fp32):
+     every output finite.
+   - L ∈ {1, 63, 64, 65, 4096}; K 64 / 128; V 48 / 128; fp16 / bf16 / fp32 q / k / v; g and β in fp16 / fp32;
+     non-contiguous q / k / v (last dimension too); B 2; H 32.
+   - 64-bit offsets; run-to-run bitwise determinism.
+2. **The whole function**: the c1 / c3 tests unchanged, now through the prep op: output, final state, and gradients
+   against the reference within their bounds.
+3. **Backward.**
+   - The op's gradients against autograd of the reference's lines (fp32, 1e-4 per head) and against fp64, in the five
+     regimes at K = V = 128 (the backward script extended to them).
+   - T non-differentiable; double backward raises.
+   - opcheck with `test_faketensor`, `test_autograd_registration` and `test_aot_dispatch_dynamic`.
+   - `torch.compile` of the whole function, forward and backward.
+4. **Routing**: `FLASH_ATTN_LEGACY_GDN_PREP=0` gives c3's path bitwise; `FLASH_ATTN_LEGACY_GDN_SCAN=0` gives the
+   reference.
+5. **Model**: the tiny Qwen3.5 tests unchanged: prefill, decode, chunked prefill, LoRA with checkpointing, and 5 AdamW
+   steps.
+6. **Speed**, with pass marks:
+   - The prep op at 4k with 16 heads ≤ 2 ms on the P100 and ≤ 3 ms on the T4.
+   - The function's inference call ≥ 1.6x against c3 on the P100 and T4.
+   - Qwen3.5-2B prefill / generate / LoRA A/B, `FLASH_ATTN_LEGACY_GDN_PREP=0` against c2, 4 rounds per arm
+     alternated, all five GPUs:
+     - no regression with non-overlapping ranges;
+     - the 1080 Ti's prefill at least back to the reference's (section 7's 1.1%).
+   - If a mark is missed: profile and revise before committing. If it is still missed, report to the user, not ship.
+7. **Peak memory** of inference and of a training forward + backward at 4k, as numbers: no higher than c3's.
+8. **Suite.**
+   - ptxas: spills, shared memory, registers and blocks per SM reported per arch and instantiation. Spills only if the
+     A/B shows no cost.
+   - The full suite green on all five GPUs, with and without `fla`.
