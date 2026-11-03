@@ -96,6 +96,13 @@ def _register_fakes():
         def _(x, conv_state, weight, bias=None, silu=False):
             return channel_last(x)
 
+    if hasattr(_ops, "gdn_chunk_scan"):  # nor before P6.10 c the scan
+        @register("flash_attn_legacy::gdn_chunk_scan")
+        def _(w, u, kt, d, initial_state=None):
+            B, H, NC, _, K = w.shape
+            V = u.shape[-1]
+            return w.new_empty((B, H, NC, K, V)), u.new_empty((B, H, NC, 64, V)), w.new_empty((B, H, K, V))
+
 
 _register_fakes()
 

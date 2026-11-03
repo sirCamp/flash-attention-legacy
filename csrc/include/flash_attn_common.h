@@ -267,6 +267,22 @@ struct ConvParams {
 };
 
 // ---------------------------------------------------------------------------
+// The sequential scan of the chunk gated delta rule (gdn_scan.cu, docs/PLAN.md
+// P6.10 c): per (batch row, head) over chunks of 64 tokens, fp32, contiguous.
+// ---------------------------------------------------------------------------
+struct GdnScanParams {
+    const float* __restrict__ w;     // [B, H, NC, 64, K]: the UT-solved decayed keys
+    const float* __restrict__ u;     // [B, H, NC, 64, V]: the UT-solved values ("new values")
+    const float* __restrict__ kt;    // [B, H, NC, 64, K]: the keys decayed to the chunk's end
+    const float* __restrict__ d;     // [B, H, NC]: the chunk's total decay exp(g summed)
+    const float* __restrict__ s0;    // [B, H, K, V] or nullptr (zeros)
+    float* __restrict__ h;           // [B, H, NC, K, V]: the state at each chunk's start
+    float* __restrict__ v_new;       // [B, H, NC, 64, V]
+    float* __restrict__ s_final;     // [B, H, K, V]
+    int batch, heads, chunks, k_dim, v_dim;
+};
+
+// ---------------------------------------------------------------------------
 // Backward kernel launch parameters — shared between all kernels
 // ---------------------------------------------------------------------------
 struct FlashAttnBwdParams {

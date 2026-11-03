@@ -7,6 +7,7 @@ integration. No architecture-specific code: every GPU runs every test.
 Run:  pytest tests/test_causal_conv1d.py -v
 """
 
+import importlib
 import sys
 import types
 
@@ -32,6 +33,19 @@ def _clean_fallback_stats():
     reset_fallback_stats()
     yield
     reset_fallback_stats()
+
+
+@pytest.fixture(autouse=True)
+def _restore_qwen35_globals(monkeypatch):
+    """Building a model on our attention patches the Qwen3.5 modeling module process-wide: each test starts and ends
+    with transformers' own bindings."""
+    try:
+        mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    except ImportError:
+        return
+    for n in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
+              "causal_conv1d_update"):
+        monkeypatch.setattr(mq, n, getattr(mq, n))
 
 
 def ops():

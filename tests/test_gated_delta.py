@@ -36,6 +36,19 @@ def _clean_fallback_stats():
     reset_fallback_stats()
 
 
+@pytest.fixture(autouse=True)
+def _restore_qwen35_globals(monkeypatch):
+    """Building a model on our attention patches the Qwen3.5 modeling module process-wide: each test starts and ends
+    with transformers' own bindings."""
+    try:
+        mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    except ImportError:
+        return
+    for n in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
+              "causal_conv1d_update"):
+        monkeypatch.setattr(mq, n, getattr(mq, n))
+
+
 def _reference(query, key, value, g, beta, initial_state=None, output_final_state=False,
                use_qk_l2norm_in_kernel=False, **kwargs):
     """Stands for transformers' torch reference: records its call."""
@@ -183,17 +196,24 @@ def test_env_opt_out(stub_module, monkeypatch):
     assert not gated_delta.guard_gated_delta(model) and module.torch_chunk_gated_delta_rule is original
 
 
-def test_reference_binding_untouched():
-    """Without fla, transformers binds its reference: the real Qwen3.5 modeling module is left as it is."""
+def test_reference_binding(monkeypatch):
+    """Without fla, transformers binds its reference: the real Qwen3.5 modeling module gets the wrapper (for the scan
+    kernel), unless the scan is turned off (then it is left as it is)."""
     from .hf_helpers import tiny_qwen35
     mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
     cells = gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)
     assert cells is not None, "transformers' kernel wrapper not recognised: the guard would never apply"
     if cells["is_new_implementation"]:
         pytest.skip("fla is installed here: see the integration tests")
+    monkeypatch.setattr(mq, "torch_chunk_gated_delta_rule", mq.torch_chunk_gated_delta_rule)
     original = mq.torch_chunk_gated_delta_rule
-    model = tiny_qwen35(attn_implementation="flash_attn_legacy")
-    assert not gated_delta.guard_gated_delta(model) and mq.torch_chunk_gated_delta_rule is original
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
+    assert not gated_delta.guard_gated_delta(tiny_qwen35()) and mq.torch_chunk_gated_delta_rule is original
+    monkeypatch.delenv("FLASH_ATTN_LEGACY_GDN_SCAN")
+    if not gated_delta._HAS_SCAN_OP:
+        pytest.skip("an extension without the scan op")
+    assert gated_delta.guard_gated_delta(tiny_qwen35(attn_implementation="flash_attn_legacy"))
+    assert getattr(mq.torch_chunk_gated_delta_rule, gated_delta._GUARDED, False)
 
 
 @pytest.mark.parametrize("impl", ["flash_attn_legacy", "sdpa"])
@@ -291,6 +311,7 @@ def test_tiny_qwen35_with_fla(monkeypatch):
     """A model on our attention with fla bound: guarded; prefill bitwise the reference's (the same functions run);
     greedy decode (fla's recurrent kernel) close to the all-reference run until the tokens part at a near-tie."""
     from .hf_helpers import tiny_qwen35
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")  # the reference's own chunk: the bitwise prefill below
     mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
     names = ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule")
     refs = {n: gated_delta._decorator_cells(getattr(mq, n))["torch_function"] for n in names}
@@ -323,3 +344,268 @@ def test_tiny_qwen35_with_fla(monkeypatch):
         top2 = b.float().topk(2, -1).values
         assert ((top2[:, 0] - top2[:, 1])[parted] < 0.05).all(), f"step {t}: tokens part away from a near-tie"
         live &= ~parted
+
+
+# ---------------------------------------------------------------------------
+# The scan kernel (P6.10 c, c1): our copy of the reference with the sequential scan on gdn_chunk_scan
+# ---------------------------------------------------------------------------
+
+scan_only = pytest.mark.skipif(not (torch.cuda.is_available() and gated_delta._HAS_SCAN_OP),
+                               reason="needs CUDA and the scan op")
+
+
+def _reference_chunk():
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    reference = gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)
+    reference = reference["torch_function"] if reference else None
+    if reference is None or not gated_delta._scan_matches(reference):
+        pytest.skip("not the transformers reference the scan path was written from")
+    return reference
+
+
+def _gdn_inputs(B, L, H, K, V, dtype, regime, seed=0):  # noqa: C901
+    """q / k / v / g / beta as the layer passes them ([B, L, H, .]); regime: "fast" (decays forget the state within a
+    chunk), "slow" (g ~ -1e-3, beta near 1: the state carries across chunks), "flat" (g = 0, beta = 1), "parallel"
+    (nearly parallel keys: an ill-conditioned UT system)."""
+    gen = torch.Generator("cuda").manual_seed(seed)
+    q = torch.randn(B, L, H, K, device="cuda", generator=gen)
+    k = torch.randn(B, L, H, K, device="cuda", generator=gen)
+    if regime == "parallel":
+        k = k[:, :1] + 0.05 * k
+    v = torch.randn(B, L, H, V, device="cuda", generator=gen)
+    if regime == "fast":
+        g = -torch.rand(B, L, H, device="cuda", generator=gen) * 0.5
+        beta = torch.rand(B, L, H, device="cuda", generator=gen)
+    elif regime == "flat":
+        g, beta = torch.zeros(B, L, H, device="cuda"), torch.ones(B, L, H, device="cuda")
+    else:
+        g = -torch.rand(B, L, H, device="cuda", generator=gen) * 1e-3
+        beta = 0.9 + 0.1 * torch.rand(B, L, H, device="cuda", generator=gen)
+    return [t.to(dtype) for t in (q, k, v)] + [g, beta.to(dtype)]
+
+
+@scan_only
+@pytest.mark.parametrize("L,K,state", [(1, 128, False), (65, 128, True), (300, 64, True), (128, 128, False)])
+def test_scan_copy_bitwise(L, K, state):
+    """Our copy of the reference, with the reference's own loop, is bitwise the installed reference (fp16 inputs,
+    padding, an initial state): only the scan differs on the kernel path."""
+    reference = _reference_chunk()
+    q, k, v, g, beta = _gdn_inputs(2, L, 4, K, 128, torch.float16, "slow")
+    s0 = torch.randn(2, 4, K, 128, device="cuda") * 0.1 if state else None
+    for final in (True, False):
+        kw = dict(initial_state=s0, output_final_state=final, use_qk_l2norm_in_kernel=True)
+        want = reference(q, k, v, g=g, beta=beta, **kw)
+        got = gated_delta._chunk_scan(reference, q, k, v, g, beta, kernel=False, **kw)
+        assert torch.equal(got[0], want[0]) and (got[1] is None) == (want[1] is None)
+        if final:
+            assert torch.equal(got[1], want[1])
+
+
+@scan_only
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel"])
+@pytest.mark.parametrize("B,L,H,K", [(1, 1, 1, 128), (2, 63, 16, 128), (1, 64, 16, 64), (2, 65, 1, 128),
+                                     (1, 1000, 16, 128), (2, 300, 4, 64), (2, 70, 32, 128), (1, 4096, 16, 128)],
+                         ids=["1tok", "63", "64-K64", "65", "1000", "300-K64", "VS32-H32", "4096"])
+def test_scan_kernel(regime, B, L, H, K):
+    """The scan on the kernel against the reference in fp32 (inputs fp32: no output rounding in between): every
+    head's output and final state within 1e-5 relative (fp32 reassociation over the chunks)."""
+    reference = _reference_chunk()
+    q, k, v, g, beta = _gdn_inputs(B, L, H, K, 128, torch.float32, regime)
+    s0 = torch.randn(B, H, K, 128, device="cuda") * 0.1
+    kw = dict(initial_state=s0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    want = reference(q, k, v, g=g, beta=beta, **kw)
+    got = gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)
+
+    def rel(a, b, dims):  # per head: relative Frobenius over the other dims
+        err = (a.double() - b.double()).pow(2).sum(dims).sqrt()
+        return (err / b.double().pow(2).sum(dims).sqrt().clamp_min(1e-30)).max().item()
+
+    assert rel(got[0], want[0], (0, 1, 3)) < 1e-5, "output"
+    assert rel(got[1], want[1], (0, 2, 3)) < 1e-5, "final state"
+    assert torch.equal(gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)[0], got[0]), "not deterministic"
+
+
+@scan_only
+def test_scan_routing(monkeypatch):
+    """The wrapper takes our scan only without gradients and for the reference's supported arguments; the reference
+    otherwise (bitwise)."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    reference = _reference_chunk()
+    monkeypatch.setattr(mq, "torch_chunk_gated_delta_rule", mq.torch_chunk_gated_delta_rule)
+    assert gated_delta.guard_gated_delta(tiny_qwen35(attn_implementation="flash_attn_legacy"))
+    calls = []
+    real = gated_delta._ops
+
+    class Recorder:
+        @staticmethod
+        def gdn_chunk_scan(*args):
+            calls.append(1)
+            return real.gdn_chunk_scan(*args)
+
+    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
+    run = mq.torch_chunk_gated_delta_rule
+
+    def used(**kw):
+        calls.clear()
+        out = run(q, k, v, g=g, beta=beta, **{"use_qk_l2norm_in_kernel": True, **kw})
+        return bool(calls), out
+
+    with torch.inference_mode():
+        assert used()[0]
+    assert used()[0]  # grad enabled, nothing requires grad (a frozen prefix): the kernel
+    assert not used(use_qk_l2norm_in_kernel=False)[0]
+    assert not used(chunk_size=32)[0]
+    qg = q.clone().requires_grad_(True)
+    calls.clear()
+    out = run(qg, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
+    assert not calls and torch.equal(out[0], reference(qg, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)[0])
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
+    assert not used()[0]
+
+
+@scan_only
+@pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="torch >= 2.4 required")
+def test_scan_opcheck():
+    w = torch.randn(1, 2, 3, 64, 128, device="cuda")
+    u = torch.randn(1, 2, 3, 64, 128, device="cuda")
+    d = torch.rand(1, 2, 3, device="cuda")
+    for s0 in (None, torch.randn(1, 2, 128, 128, device="cuda")):
+        torch.library.opcheck(torch.ops.flash_attn_legacy.gdn_chunk_scan.default, (w, u, w.clone(), d, s0),
+                              test_utils=("test_schema", "test_faketensor"))
+
+
+@scan_only
+def test_tiny_qwen35_scan(monkeypatch):
+    """A tiny Qwen3.5 (K != V) on our attention, a left-padded batch: prefill logits within fp16 noise of the
+    reference's chunk; greedy decode the same until the tokens part at a near-tie."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    monkeypatch.setattr(mq, "torch_chunk_gated_delta_rule", mq.torch_chunk_gated_delta_rule)
+    model = tiny_qwen35(attn_implementation="flash_attn_legacy", key_dim=64).to("cuda", torch.float16)
+    ids = torch.randint(0, 512, (2, 150), device="cuda", generator=torch.Generator("cuda").manual_seed(4))
+    mask = torch.ones_like(ids)
+    mask[1, :20] = 0  # left padding
+
+    def run():
+        with torch.inference_mode():
+            return model(input_ids=ids, attention_mask=mask).logits.float()[mask.bool()], model.generate(
+                ids, attention_mask=mask, max_new_tokens=32, min_new_tokens=32, do_sample=False, output_logits=True,
+                return_dict_in_generate=True)
+
+    ours = run()
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
+    stock = run()
+    assert (ours[0] - stock[0]).abs().max().item() < 2e-2
+    live = torch.ones(ids.shape[0], dtype=torch.bool, device="cuda")
+    for t, (a, b) in enumerate(zip(ours[1].logits, stock[1].logits)):
+        assert ((a.float() - b.float()).abs().amax(-1)[live] < 2e-2).all(), f"decode step {t}"
+        parted = live & (ours[1].sequences[:, ids.shape[1] + t] != stock[1].sequences[:, ids.shape[1] + t])
+        top2 = b.float().topk(2, -1).values
+        assert ((top2[:, 0] - top2[:, 1])[parted] < 0.05).all(), f"step {t}: tokens part away from a near-tie"
+        live &= ~parted
+
+
+@scan_only
+def test_scan_v48_and_dtypes():
+    """The whole function against the reference: V = 48 (16-column slices), fp16 / bf16 / fp32 inputs, non-contiguous
+    q / k / v (views of a wider projection, as the layer's split gives): within one rounding of the output dtype."""
+    reference = _reference_chunk()
+    eps = {torch.float16: 2.0 ** -10, torch.bfloat16: 2.0 ** -7, torch.float32: 1e-6}
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        for V in (48, 128):
+            q, k, v, g, beta = _gdn_inputs(2, 130, 4, 128, V, dtype, "slow")
+            wide = torch.cat([q, k, v], -1)  # [B, L, H, 256 + V]: q / k / v as slices
+            q, k, v = wide[..., :128], wide[..., 128:256], wide[..., 256:]
+            kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True)
+            want = reference(q, k, v, g=g, beta=beta, **kw)
+            got = gated_delta._chunk_scan(reference, q, k, v, g, beta, **kw)
+            err = ((got[0].double() - want[0].double()).norm() / want[0].double().norm()).item()
+            assert got[0].dtype == dtype and err < eps[dtype], f"{dtype} V={V}: {err:.1e}"
+            assert ((got[1] - want[1]).norm() / want[1].norm()).item() < 1e-5
+
+
+@scan_only
+def test_scan_peak_memory():
+    """The kernel path's peak memory (the per-chunk states included) is no higher than the reference's."""
+    reference = _reference_chunk()
+    q, k, v, g, beta = _gdn_inputs(1, 2048, 16, 128, 128, torch.float16, "slow")
+    peaks = []
+    for fn in (lambda: reference(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True),
+               lambda: gated_delta._chunk_scan(reference, q, k, v, g, beta, use_qk_l2norm_in_kernel=True)):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        fn()
+        torch.cuda.synchronize()
+        peaks.append(torch.cuda.max_memory_allocated() - base)
+    assert peaks[1] <= peaks[0], f"reference {peaks[0] / 2**20:.0f} MiB, scan {peaks[1] / 2**20:.0f} MiB"
+
+
+@scan_only
+def test_scan_fla_bound_route(monkeypatch):
+    """With fla bound (the module's chunk -> fla), below SM 8.0 our scan serves the call (not counted as a fallback:
+    the reference does not run); from SM 8.0, fla."""
+    reference = _reference_chunk()
+    calls = []
+
+    def fla_chunk(*args, **kwargs):
+        calls.append("fla")
+        return "fla"
+
+    cells = {"implementation": fla_chunk, "torch_function": reference, "is_new_implementation": True}
+    wrapper = gated_delta._chunk_wrapper(fla_chunk, cells)
+    real = gated_delta._ops
+
+    class Recorder:
+        @staticmethod
+        def gdn_chunk_scan(*args):
+            calls.append("scan")
+            return real.gdn_chunk_scan(*args)
+
+    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
+    for cc, expected in (((7, 0), ["scan"]), ((8, 0), ["fla"])):
+        calls.clear()
+        monkeypatch.setattr(gated_delta, "device_capability", lambda index, cc=cc: cc)
+        wrapper(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True, cu_seqlens=None)
+        assert calls == expected, cc
+    assert fallback_stats() == {}
+
+
+@scan_only
+def test_scan_routing_more(monkeypatch):
+    """Gradients through g or the initial state, and CPU tensors: the reference; an unsupported inference call is
+    counted."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    _reference_chunk()
+    assert gated_delta.guard_gated_delta(tiny_qwen35(attn_implementation="flash_attn_legacy"))
+    calls = []
+    real = gated_delta._ops
+
+    class Recorder:
+        @staticmethod
+        def gdn_chunk_scan(*args):
+            calls.append(1)
+            return real.gdn_chunk_scan(*args)
+
+    monkeypatch.setattr(gated_delta, "_ops", Recorder)
+    q, k, v, g, beta = _gdn_inputs(1, 70, 2, 128, 128, torch.float16, "slow")
+    s0 = torch.randn(1, 2, 128, 128, device="cuda")
+    run = mq.torch_chunk_gated_delta_rule
+    run(q, k, v, g=g.clone().requires_grad_(True), beta=beta, use_qk_l2norm_in_kernel=True)
+    run(q, k, v, g=g, beta=beta, initial_state=s0.clone().requires_grad_(True), use_qk_l2norm_in_kernel=True)
+    run(*(t.cpu() for t in (q.float(), k.float(), v.float())), g=g.cpu(), beta=beta.float().cpu(),
+        use_qk_l2norm_in_kernel=True)
+    assert not calls and fallback_stats() == {}
+    with torch.no_grad():
+        run(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True, chunk_size=32)
+    assert not calls and fallback_stats() == {"gated_delta_scan_input": 1}

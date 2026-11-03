@@ -101,6 +101,10 @@ FALLBACK_REASONS: Dict[str, FallbackReason] = {
     "gated_delta_chunk_arch": FallbackReason(
         "fla's chunk gated delta rule does not run below compute capability 8.0 (its Triton kernel fails to "
         "compile); fla's recurrent kernel is kept for decode", "reference"),
+    "gated_delta_scan_input": FallbackReason(
+        "chunk gated delta rule without gradients that the scan kernel does not take (chunk_size other than 64, "
+        "no l2norm in the kernel, K other than 64 / 128, V not a multiple of 16, dtype, an initial state to "
+        "broadcast)", "reference"),
     "conv1d_input": FallbackReason(
         "Gated DeltaNet causal conv1d: an input the kernel does not take (not CUDA, a channel stride other than 1, "
         "width other than 2-4, dtype, activation other than SiLU, a decode step with gradients, or an extension "

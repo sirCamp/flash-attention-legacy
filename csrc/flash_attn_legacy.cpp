@@ -52,6 +52,7 @@ void linear_pascal_launch(const LinearParams& p, const LinearPlan& plan, cudaStr
 int causal_conv1d_runs(int seqlen);
 void causal_conv1d_launch(const ConvParams& p, bool vec, bool backward, cudaStream_t stream);
 void causal_conv1d_update_launch(const ConvParams& p, cudaStream_t stream);
+void gdn_scan_launch(const GdnScanParams& p, int vs, cudaStream_t stream);
 
 // Contiguous with a 16-byte aligned start: the kernels move rows with 128-bit
 // accesses (row strides are multiples of 8 halves since head_dim is). A view
@@ -1206,6 +1207,65 @@ torch::Tensor causal_conv1d_update(torch::Tensor x, const torch::Tensor& conv_st
     return y;
 }
 
+// ---------------------------------------------------------------------------
+// The sequential scan of the chunk gated delta rule (gdn_scan.cu, GdnScanParams;
+// docs/PLAN.md P6.10 c, c1): w, kt [B, H, NC, 64, K], u [B, H, NC, 64, V],
+// d [B, H, NC], initial_state [B, H, K, V], fp32 (the reference's intra-chunk
+// phase computes them; gated_delta.py). Returns (h [B, H, NC, K, V], the state at
+// each chunk's start; v_new [B, H, NC, 64, V]; the final state [B, H, K, V]).
+// ---------------------------------------------------------------------------
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gdn_chunk_scan(
+    torch::Tensor w, torch::Tensor u, torch::Tensor kt, torch::Tensor d, c10::optional<torch::Tensor> initial_state
+) {
+    TORCH_CHECK(w.is_cuda() && w.dim() == 5 && w.size(3) == 64, "w must be a CUDA tensor [B, H, NC, 64, K]");
+    TORCH_CHECK(u.dim() == 5 && u.size(0) == w.size(0) && u.size(1) == w.size(1) && u.size(2) == w.size(2) &&
+                u.size(3) == 64, "u must be [B, H, NC, 64, V]");
+    const int64_t B = w.size(0), H = w.size(1), NC = w.size(2), K = w.size(4), V = u.size(4);
+    // inference only (the reference's autograd runs for training: docs/PLAN.md P6.10 c)
+    TORCH_CHECK(!(at::GradMode::is_enabled() && (w.requires_grad() || u.requires_grad() || kt.requires_grad() ||
+                d.requires_grad() || (initial_state.has_value() && initial_state->defined() &&
+                initial_state->requires_grad()))), "gdn_chunk_scan has no backward: inputs must not require grad");
+    TORCH_CHECK(kt.sizes() == w.sizes() && d.dim() == 3 && d.size(0) == B && d.size(1) == H && d.size(2) == NC,
+                "kt must be w's shape and d [B, H, NC]");
+    TORCH_CHECK(K == 64 || K == 128, "K must be 64 or 128, got ", K);
+    TORCH_CHECK(V % 16 == 0 && V > 0, "V must be a positive multiple of 16, got ", V);
+    TORCH_CHECK(B <= 65535 && H <= 65535 && NC <= INT32_MAX, "too many rows / heads / chunks");
+    for (const torch::Tensor* t : {&w, &u, &kt, &d}) {
+        TORCH_CHECK(t->dtype() == torch::kFloat32 && t->device() == w.device(), "inputs must be float32 on w's device");
+    }
+    w = contiguous_aligned(w); kt = contiguous_aligned(kt);  // 16-byte loads of w / kt rows
+    u = u.contiguous(); d = d.contiguous();
+    torch::Tensor s0;
+    if (initial_state.has_value() && initial_state->defined()) {
+        TORCH_CHECK(initial_state->dtype() == torch::kFloat32 && initial_state->device() == w.device() &&
+                    initial_state->dim() == 4 && initial_state->size(0) == B && initial_state->size(1) == H &&
+                    initial_state->size(2) == K && initial_state->size(3) == V,
+                    "initial_state must be float32 [B, H, K, V] on w's device");
+        s0 = initial_state->contiguous();
+    }
+    torch::Tensor h = torch::empty({B, H, NC, K, V}, w.options());
+    torch::Tensor v_new = torch::empty({B, H, NC, 64, V}, w.options());
+    torch::Tensor s_final = torch::empty({B, H, K, V}, w.options());
+    if (NC == 0) {
+        if (s0.defined()) s_final.copy_(s0); else s_final.zero_();
+        return {h, v_new, s_final};
+    }
+    GdnScanParams p = {};
+    p.w = w.data_ptr<float>(); p.u = u.data_ptr<float>(); p.kt = kt.data_ptr<float>(); p.d = d.data_ptr<float>();
+    p.s0 = s0.defined() ? s0.data_ptr<float>() : nullptr;
+    p.h = h.data_ptr<float>(); p.v_new = v_new.data_ptr<float>(); p.s_final = s_final.data_ptr<float>();
+    p.batch = B; p.heads = H; p.chunks = NC; p.k_dim = K; p.v_dim = V;
+    const at::cuda::CUDAGuard device_guard(w.device());
+    int sms = 0;
+    FLASH_ATTN_CHECK_CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, w.get_device()));
+    // 32 state columns per block, 16 below two blocks per SM (a block of 256 threads at 64-96 registers: two or three
+    // per SM; shared memory 32 KB at K = 128, VS = 32, 20 KB at VS = 16)
+    const int vs = (V % 32 == 0 && B * H * (V / 32) >= 2 * sms) ? 32 : 16;
+    gdn_scan_launch(p, vs, at::cuda::getCurrentCUDAStream());
+    FLASH_ATTN_CHECK_CUDA(cudaGetLastError());
+    return {h, v_new, s_final};
+}
+
 }  // namespace flash_attn_legacy
 
 // The kernels are dispatcher operators (torch.ops.flash_attn_legacy.*): torch.compile
@@ -1236,6 +1296,8 @@ TORCH_LIBRARY(flash_attn_legacy, m) {
           "-> (Tensor, Tensor, Tensor)");
     m.def("causal_conv1d_update(Tensor x, Tensor(a!) conv_state, Tensor weight, Tensor? bias=None, "
           "bool silu=False) -> Tensor");
+    m.def("gdn_chunk_scan(Tensor w, Tensor u, Tensor kt, Tensor d, Tensor? initial_state=None) "
+          "-> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
@@ -1249,6 +1311,7 @@ TORCH_LIBRARY_IMPL(flash_attn_legacy, CUDA, m) {
     m.impl("causal_conv1d", &flash_attn_legacy::causal_conv1d_forward);
     m.impl("causal_conv1d_backward", &flash_attn_legacy::causal_conv1d_backward);
     m.impl("causal_conv1d_update", &flash_attn_legacy::causal_conv1d_update);
+    m.impl("gdn_chunk_scan", &flash_attn_legacy::gdn_chunk_scan);
 }
 
 // Helpers (host-side queries, not traced)

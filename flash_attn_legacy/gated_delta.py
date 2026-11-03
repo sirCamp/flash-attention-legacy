@@ -14,6 +14,15 @@ The guarded function is a plain function: below SM 8.0 it also bypasses a hub ke
 function (use_kernels=True). FLASH_ATTN_LEGACY_FLA_CHUNK=fla, set before the model is built, leaves `fla`'s chunk
 kernel in place (a newer fla / Triton that compiles it); a guard already installed stays.
 
+The chunk function also runs the reference with its sequential scan on our kernel (P6.10 c1,
+docs/analysis/kernels/qwen35_delta_rule.md: torch.ops.flash_attn_legacy.gdn_chunk_scan; the function 1.4-3.4x faster
+at 4k tokens) wherever `fla`'s chunk does not run, for calls without gradients (inference, prefill; training stays
+on the reference until its backward exists) and the reference's supported arguments; only for the reference source
+it was copied from (transformers 5.20.2, by fingerprint: another version runs the reference, with a warning).
+FLASH_ATTN_LEGACY_GDN_SCAN=0 opts out. Under reentrant gradient checkpointing the first forward (no gradients) takes
+the scan and the recompute the reference: equal up to fp32 rounding. Like the guard, the wrapper is process-wide for
+the modeling module: other models of its classes in the process get it too.
+
 The layers' depthwise causal conv1d (P6.10 b, docs/analysis/kernels/qwen35_conv1d.md): transformers' reference
 (F.conv1d on a transposing copy, then SiLU: 7-34x above the bandwidth floor on these GPUs) or the `causal-conv1d`
 package, which has no code below SM 7.5. patch_conv1d replaces the module's causal_conv1d_fn / causal_conv1d_update
@@ -22,6 +31,7 @@ out), keeping the package where it is bound and has code (SM 7.5 and newer). FLA
 """
 
 import functools
+import hashlib
 import inspect
 import logging
 import os
@@ -72,35 +82,180 @@ def _query(args, kwargs):
     return kwargs.get("query", kwargs.get("q"))
 
 
-def _guarded_chunk(fn, reference):
-    # the keywords transformers' wrapper passes to its reference: the named parameters only
-    named = tuple(inspect.signature(reference).parameters)
+# ---------------------------------------------------------------------------
+# The chunk delta rule: one wrapper decides between fla, our scan (P6.10 c, c1) and the reference
+# ---------------------------------------------------------------------------
+
+_SCAN_ENV = "FLASH_ATTN_LEGACY_GDN_SCAN"
+_HAS_SCAN_OP = hasattr(_ops, "gdn_chunk_scan")  # an extension built before P6.10 c has no scan op
+# sha1 prefixes of the reference our copy below follows (and of its l2norm): transformers 5.20.2, the same in
+# modeling_qwen3_5 / qwen3_5_moe / qwen3_next / olmo_hybrid. Another source: the reference itself runs.
+_REFERENCE_SHA1 = {"d2f00f2b07183377"}
+_L2NORM_SHA1 = {"757e6bd6fc8af596"}
+_SCAN_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _sha1(fn):
+    try:
+        return hashlib.sha1(inspect.getsource(fn).encode()).hexdigest()[:16]
+    except (OSError, TypeError):
+        return None
+
+
+def _scan_matches(reference):
+    """Our copy of the reference (_chunk_scan) applies: the installed reference is the one it was written from."""
+    l2norm = getattr(reference, "__globals__", {}).get("l2norm")
+    return _sha1(reference) in _REFERENCE_SHA1 and l2norm is not None and _sha1(l2norm) in _L2NORM_SHA1
+
+
+def _scan_supported(a):
+    """The reference's arguments (bound) our scan takes: chunks of 64, l2norm in the kernel, K 64 / 128, V a multiple
+    of 16, one head count for q / k / v, floating CUDA tensors on one device, and no gradient needed."""
+    q, k, v, g, beta, s0 = (a["query"], a["key"], a["value"], a["g"], a["beta"], a.get("initial_state"))
+    tensors = [q, k, v, g, beta] + ([s0] if s0 is not None else [])
+    if s0 is not None and (not isinstance(s0, torch.Tensor) or s0.shape != (q.shape[0], v.shape[2], q.shape[3],
+                                                                          v.shape[3])):
+        return False  # the reference broadcasts other shapes; the op takes [B, H, K, V]
+    if not (a.get("chunk_size", 64) == 64 and a.get("use_qk_l2norm_in_kernel") is True
+            and all(isinstance(t, torch.Tensor) and t.is_cuda and t.device == q.device for t in tensors)
+            and q.dtype in _SCAN_DTYPES and q.dim() == 4 and q.shape == k.shape and v.dim() == 4
+            and v.shape[:3] == q.shape[:3] and q.shape[-1] in (64, 128) and v.shape[-1] % 16 == 0
+            and g.shape == q.shape[:3] and beta.shape == q.shape[:3]):
+        return False
+    return not (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
+
+
+def _chunk_scan(reference, query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False,
+                use_qk_l2norm_in_kernel=False, kernel=True):
+    """transformers' torch_chunk_gated_delta_rule (5.20.2, _REFERENCE_SHA1) with its sequential scan on our kernel
+    (gdn_chunk_scan: the state at each chunk's start and the corrected values; the outputs then two batched matmuls,
+    parallel over the chunks). kernel=False runs the reference's own loop instead (a test checks that this copy is then
+    bitwise the reference). The prologue and the intra-chunk phase are the reference's lines."""
+    F = torch.nn.functional
+    l2norm = reference.__globals__["l2norm"]
+    initial_dtype = query.dtype
+    batch_size, sequence_length, _, k_head_dim = key.shape
+    num_v_heads, v_head_dim = value.shape[-2:]
+    recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
+    padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)
+    decay = g
+    query, key, value, beta, decay = [
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, decay)
+    ]
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    scaling = query.shape[-1] ** -0.5
+    query = query * scaling
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
+    beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
+    total_sequence_length = sequence_length + pad_size
+    num_chunks = total_sequence_length // chunk_size
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, k_beta, v_beta)
+    ]
+    decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
+    strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
+    cum_decay = decay.cumsum(dim=3)
+    pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
+    pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf"))
+    pairwise_decay = pairwise_decay.exp()
+    ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
+    intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
+    decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
+    new_values = torch.linalg.solve_triangular(ut_system, v_beta, upper=False, unitriangular=True)
+    k_cumdecay = torch.linalg.solve_triangular(ut_system, decayed_k_beta, upper=False, unitriangular=True)
+    if kernel:  # the reference keeps these alive to its end; ours frees them before the scan's own buffers
+        del ut_system, pairwise_decay, decayed_k_beta, k_beta, v_beta
+    if initial_state is None:
+        last_recurrent_state = torch.zeros(recurrent_state_shape, dtype=new_values.dtype, device=new_values.device)
+    else:
+        last_recurrent_state = initial_state.to(new_values)
+    query = query * cum_decay.exp().unsqueeze(-1)
+    key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
+    chunk_decay = cum_decay[..., -1].exp()[..., None, None]
+    if kernel:
+        # solve_triangular returns column-major results: made contiguous here (the op reads rows), then freed
+        states, v_new, last_recurrent_state = _ops.gdn_chunk_scan(
+            k_cumdecay.contiguous(), new_values.contiguous(), key, chunk_decay[..., 0, 0], last_recurrent_state)
+        del k_cumdecay, new_values
+        core_attn_out = torch.matmul(query, states)  # no gradient on this path: in place below
+        del states
+        core_attn_out += intra_chunk_attn @ v_new
+    else:
+        core_attn_out = torch.zeros_like(new_values)
+        for i in range(num_chunks):
+            v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
+            inter_chunk_attn = query[:, :, i] @ last_recurrent_state
+            core_attn_out[:, :, i] = inter_chunk_attn + intra_chunk_attn[:, :, i] @ v_new
+            last_recurrent_state = last_recurrent_state * chunk_decay[:, :, i] + key[:, :, i].transpose(-1, -2) @ v_new
+    last_recurrent_state = None if not output_final_state else last_recurrent_state
+    core_attn_out = core_attn_out.reshape(padded_output_shape)
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).to(initial_dtype, memory_format=torch.contiguous_format)
+    return core_attn_out, last_recurrent_state
+
+
+def _chunk_wrapper(fn, cells):
+    """The module's chunk function: `fla` where it runs (SM 8.0 and newer, or FLASH_ATTN_LEGACY_FLA_CHUNK=fla), our
+    scan where it applies (_scan_supported, the reference unchanged), else transformers' reference."""
+    reference = cells["torch_function"]
+    fla_bound = cells["is_new_implementation"] is True
+    signature = inspect.signature(reference)
+    named = tuple(signature.parameters)  # the keywords transformers' wrapper passes to its reference
+    scan = _HAS_SCAN_OP and _scan_matches(reference)
+    if _HAS_SCAN_OP and not scan:
+        _warn_once("gdn_scan_fingerprint", "flash_attn_legacy: %s's chunk gated delta rule is not the transformers "
+                   "reference (5.20.2) the scan kernel was written for: the reference runs (no scan kernel)",
+                   getattr(reference, "__module__", "?"))
 
     @functools.wraps(reference)
     def chunk(*args, **kwargs):
         query = _query(args, kwargs)
-        if isinstance(query, torch.Tensor) and query.is_cuda and (
-                device_capability(query.device.index) < FLA_CHUNK_MIN_CC):
+        cuda = isinstance(query, torch.Tensor) and query.is_cuda
+        below = cuda and device_capability(query.device.index) < FLA_CHUNK_MIN_CC
+        if fla_bound and (not below or os.environ.get(_FLA_CHUNK_ENV) == "fla"):
+            return fn(*args, **kwargs)
+        if kwargs.get("cu_seqlens") is not None or kwargs.get("seq_idx") is not None:
+            if not fla_bound:
+                return fn(*args, **kwargs)  # transformers' own error for packed sequences without fla
             # as transformers' wrapper does for its reference: packed sequences cannot be kept apart there
-            if kwargs.get("cu_seqlens") is not None or kwargs.get("seq_idx") is not None:
-                raise ValueError("flash_attn_legacy: packed sequences (cu_seqlens / seq_idx) in a Gated DeltaNet layer "
-                                 "need fla's chunk kernel, which does not run below compute capability 8.0; the "
-                                 "PyTorch reference would mix the sequences (the conv needs causal-conv1d too)")
-            if not is_compiling():
-                _record_fallback("gated_delta_chunk_arch")
-            return reference(*args, **{k: v for k, v in kwargs.items() if k in named})
-        return fn(*args, **kwargs)
+            raise ValueError("flash_attn_legacy: packed sequences (cu_seqlens / seq_idx) in a Gated DeltaNet layer "
+                             "need fla's chunk kernel, which does not run below compute capability 8.0; the "
+                             "PyTorch reference would mix the sequences (the conv needs causal-conv1d too)")
+        kwargs = {k: v for k, v in kwargs.items() if k in named}
+        a = None
+        if scan and cuda and os.environ.get(_SCAN_ENV) != "0":
+            try:
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                a = dict(bound.arguments)
+                a.pop("kwargs", None)  # the reference's var-keyword (its source is pinned by _REFERENCE_SHA1)
+            except TypeError:
+                a = None
+            if a is not None and _scan_supported(a):
+                return _chunk_scan(reference, **a)
+        if not is_compiling():
+            if fla_bound:
+                _record_fallback("gated_delta_chunk_arch")  # fla's chunk does not run here: the reference does
+            elif a is not None and not (torch.is_grad_enabled() and any(
+                    isinstance(t, torch.Tensor) and t.requires_grad for t in a.values())):
+                _record_fallback("gated_delta_scan_input")  # inference the scan does not take (training: c3)
+        return reference(*args, **kwargs)
 
     setattr(chunk, _GUARDED, True)
     return chunk
 
 
 def guard_gated_delta(model) -> bool:
-    """Route the chunk delta rule of `model`'s modeling module (the first class of its MRO whose module defines it)
-    to transformers' PyTorch reference for CUDA tensors below compute capability 8.0, when transformers bound it to
-    `fla`. Process-wide for that module, idempotent. True when the module is guarded (now or before)."""
-    if os.environ.get(_FLA_CHUNK_ENV) == "fla":
-        return False
+    """Install the chunk wrapper (_chunk_wrapper) on `model`'s modeling module (the first class of its MRO whose
+    module defines the chunk function) when transformers bound it to its reference or to `fla` (left alone: another
+    package, an unknown wrapper, and `fla` with FLASH_ATTN_LEGACY_FLA_CHUNK=fla). Process-wide for that module,
+    idempotent. True when the module carries the wrapper (now or before)."""
     for cls in type(model).__mro__:
         module = sys.modules.get(cls.__module__)
         fn = getattr(module, _CHUNK, None)
@@ -113,18 +268,21 @@ def guard_gated_delta(model) -> bool:
     cells = _decorator_cells(fn)
     if cells is None:
         _warn_once("gated_delta_unknown", "flash_attn_legacy: %s.%s is not transformers' kernel wrapper as known "
-                   "(another transformers version, or replaced): left as it is, not guarded for fla below SM 8.0",
+                   "(another transformers version, or replaced): left as it is (no fla guard, no scan kernel)",
                    module.__name__, _CHUNK)
         return False
     package = getattr(cells["implementation"], "__module__", "") or ""
-    if cells["is_new_implementation"] is not True or package.partition(".")[0] != "fla":
-        return False  # bound to the reference (no fla), or to another package
+    fla_bound = cells["is_new_implementation"] is True
+    if fla_bound and (package.partition(".")[0] != "fla" or os.environ.get(_FLA_CHUNK_ENV) == "fla"):
+        return False  # another package, or fla left in place by request
+    if not fla_bound and not (_HAS_SCAN_OP and os.environ.get(_SCAN_ENV) != "0"):
+        return False  # the reference stays bound: nothing to add without the scan
     try:
-        guarded = _guarded_chunk(fn, cells["torch_function"])
+        wrapper = _chunk_wrapper(fn, cells)
     except (TypeError, ValueError) as e:  # a reference without a readable signature
-        logger.warning("flash_attn_legacy: not guarding %s.%s: %s", module.__name__, _CHUNK, e)
+        logger.warning("flash_attn_legacy: not wrapping %s.%s: %s", module.__name__, _CHUNK, e)
         return False
-    setattr(module, _CHUNK, guarded)
+    setattr(module, _CHUNK, wrapper)
     return True
 
 
@@ -166,7 +324,9 @@ def _conv_targets(fn):
 
 
 def _uses_package(package, x):
-    return package is not None and (not x.is_cuda or device_capability(x.device.index) >= CONV_PACKAGE_MIN_CC)
+    """The bound causal-conv1d runs: CUDA (it has no CPU code) with code for the device (SM 7.5 and newer)."""
+    return (package is not None and isinstance(x, torch.Tensor) and x.is_cuda
+            and device_capability(x.device.index) >= CONV_PACKAGE_MIN_CC)
 
 
 def _conv_fn(fn):

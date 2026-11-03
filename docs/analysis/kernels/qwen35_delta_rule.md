@@ -1,6 +1,6 @@
 # The chunk gated delta rule of Qwen3.5-class models on pre-Ampere GPUs (P6.10 c)
 
-Status: analysis and plan for the first step (2026-11-03), reviewed; section 3 revised after the review. Last of the order
+Status: c1 done (2026-11-03): planned, reviewed, implemented, reviewed again, measured (section 5). c2 and c3 open. Last of the order
 decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
 
 ## 1. Today
@@ -79,7 +79,8 @@ The shares are the same at L = 1024 and 16384 (time is linear in L).
   1080 Ti at B = 1).
 - **Shared memory: ≤ 48 KB static on every arch** (the review found the first plan's ~136 KB fits none).
   - The state slice (K x VS fp32, 16 KB at VS = 32) and v_new (64 x VS, 8 KB) stay in shared memory.
-  - w_c and k̃_c are streamed in K sub-tiles of 32 columns (64 x 32 fp32, 8 KB, padded against bank conflicts):
+  - w_c and k̃_c are streamed in K sub-tiles of 32 columns (64 x 32 fp32, 8 KB; unpadded as implemented: neither
+    access pattern conflicts):
     v_new accumulates over the sub-tiles, then the state rows of each sub-tile are updated.
   - 256 threads, register double-buffering of the next sub-tile (no `cp.async` before Ampere).
 - **The rest stays PyTorch**, copied from the installed reference: the prologue, the intra-chunk phase (u, w, A), q̃,
@@ -144,3 +145,57 @@ The shares are the same at L = 1024 and 16384 (time is linear in L).
    - run-to-run determinism; peak memory no higher than the reference (h counted);
    - 64-bit offsets;
    - the 1080 Ti's speed is not measurable while its GPU is shared with another tenant: correctness only there.
+
+## 5. c1 as implemented, and the results
+
+**Kernel** (`csrc/kernels/gdn_scan.cu`, op `gdn_chunk_scan(w, u, k̃, d, initial_state) -> (h, v_new, final_state)`).
+- One block per (batch row, head, slice of VS = 16 or 32 state columns), 256 threads.
+  - VS = 32 when B·H·V/32 reaches twice the SM count, else 16.
+  - 75-96 registers, no spills; shared memory 16-32 KB.
+- The w / k̃ sub-tiles are 64 x 32 fp32, loaded as float4 into registers one tile ahead.
+- Each tap's state value read from shared memory is reused for a thread's rows. The first version, with scalar
+  dependent loads, ran at 7.4 ms on the P100 at 4k; the final one runs at 1.97 ms.
+- A `__launch_bounds__(256, 2)` hint was tried after the review and reverted: it let ptxas take 96-124 registers,
+  2 blocks per SM instead of 3, and 2.77 ms.
+- The op raises if its inputs require grad.
+
+**Python** (`flash_attn_legacy/gated_delta.py`).
+- `_chunk_scan` is the reference's lines with the loop replaced. With `kernel=False` it is bitwise the installed
+  reference (tested).
+- On the kernel path it frees the intra-chunk intermediates before the scan and adds the two output products in
+  place. Its peak memory is no higher than the reference's (tested at 2k).
+- The route is pinned to the reference's source by sha1, with a warning when it differs.
+- Inference calls the scan does not take are counted (`gated_delta_scan_input`); training calls go to the reference
+  without a count until c3.
+- Deviation from section 3: under reentrant gradient checkpointing the first forward takes the scan and the
+  recompute the reference. They are equal up to fp32 rounding, not bitwise; this is documented in the module.
+
+**Accuracy**: fp32 out / final state relF 5.5e-7 / 5.0e-7 at 4k on all GPUs measured. The tests' bound is 1e-5 per
+head, over the fast, slow, flat and parallel-keys regimes, up to 4096 tokens, at K 64 / 128, VS 16 / 32 and V 48 / 128,
+in fp16 / bf16 / fp32.
+
+**Speed of the function** at 4096 tokens (`qwen35_delta_phases.py`-style timing, ours vs the reference, one layer):
+
+| GPU | 16 heads (0.8B / 2B) | 32 heads (4B) | the scan kernel alone, 16 heads |
+|---|---|---|---|
+| V100 | 18.9 -> 5.6 ms (3.35x) | 18.5 -> 10.6 ms (1.74x) | 1.19 ms |
+| 2080 Ti | 25.2 -> 9.1 ms (2.76x) | 26.6 -> 14.8 ms (1.79x) | 2.15 ms |
+| P100 | 14.5 -> 9.7 ms (1.50x) | 22.2 -> 19.5 ms (1.14x) | 1.97 ms |
+| T4 | 25.0 -> 18.2 ms (1.37x) | 36.5 -> 34.8 ms (1.05x) | 4.28 ms |
+
+**In the model** (Qwen3.5-2B fp16 on our attention and conv, `qwen35_conv_model_ab.py NO_LORA=1`, A =
+`FLASH_ATTN_LEGACY_GDN_SCAN=0`, 4 rounds per arm alternated):
+
+| GPU | prefill 4096 | generate 2048 + 64 |
+|---|---|---|
+| V100 | 357 -> 307 ms (1.163x) | 2496 -> 2530 ms (0.99x, overlapping ranges) |
+| 2080 Ti | 509 -> 466 ms (1.094x) | 3190 -> 3161 ms (1.009x) |
+| P100 | 1867 -> 1795 ms (1.040x) | 2446 -> 2406 ms (1.017x) |
+| T4 | 1144 -> 1142 ms (1.00x) | 3501 -> 3499 ms (1.00x) |
+
+The 1080 Ti is not measurable (its GPU is shared with another tenant).
+
+- Generate does not change beyond noise: its prefill is 2k of a 64-token decode, and decode runs the recurrent rule.
+- **On the T4 the prefill does not move.** Measured inside the model in one process, its 18 chunk calls take 435 ->
+  401 ms: the remaining time is the PyTorch prologue and intra-chunk phase (57% of the function there), and the T4's
+  sustained clocks. That is c2's target, and the P100's too.
