@@ -427,8 +427,8 @@ def test_scan_kernel(regime, B, L, H, K):
 
 @scan_only
 def test_scan_routing(monkeypatch):
-    """The wrapper takes our scan only without gradients and for the reference's supported arguments; the reference
-    otherwise (bitwise)."""
+    """The wrapper takes our scan for the reference's supported arguments (gradient calls too with its backward); the
+    reference otherwise."""
     from .hf_helpers import tiny_qwen35
     mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
     if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
@@ -461,8 +461,8 @@ def test_scan_routing(monkeypatch):
     assert not used(chunk_size=32)[0]
     qg = q.clone().requires_grad_(True)
     calls.clear()
-    out = run(qg, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
-    assert not calls and torch.equal(out[0], reference(qg, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)[0])
+    run(qg, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)[0].float().sum().backward()
+    assert bool(calls) == gated_delta._HAS_SCAN_AUTOGRAD and qg.grad is not None  # c3: gradient calls on the scan
     monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
     assert not used()[0]
 
@@ -580,8 +580,8 @@ def test_scan_fla_bound_route(monkeypatch):
 
 @scan_only
 def test_scan_routing_more(monkeypatch):
-    """Gradients through g or the initial state, and CPU tensors: the reference; an unsupported inference call is
-    counted."""
+    """Gradients through g or the initial state: the scan (c3); CPU tensors: the reference, not counted; an
+    unsupported call is counted."""
     from .hf_helpers import tiny_qwen35
     mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
     if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
@@ -603,9 +603,231 @@ def test_scan_routing_more(monkeypatch):
     run = mq.torch_chunk_gated_delta_rule
     run(q, k, v, g=g.clone().requires_grad_(True), beta=beta, use_qk_l2norm_in_kernel=True)
     run(q, k, v, g=g, beta=beta, initial_state=s0.clone().requires_grad_(True), use_qk_l2norm_in_kernel=True)
+    assert len(calls) == (2 if gated_delta._HAS_SCAN_AUTOGRAD else 0)
+    calls.clear()
     run(*(t.cpu() for t in (q.float(), k.float(), v.float())), g=g.cpu(), beta=beta.float().cpu(),
         use_qk_l2norm_in_kernel=True)
     assert not calls and fallback_stats() == {}
     with torch.no_grad():
         run(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True, chunk_size=32)
     assert not calls and fallback_stats() == {"gated_delta_scan_input": 1}
+
+
+# ---------------------------------------------------------------------------
+# The scan's backward (P6.10 c, c3)
+# ---------------------------------------------------------------------------
+
+backward_only = pytest.mark.skipif(not (torch.cuda.is_available() and gated_delta._HAS_SCAN_AUTOGRAD),
+                                   reason="needs CUDA and the scan's backward")
+
+
+@backward_only
+@pytest.mark.parametrize("regime", ["fast", "slow", "flat", "parallel"])
+@pytest.mark.parametrize("L,H,K,V", [(65, 4, 128, 128), (300, 4, 64, 128), (130, 4, 128, 48), (1000, 4, 128, 128),
+                                     (300, 32, 128, 128), (4096, 4, 128, 128)],
+                         ids=["65", "300-K64", "130-V48", "1000", "VS32-H32", "4096"])
+@pytest.mark.parametrize("final", [True, False], ids=["final-state", "output-only"])
+def test_scan_grads(regime, L, H, K, V, final):
+    """Every input's gradient (q, k, v, g, beta, the initial state) through our path against the reference's autograd,
+    fp32: within 1e-4 relative per head."""
+    reference = _reference_chunk()
+    if L == 4096 and regime != "slow":
+        pytest.skip("4096 tokens: the slow regime only (the state carries across all 64 chunks)")
+    a = [t.requires_grad_(True) for t in _gdn_inputs(2, L, H, K, V, torch.float32, regime)]
+    s0 = (torch.randn(2, H, K, V, device="cuda") * 0.1).requires_grad_(True)
+    torch.manual_seed(1)
+    gy, gs = torch.randn(2, L, H, V, device="cuda"), torch.randn(2, H, K, V, device="cuda")
+    grads = []
+    for fn in (reference, functools.partial(gated_delta._chunk_scan, reference)):
+        o, sf = fn(*a[:3], g=a[3], beta=a[4], initial_state=s0, output_final_state=True,
+                   use_qk_l2norm_in_kernel=True)
+        loss = (o * gy).sum() + ((sf * gs).sum() if final else 0)
+        grads.append(torch.autograd.grad(loss, a + [s0]))
+    for name, got, want in zip(("q", "k", "v", "g", "beta", "s0"), grads[1], grads[0]):
+        head = 2 if name not in ("s0",) else 1  # the head dimension
+        dims = tuple(i for i in range(got.dim()) if i != head)
+        ref_norm = want.double().pow(2).sum(dims).sqrt().clamp_min(1e-30)
+        err = (got.double() - want.double()).pow(2).sum(dims).sqrt() / ref_norm
+        assert err.max().item() < 1e-4, f"d{name}: {err.max().item():.1e}"
+
+
+@backward_only
+@pytest.mark.parametrize("B,H,K,V", [(1, 2, 64, 32), (2, 32, 128, 128)], ids=["VS16-K64", "VS32-K128"])
+def test_scan_backward_against_fp64(B, H, K, V):
+    """The op's backward against autograd of the scan's recurrence in fp64 (Python): the gradients of w, u, k~, d and
+    the initial state within fp32 rounding."""
+    torch.manual_seed(3)
+    NC = 5
+    w, kt = (torch.randn(B, H, NC, 64, K, device="cuda") * 0.05 for _ in range(2))
+    u = torch.randn(B, H, NC, 64, V, device="cuda")
+    d, s0 = torch.rand(B, H, NC, device="cuda"), torch.randn(B, H, K, V, device="cuda")
+    ins = [t.clone().requires_grad_(True) for t in (w, u, kt, d, s0)]
+    h, vn, sf = torch.ops.flash_attn_legacy.gdn_chunk_scan(*ins)
+    dh, dv, dsf = torch.randn_like(h), torch.randn_like(vn), torch.randn_like(sf)
+    got = torch.autograd.grad((h * dh).sum() + (vn * dv).sum() + (sf * dsf).sum(), ins)
+    ins64 = [t.double().requires_grad_(True) for t in (w, u, kt, d, s0)]
+    w64, u64, kt64, d64, S = ins64
+    hs, vs = [], []
+    for c in range(NC):
+        hs.append(S)
+        v = u64[:, :, c] - w64[:, :, c] @ S
+        vs.append(v)
+        S = d64[:, :, c, None, None] * S + kt64[:, :, c].transpose(-1, -2) @ v
+    loss = ((torch.stack(hs, 2) * dh.double()).sum() + (torch.stack(vs, 2) * dv.double()).sum()
+            + (S * dsf.double()).sum())
+    want = torch.autograd.grad(loss, ins64)
+    for name, g, r in zip(("w", "u", "kt", "d", "s0"), got, want):
+        assert ((g.double() - r).norm() / r.norm()).item() < 1e-5, name
+
+
+@backward_only
+@pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="torch >= 2.4 required")
+def test_scan_opcheck_autograd():
+    w = torch.randn(1, 2, 3, 64, 128, device="cuda") * 0.05
+    u = torch.randn(1, 2, 3, 64, 128, device="cuda")
+    d = torch.rand(1, 2, 3, device="cuda")
+    s0 = torch.randn(1, 2, 128, 128, device="cuda")
+    args = [t.clone().requires_grad_(True) for t in (w, u, w, d, s0)]
+    torch.library.opcheck(torch.ops.flash_attn_legacy.gdn_chunk_scan.default, tuple(args),
+                          test_utils=("test_autograd_registration", "test_aot_dispatch_dynamic"))
+    gh = torch.randn(1, 2, 3, 128, 128, device="cuda")
+    for grads in ((gh, u, s0), (None, None, s0), (gh, None, None)):
+        torch.library.opcheck(torch.ops.flash_attn_legacy.gdn_chunk_scan_backward.default,
+                              (w, w.clone(), d, *grads, 128), test_utils=("test_schema", "test_faketensor"))
+
+
+@backward_only
+@pytest.mark.parametrize("checkpointing", [None, "reentrant", "non-reentrant"])
+def test_tiny_qwen35_training(monkeypatch, checkpointing):
+    """A tiny Qwen3.5 (K != V) training step on our attention, with and without gradient checkpointing: the loss and
+    every parameter's gradient within fp16 noise of the reference's chunk; the scan's backward ran."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    model = tiny_qwen35(attn_implementation="flash_attn_legacy").to("cuda", torch.float16)
+    if checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": checkpointing == "reentrant"})
+    model.train()
+    ids = torch.randint(0, 512, (2, 140), device="cuda", generator=torch.Generator("cuda").manual_seed(6))
+    calls = []
+    real = gated_delta._ops
+
+    class Recorder:
+        def __getattr__(self, name):
+            if name == "gdn_chunk_scan_backward":
+                calls.append(name)
+            return getattr(real, name)
+
+    monkeypatch.setattr(gated_delta, "_ops", Recorder())
+
+    def step():
+        model.zero_grad(set_to_none=True)
+        loss = model(input_ids=ids, labels=ids).loss
+        loss.backward()
+        return loss.item(), {n: p.grad.float().clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    ours = step()
+    assert calls, "the scan's backward did not run"
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
+    stock = step()
+    assert abs(ours[0] - stock[0]) < 2e-3
+    for n, g in ours[1].items():
+        r = stock[1][n].double()
+        assert ((g.double() - r).norm() / r.norm().clamp_min(1e-30)).item() < 2e-2, n
+
+
+@backward_only
+def test_scan_training_peak_memory():
+    """A forward + backward on our path takes no more memory than the reference's."""
+    reference = _reference_chunk()
+    peaks = []
+    for fn in (reference, functools.partial(gated_delta._chunk_scan, reference)):
+        a = [t.requires_grad_(True) for t in _gdn_inputs(1, 2048, 16, 128, 128, torch.float16, "slow")]
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        fn(*a[:3], g=a[3], beta=a[4], use_qk_l2norm_in_kernel=True)[0].float().sum().backward()
+        torch.cuda.synchronize()
+        peaks.append(torch.cuda.max_memory_allocated() - base)
+        del a
+    assert peaks[1] <= peaks[0], f"reference {peaks[0] / 2**20:.0f} MiB, scan {peaks[1] / 2**20:.0f} MiB"
+
+
+@backward_only
+def test_scan_backward_edge_cases():
+    """A loss on the final state alone (the outputs' gradients undefined), an initial state that alone needs a
+    gradient, run-to-run determinism, and double backward raising."""
+    reference = _reference_chunk()
+    q, k, v, g, beta = _gdn_inputs(1, 200, 4, 128, 128, torch.float32, "slow")
+    s0 = (torch.randn(1, 4, 128, 128, device="cuda") * 0.1).requires_grad_(True)
+    kw = dict(initial_state=s0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    grads = []
+    for fn in (reference, functools.partial(gated_delta._chunk_scan, reference)):
+        _, sf = fn(q, k, v, g=g, beta=beta, **kw)
+        grads.append(torch.autograd.grad(sf.square().sum(), s0)[0])
+    assert ((grads[1] - grads[0]).norm() / grads[0].norm()).item() < 1e-4
+    qg = q.clone().requires_grad_(True)
+    runs = []
+    for _ in range(2):
+        out, _ = gated_delta._chunk_scan(reference, qg, k, v, g, beta, **kw)
+        runs.append(torch.autograd.grad(out.square().sum(), (qg, s0)))
+    assert all(torch.equal(a, b) for a, b in zip(*runs)), "gradients not deterministic"
+    kg = k.clone().requires_grad_(True)  # k feeds the scan (q only its output product)
+    out, _ = gated_delta._chunk_scan(reference, q, kg, v, g, beta, **kw)
+    with pytest.raises(RuntimeError, match="double backward"):
+        torch.autograd.grad(out.square().sum(), kg, create_graph=True)
+
+
+@backward_only
+def test_tiny_qwen35_autocast_training(monkeypatch):
+    """The mixed-precision recipe (FP32 weights, fp16 autocast): loss and gradients within fp16 noise of the
+    reference's chunk (whose per-chunk matmuls run in fp16 under autocast, the scan in fp32 here)."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    model = tiny_qwen35(attn_implementation="flash_attn_legacy").to("cuda")
+    model.train()
+    ids = torch.randint(0, 512, (2, 140), device="cuda", generator=torch.Generator("cuda").manual_seed(7))
+
+    def step():
+        model.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            loss = model(input_ids=ids, labels=ids).loss
+        loss.backward()
+        return loss.item(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    ours = step()
+    monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", "0")
+    stock = step()
+    assert abs(ours[0] - stock[0]) < 5e-3
+    for n, g in ours[1].items():
+        r = stock[1][n].double()
+        assert ((g.double() - r).norm() / r.norm().clamp_min(1e-30)).item() < 3e-2, n
+
+
+@backward_only
+def test_tiny_qwen35_optimizer_steps(monkeypatch):
+    """A few AdamW steps of a tiny Qwen3.5 on our scan and on the reference, from the same weights: the losses agree
+    within fp16 noise at every step."""
+    from .hf_helpers import tiny_qwen35
+    mq = importlib.import_module("transformers.models.qwen3_5.modeling_qwen3_5")
+    if gated_delta._decorator_cells(mq.torch_chunk_gated_delta_rule)["is_new_implementation"]:
+        pytest.skip("fla is installed here")
+    ids = torch.randint(0, 512, (2, 140), device="cuda", generator=torch.Generator("cuda").manual_seed(8))
+    curves = []
+    for scan in ("1", "0"):
+        monkeypatch.setenv("FLASH_ATTN_LEGACY_GDN_SCAN", scan)
+        model = tiny_qwen35(attn_implementation="flash_attn_legacy").to("cuda")  # same seed: same weights
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        losses = []
+        for _ in range(5):
+            loss = model(input_ids=ids, labels=ids).loss
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            losses.append(loss.item())
+        curves.append(losses)
+    assert all(abs(a - b) < 1e-3 for a, b in zip(*curves)), curves

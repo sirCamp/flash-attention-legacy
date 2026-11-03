@@ -18,6 +18,17 @@
 // [64][VS], and one 64 x 32 tile of w_c or k~_c at a time (K sub-tiles of 32),
 // so v_new accumulates over the sub-tiles and the state rows of a sub-tile are
 // updated from it. 256 threads; a thread owns fixed (row, column) outputs.
+//
+// The backward (kBack, c3): the same recurrence in reverse chunk order, with
+// G_{c+1} = dL/dS_{c+1} (G_NC = the final state's gradient) in the state's place:
+//
+//   G_{c+1}     stored                             ([B, H, NC, K, V], in h's place)
+//   dv^_c       = dv_c + k~_c G_{c+1}              ([B, H, NC, 64, V], in v_new's place)
+//   G_c         = d_c G_{c+1} - w_c^T dv^_c + dh_c
+//
+// and G_0 (the initial state's gradient) in the final state's place: k~ streamed
+// first, then w. The inputs' gradients (dw = -dv^ h^T, dk~ = v_new G^T, dd = sum
+// G * h, du = dv^) are batched matmuls in PyTorch (reductions over V).
 // ============================================================================
 
 #include "flash_attn_common.h"
@@ -50,9 +61,9 @@ __device__ __forceinline__ void store_tile(float (&tile)[kChunk][kSub], const fl
     }
 }
 
-template <int K, int VS>
 // No minimum-blocks hint: at (256, 2) ptxas takes up to 128 registers (96-124), leaving 2 blocks per SM where 75-96
 // registers fit 3 (VS = 16: 128 blocks resident at once on the P100; 2.77 against 1.97 ms at 4k tokens)
+template <int K, int VS, bool kBack>
 __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams p) {
     static_assert(K % kSub == 0 && kThreads % VS == 0 && kTileVecs * kThreads * 4 == kChunk * kSub, "tile mismatch");
     static_assert(kChunk % (kThreads / VS) == 0 && kSub % (kThreads / VS) == 0, "rows per pass: every row covered");
@@ -70,22 +81,28 @@ __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams 
     const int v0 = blockIdx.x * VS, h = blockIdx.y, b = blockIdx.z;
     const index_t bh = index_t(b) * p.heads + h;
     const int V = p.v_dim;
-    // The tiles of a chunk in order: w's kSubs sub-tiles, then k~'s; the next one is prefetched into registers while
-    // the current one is used (no cp.async before SM 8.0)
+    // The tiles of a chunk in order: w's kSubs sub-tiles, then k~'s (backward: k~'s, then w's); the next one is
+    // prefetched into registers while the current one is used (no cp.async before SM 8.0)
+    const float* first = kBack ? p.kt : p.w;
+    const float* second = kBack ? p.w : p.kt;
     auto tile_src = [&](int c, int n) {
         const index_t bhc = bh * p.chunks + c;
-        return (n < kSubs ? p.w : p.kt) + bhc * kChunk * K;
+        return (n < kSubs ? first : second) + bhc * kChunk * K;
     };
+    // the chunk of step s (the backward runs in reverse)
+    auto chunk_of = [&](int s) { return kBack ? p.chunks - 1 - s : s; };
+    constexpr float kSign = kBack ? 1.0f : -1.0f;  // v_new = u - w S; dv^ = dv + k~ G
     float4 next[kTileVecs];
 
     for (int e = tid; e < K * VS; e += kThreads) {
         const int i = e / VS, jj = e % VS;
         S[i][jj] = p.s0 != nullptr ? p.s0[(bh * K + i) * V + v0 + jj] : 0.0f;
     }
-    if (p.chunks > 0) load_tile<K>(next, tile_src(0, 0), 0, tid);
+    if (p.chunks > 0) load_tile<K>(next, tile_src(chunk_of(0), 0), 0, tid);
     __syncthreads();
 
-    for (int c = 0; c < p.chunks; c++) {
+    for (int step = 0; step < p.chunks; step++) {
+        const int c = chunk_of(step);
         const index_t bhc = bh * p.chunks + c;
         // h_c = S_c
         float* hc = p.h + bhc * K * V + v0;
@@ -93,17 +110,17 @@ __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams 
             const int i = e / VS, jj = e % VS;
             hc[index_t(i) * V + jj] = S[i][jj];
         }
-        const float* u = p.u + bhc * kChunk * V + v0;
+        const float* u = p.u != nullptr ? p.u + bhc * kChunk * V + v0 : nullptr;
         float acc[kOut];
         #pragma unroll
-        for (int o = 0; o < kOut; o++) acc[o] = u[index_t(r0 + o * kRowsPerPass) * V + j];
+        for (int o = 0; o < kOut; o++) acc[o] = u != nullptr ? u[index_t(r0 + o * kRowsPerPass) * V + j] : 0.0f;
         const float d = p.d[bhc];
         #pragma unroll 1
         for (int n = 0; n < 2 * kSubs; n++) {
             store_tile(tile, next, tid);
             // the next tile: this chunk's, or the next chunk's first
             if (n + 1 < 2 * kSubs) load_tile<K>(next, tile_src(c, n + 1), ((n + 1) % kSubs) * kSub, tid);
-            else if (c + 1 < p.chunks) load_tile<K>(next, tile_src(c + 1, 0), 0, tid);
+            else if (step + 1 < p.chunks) load_tile<K>(next, tile_src(chunk_of(step + 1), 0), 0, tid);
             __syncthreads();  // the tile (and, before the first k~ tile, v_new) visible
             const int k0 = (n % kSubs) * kSub;
             if (n < kSubs) {  // v_new = u - w S, accumulated over w's sub-tiles
@@ -115,7 +132,8 @@ __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams 
                     for (int o = 0; o < kOut; o++) {
                         const float4 wv = *reinterpret_cast<const float4*>(&tile[r0 + o * kRowsPerPass][i]);
                         float x = acc[o];
-                        x = fmaf(-wv.x, s0, x); x = fmaf(-wv.y, s1, x); x = fmaf(-wv.z, s2, x); x = fmaf(-wv.w, s3, x);
+                        x = fmaf(kSign * wv.x, s0, x); x = fmaf(kSign * wv.y, s1, x);
+                        x = fmaf(kSign * wv.z, s2, x); x = fmaf(kSign * wv.w, s3, x);
                         acc[o] = x;
                     }
                 }
@@ -141,7 +159,12 @@ __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams 
                 #pragma unroll
                 for (int o = 0; o < kSOut; o++) {
                     const int i = r0 + o * kRowsPerPass;
-                    S[k0 + i][j] = fmaf(d, S[k0 + i][j], a[o]);
+                    if (kBack) {  // G_c = d G_{c+1} - w^T dv^ + dh_c
+                        const float dh = p.dh != nullptr ? p.dh[bhc * K * V + index_t(k0 + i) * V + v0 + j] : 0.0f;
+                        S[k0 + i][j] = fmaf(d, S[k0 + i][j], -a[o]) + dh;
+                    } else {
+                        S[k0 + i][j] = fmaf(d, S[k0 + i][j], a[o]);
+                    }
                 }
             }
             __syncthreads();  // the tile buffer free for the next store; S / v_new complete
@@ -153,19 +176,26 @@ __global__ void __launch_bounds__(kThreads) gdn_scan_kernel(const GdnScanParams 
     }
 }
 
-template <int K>
+template <int K, bool kBack>
 void launch_vs(const GdnScanParams& p, int vs, cudaStream_t stream) {
-    if (vs == 16) gdn_scan_kernel<K, 16><<<dim3(p.v_dim / 16, p.heads, p.batch), kThreads, 0, stream>>>(p);
-    else          gdn_scan_kernel<K, 32><<<dim3(p.v_dim / 32, p.heads, p.batch), kThreads, 0, stream>>>(p);
+    if (vs == 16) gdn_scan_kernel<K, 16, kBack><<<dim3(p.v_dim / 16, p.heads, p.batch), kThreads, 0, stream>>>(p);
+    else          gdn_scan_kernel<K, 32, kBack><<<dim3(p.v_dim / 32, p.heads, p.batch), kThreads, 0, stream>>>(p);
+}
+
+template <bool kBack>
+void launch_k(const GdnScanParams& p, int vs, cudaStream_t stream) {
+    if (p.k_dim == 64) launch_vs<64, kBack>(p, vs, stream);
+    else               launch_vs<128, kBack>(p, vs, stream);
 }
 
 }  // namespace
 
-// vs: the state columns per block (16 or 32, the host chose; V % vs == 0); K 64 or 128 (the host checked)
-void gdn_scan_launch(const GdnScanParams& p, int vs, cudaStream_t stream) {
+// vs: the state columns per block (16 or 32, the host chose; V % vs == 0); K 64 or 128 (the host checked);
+// backward: the reverse scan of the gradients (the fields' roles in GdnScanParams)
+void gdn_scan_launch(const GdnScanParams& p, int vs, bool backward, cudaStream_t stream) {
     if (p.batch == 0 || p.heads == 0) return;
-    if (p.k_dim == 64) launch_vs<64>(p, vs, stream);
-    else               launch_vs<128>(p, vs, stream);
+    if (backward) launch_k<true>(p, vs, stream);
+    else          launch_k<false>(p, vs, stream);
 }
 
 }  // namespace flash_attn_legacy

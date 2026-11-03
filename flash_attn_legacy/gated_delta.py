@@ -14,14 +14,13 @@ The guarded function is a plain function: below SM 8.0 it also bypasses a hub ke
 function (use_kernels=True). FLASH_ATTN_LEGACY_FLA_CHUNK=fla, set before the model is built, leaves `fla`'s chunk
 kernel in place (a newer fla / Triton that compiles it); a guard already installed stays.
 
-The chunk function also runs the reference with its sequential scan on our kernel (P6.10 c1,
-docs/analysis/kernels/qwen35_delta_rule.md: torch.ops.flash_attn_legacy.gdn_chunk_scan; the function 1.4-3.4x faster
-at 4k tokens) wherever `fla`'s chunk does not run, for calls without gradients (inference, prefill; training stays
-on the reference until its backward exists) and the reference's supported arguments; only for the reference source
-it was copied from (transformers 5.20.2, by fingerprint: another version runs the reference, with a warning).
-FLASH_ATTN_LEGACY_GDN_SCAN=0 opts out. Under reentrant gradient checkpointing the first forward (no gradients) takes
-the scan and the recompute the reference: equal up to fp32 rounding. Like the guard, the wrapper is process-wide for
-the modeling module: other models of its classes in the process get it too.
+The chunk function also runs the reference with its sequential scan on our kernel (P6.10 c1 / c3,
+docs/analysis/kernels/qwen35_delta_rule.md: torch.ops.flash_attn_legacy.gdn_chunk_scan, with its backward as a
+reverse scan; the function 1.4-3.4x faster at 4k tokens, forward + backward 5-8x on the P100) wherever `fla`'s chunk
+does not run, for the reference's supported arguments; only for the reference source it was copied from
+(transformers 5.20.2, by fingerprint: another version runs the reference, with a warning). FLASH_ATTN_LEGACY_GDN_SCAN=0
+opts out. torch.func transforms and forward-mode AD are not supported on this path (an old-style autograd Function).
+Like the guard, the wrapper is process-wide for the modeling module: other models of its classes get it too.
 
 The layers' depthwise causal conv1d (P6.10 b, docs/analysis/kernels/qwen35_conv1d.md): transformers' reference
 (F.conv1d on a transposing copy, then SiLU: 7-34x above the bandwidth floor on these GPUs) or the `causal-conv1d`
@@ -88,6 +87,9 @@ def _query(args, kwargs):
 
 _SCAN_ENV = "FLASH_ATTN_LEGACY_GDN_SCAN"
 _HAS_SCAN_OP = hasattr(_ops, "gdn_chunk_scan")  # an extension built before P6.10 c has no scan op
+# ... and its backward (c3): gradient calls take the scan too
+_HAS_SCAN_AUTOGRAD = (_HAS_SCAN_OP and hasattr(_ops, "gdn_chunk_scan_backward")
+                      and hasattr(torch.library, "register_autograd"))
 # sha1 prefixes of the reference our copy below follows (and of its l2norm): transformers 5.20.2, the same in
 # modeling_qwen3_5 / qwen3_5_moe / qwen3_next / olmo_hybrid. Another source: the reference itself runs.
 _REFERENCE_SHA1 = {"d2f00f2b07183377"}
@@ -110,7 +112,7 @@ def _scan_matches(reference):
 
 def _scan_supported(a):
     """The reference's arguments (bound) our scan takes: chunks of 64, l2norm in the kernel, K 64 / 128, V a multiple
-    of 16, one head count for q / k / v, floating CUDA tensors on one device, and no gradient needed."""
+    of 16, one head count for q / k / v, floating CUDA tensors on one device; gradients too with its backward (c3)."""
     q, k, v, g, beta, s0 = (a["query"], a["key"], a["value"], a["g"], a["beta"], a.get("initial_state"))
     tensors = [q, k, v, g, beta] + ([s0] if s0 is not None else [])
     if s0 is not None and (not isinstance(s0, torch.Tensor) or s0.shape != (q.shape[0], v.shape[2], q.shape[3],
@@ -122,7 +124,7 @@ def _scan_supported(a):
             and v.shape[:3] == q.shape[:3] and q.shape[-1] in (64, 128) and v.shape[-1] % 16 == 0
             and g.shape == q.shape[:3] and beta.shape == q.shape[:3]):
         return False
-    return not (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
+    return _HAS_SCAN_AUTOGRAD or not (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
 
 
 def _chunk_scan(reference, query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False,
@@ -179,11 +181,12 @@ def _chunk_scan(reference, query, key, value, g, beta, chunk_size=64, initial_st
     key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
     chunk_decay = cum_decay[..., -1].exp()[..., None, None]
     if kernel:
-        # solve_triangular returns column-major results: made contiguous here (the op reads rows), then freed
+        # solve_triangular's results are column-major: the op copies them to rows (transient); under autograd it keeps
+        # what its backward needs (w, k~, d and its outputs h, v_new), w being solve_triangular's own saved result
         states, v_new, last_recurrent_state = _ops.gdn_chunk_scan(
-            k_cumdecay.contiguous(), new_values.contiguous(), key, chunk_decay[..., 0, 0], last_recurrent_state)
+            k_cumdecay, new_values, key, chunk_decay[..., 0, 0], last_recurrent_state)
         del k_cumdecay, new_values
-        core_attn_out = torch.matmul(query, states)  # no gradient on this path: in place below
+        core_attn_out = torch.matmul(query, states)  # matmul's backward needs its inputs, not its output: in place
         del states
         core_attn_out += intra_chunk_attn @ v_new
     else:
@@ -242,9 +245,9 @@ def _chunk_wrapper(fn, cells):
         if not is_compiling():
             if fla_bound:
                 _record_fallback("gated_delta_chunk_arch")  # fla's chunk does not run here: the reference does
-            elif a is not None and not (torch.is_grad_enabled() and any(
-                    isinstance(t, torch.Tensor) and t.requires_grad for t in a.values())):
-                _record_fallback("gated_delta_scan_input")  # inference the scan does not take (training: c3)
+            elif a is not None and (_HAS_SCAN_AUTOGRAD or not (torch.is_grad_enabled() and any(
+                    isinstance(t, torch.Tensor) and t.requires_grad for t in a.values()))):
+                _record_fallback("gated_delta_scan_input")  # a call the scan does not take
         return reference(*args, **kwargs)
 
     setattr(chunk, _GUARDED, True)
@@ -415,3 +418,34 @@ def _conv_backward(ctx, dy):
 if _HAS_CONV_OP and hasattr(torch.library, "register_autograd"):
     torch.library.register_autograd("flash_attn_legacy::causal_conv1d", _conv_backward,
                                     setup_context=_conv_setup_context)
+
+
+# Autograd of torch.ops.flash_attn_legacy.gdn_chunk_scan (w, u, k~, d, initial_state) -> (h, v_new, final_state):
+# the reverse scan (gdn_chunk_scan_backward) gives G (the state's gradient after each chunk), dv^ (= du) and the
+# initial state's gradient; dw, dk~ and dd are batched products over the chunks (docs/analysis/kernels/
+# qwen35_delta_rule.md section 6)
+def _scan_setup_context(ctx, inputs, output):
+    w, u, kt, d, s0 = inputs
+    h, v_new, _ = output
+    ctx.has_s0 = s0 is not None
+    ctx.set_materialize_grads(False)  # unused outputs' gradients stay None (no zero-filled [B, H, NC, K, V])
+    ctx.save_for_backward(w, kt, d, h, v_new)
+
+
+def _scan_backward(ctx, dh, dv_new, d_final):
+    if torch.is_grad_enabled():
+        raise RuntimeError("flash_attn_legacy gdn_chunk_scan: double backward is not supported")
+    w, kt, d, h, v_new = ctx.saved_tensors
+    need_w, need_u, need_kt, need_d, need_s0 = ctx.needs_input_grad
+    g, dvh, ds0 = _ops.gdn_chunk_scan_backward(w, kt, d, dh, dv_new, d_final, v_new.shape[-1])
+    dkt = torch.matmul(v_new, g.transpose(-1, -2)) if need_kt else None
+    # sum G * h per chunk as a batched dot product (no [B, H, NC, K, V] temporary)
+    dd = torch.matmul(g.flatten(-2).unsqueeze(-2), h.flatten(-2).unsqueeze(-1))[..., 0, 0] if need_d else None
+    del g  # freed before dw is allocated (the incoming gradients stay alive until return: autograd holds them)
+    dw = -torch.matmul(dvh, h.transpose(-1, -2)) if need_w else None
+    return dw, (dvh if need_u else None), dkt, dd, (ds0 if ctx.has_s0 and need_s0 else None)
+
+
+if _HAS_SCAN_AUTOGRAD:
+    torch.library.register_autograd("flash_attn_legacy::gdn_chunk_scan", _scan_backward,
+                                    setup_context=_scan_setup_context)

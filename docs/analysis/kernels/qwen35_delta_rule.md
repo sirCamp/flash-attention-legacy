@@ -1,6 +1,7 @@
 # The chunk gated delta rule of Qwen3.5-class models on pre-Ampere GPUs (P6.10 c)
 
-Status: c1 done (2026-11-03): planned, reviewed, implemented, reviewed again, measured (section 5). c2 and c3 open. Last of the order
+Status: c1 and c3 done (2026-11-03): each planned, reviewed, implemented, reviewed again, measured (sections 5 and
+7). c2 open. Last of the order
 decided on 2026-11-03: (a) the `fla` guard, done; (b) the causal conv1d, done; (c) this.
 
 ## 1. Today
@@ -151,7 +152,7 @@ The shares are the same at L = 1024 and 16384 (time is linear in L).
 **Kernel** (`csrc/kernels/gdn_scan.cu`, op `gdn_chunk_scan(w, u, k̃, d, initial_state) -> (h, v_new, final_state)`).
 - One block per (batch row, head, slice of VS = 16 or 32 state columns), 256 threads.
   - VS = 32 when B·H·V/32 reaches twice the SM count, else 16.
-  - 75-96 registers, no spills; shared memory 16-32 KB.
+  - 75-96 registers on sm_60; shared memory 16-32 KB. (Section 7 corrects the "no spills" first recorded here.)
 - The w / k̃ sub-tiles are 64 x 32 fp32, loaded as float4 into registers one tile ahead.
 - Each tap's state value read from shared memory is reused for a thread's rows. The first version, with scalar
   dependent loads, ran at 7.4 ms on the P100 at 4k; the final one runs at 1.97 ms.
@@ -199,3 +200,112 @@ The 1080 Ti is not measurable (its GPU is shared with another tenant).
 - **On the T4 the prefill does not move.** Measured inside the model in one process, its 18 chunk calls take 435 ->
   401 ms: the remaining time is the PyTorch prologue and intra-chunk phase (57% of the function there), and the T4's
   sustained clocks. That is c2's target, and the P100's too.
+
+## 6. c3: the backward (plan, 2026-11-03)
+
+**Today.** A call that needs gradients runs the reference, whose autograd graph holds the 64-step loop. Its
+backward is 8-24x the forward (section 2): ~64 ms per layer at 2k on the P100, ~27% of a LoRA step.
+
+**Approach.** Register autograd on `gdn_chunk_scan`, so the whole `_chunk_scan` path is differentiable.
+- PyTorch's autograd keeps the parallel part: the prologue, the intra-chunk phase with its two batched triangular
+  solves, and the two output matmuls. These are batched ops with no per-chunk loop.
+- The op's backward is a reverse scan.
+- The routing then sends gradient calls to the scan too (c1 sends them to the reference).
+
+**The op's backward.** In the forward, per chunk c (S_c = h_c, the state at the chunk's start):
+
+    v_c = u_c - w_c S_c,   S_{c+1} = d_c S_c + k̃_cᵀ v_c
+
+Given dh_c, dv_c (from the output matmuls) and dS_NC (the final state's gradient), let G_{c+1} = ∂L/∂S_{c+1}, with
+G_NC = dS_NC. Then, for c = NC-1 .. 0:
+
+    dv̂_c = dv_c + k̃_c G_{c+1}                    (all of v_c's gradient: through S_{c+1} too)
+    G_c  = d_c G_{c+1} - w_cᵀ dv̂_c + dh_c
+
+and the inputs' gradients:
+
+    du_c = dv̂_c,   dw_c = -dv̂_c S_cᵀ,   dk̃_c = v_c G_{c+1}ᵀ,   dd_c = Σ G_{c+1} ⊙ S_c,   dS_0 = G_0
+
+- **The recurrence in G has the forward's shape.** It goes in reverse chunk order, uses k̃ in place of w and w in
+  place of k̃, has signs flipped, and adds dh_c. Its columns are independent, as the state's are.
+  - So it is the same kernel, with a template flag: blocks over state-column slices, w / k̃ streamed in sub-tiles.
+  - It stores G_{c+1} per chunk ([B, H, NC, K, V]) and dv̂ ([B, H, NC, 64, V]).
+- **The rest is batched matmuls in PyTorch, parallel over the chunks**: dw = -dv̂·hᵀ, dk̃ = v·Gᵀ, dd = Σ G ⊙ h.
+  These reduce over V, which crosses the column slices, so they are not done in the kernel: no atomics, deterministic.
+- **Saved for the backward**: h and v_new, the op's outputs; w, k̃ and d, its inputs.
+- **Memory**: G is another [B, H, NC, K, V] fp32 transient in the backward, 64 MB per layer at 4k (B = 1, 16 heads).
+  The reference's graph saves the state at every chunk too.
+
+**Routing.** Gradient calls take the scan when their arguments are supported; the training route is no longer
+counted. The reentrant-checkpointing note of c1 goes away: both passes take the scan.
+
+**Acceptance.**
+1. **Gradients against the reference's autograd, fp32**: dq, dk, dv, dg, dβ and d(initial state) within 1e-4
+   relative, per head, over the four regimes of the c1 tests, at K 64 / 128 and V 48 / 128. Also with the final state
+   in the loss (dS_NC), and with the output alone.
+2. **The op's backward against fp64**: the Python reverse loop in fp64 (autograd of the op's math). `gradcheck` is not
+   usable on an fp32-only op.
+3. **Model.** A tiny Qwen3.5 (K ≠ V): a LoRA step's gradients within fp16 noise of the reference path, and a few
+   optimizer steps whose losses agree. Gradient checkpointing, reentrant and not.
+4. **Speed.** Forward + backward of the function at 2k / 4k on the four measurable GPUs, against the reference's.
+   Qwen3.5-2B LoRA step at 1k (2k where it fits) A/B, 4 rounds per arm: expected 1.2-1.3x on the P100 (from section
+   2's share), to be measured.
+5. **Peak memory** of a training forward + backward no higher than the reference's.
+6. **Suite.** ptxas 0 spills; opcheck with autograd registration; the full suite green on all five GPUs.
+
+## 7. c3 as implemented, and the results
+
+**Plan review points applied.**
+- The op saves solve_triangular's own result for w, not a contiguous copy. The copy for the kernel's row loads is a
+  transient inside the op.
+- `set_materialize_grads(False)`: unused outputs' gradients reach the backward op as None, treated as zeros in the
+  kernel, with no zero-filled [B, H, NC, K, V] tensor.
+- dd is a batched dot product (no G ⊙ h temporary).
+- Double backward raises.
+- `_scan_supported` takes gradient calls when the backward is registered; unsupported calls are counted with or
+  without gradients.
+- The derivation was checked in fp64 against autograd of the recurrence: every gradient to ~1e-16.
+- The plan review's doubt about the gain (whether `solve_triangular`'s backward would dominate) was settled by
+  measuring before committing to the design. Forward + backward of the function on the P100 went from 71 to 15 ms at
+  2k and from 228 to 29 ms at 4k.
+
+**Code review points applied.**
+- Tests with VS = 32 (B·H·V/32 above twice the SM count) and K = 128 against fp64, a 4096-token gradient case, five
+  AdamW steps against the reference, and `test_aot_dispatch_dynamic`.
+- The comment on freeing the incoming gradients early was wrong (autograd holds them until the backward returns) and
+  was dropped; G is freed before dw is allocated.
+
+**Accuracy.**
+- Gradients of q, k, v, g, β and the initial state against the reference's autograd: ~5e-7 relative in fp32, under a
+  per-head bound of 1e-4 in all four regimes, with and without the final state in the loss.
+- The op's backward against fp64 autograd of the recurrence: within 1e-5.
+- Losses of a tiny Qwen3.5 over five AdamW steps: within 1e-3 of the reference path.
+
+**In the model** (Qwen3.5-2B fp16, our attention and conv, `qwen35_conv_model_ab.py`: A =
+`FLASH_ATTN_LEGACY_GDN_SCAN=0`, B = the scan with its backward, 4 rounds per arm alternated; the LoRA step is a
+forward + backward at 1024 tokens, rank-16 adapters on the projections, gradient checkpointing, fp16 autocast):
+
+| GPU | LoRA step | prefill 4096 | generate 2048 + 64 |
+|---|---|---|---|
+| V100 | 1213 -> 405 ms (2.99x) | 1.170x | 1.081x |
+| 2080 Ti | 1735 -> 603 ms (2.88x) | 1.154x | 1.031x |
+| T4 | 1671 -> 1203 ms (1.39x) | 0.985x (overlapping ranges) | 0.986x (overlapping) |
+| P100 | 2251 -> 1911 ms (1.18x) | 1.040x | 1.013x |
+| 1080 Ti | 3156 -> 2866 ms (1.10x) | 0.989x | 1.001x |
+
+- The 1080 Ti's GPU was not shared during this run: its ranges are tight.
+- Its prefill is 1.1% slower with the scan, with non-overlapping ranges: at B = 1 its 28 SMs take the 64 blocks of
+  VS = 32 in two waves. This is a known, small regression, left for c2, which changes that phase.
+- The training gain is the largest of P6.10. On the V100 and 2080 Ti the delta rule's reference backward was most of
+  the LoRA step.
+
+**ptxas** (the 8 instantiations, sm_60 / 70 / 75). Acceptance 6 asked for no spills; two remain, both of one
+register.
+- sm_70, the backward at K 128 / VS 32: 8 bytes. ptxas keeps sm_70 at 80 registers, for 3 blocks per SM.
+- sm_75, the forward at K 128 / VS 16: 4 bytes.
+- The c1 kernel already had 8-byte sm_70 spills, at VS 32 for both K: section 5's "no spills" was wrong.
+- Cost: the forward op on the T4 (B = 1, 16 heads, K = V = 128, 64 chunks, VS 16), c1 against c3, 5 alternated runs per
+  arm: median 4.42 against 4.41 ms. Not measurable; left as is.
+
+**Suite.** test_gated_delta and test_causal_conv1d, with and without fla, are green on all five GPUs: 179 passed
+without fla, 177 with. Opcheck covers the autograd registration (`test_aot_dispatch_dynamic`).

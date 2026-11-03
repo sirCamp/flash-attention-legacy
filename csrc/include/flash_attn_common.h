@@ -270,12 +270,15 @@ struct ConvParams {
 // The sequential scan of the chunk gated delta rule (gdn_scan.cu, docs/PLAN.md
 // P6.10 c): per (batch row, head) over chunks of 64 tokens, fp32, contiguous.
 // ---------------------------------------------------------------------------
+// The backward reuses the fields (in parentheses): u (dv_new), s0 (the final state's gradient), h (G_{c+1}), v_new
+// (dv^), s_final (the initial state's gradient), plus dh; the gradients may be nullptr (zeros: undefined).
 struct GdnScanParams {
     const float* __restrict__ w;     // [B, H, NC, 64, K]: the UT-solved decayed keys
     const float* __restrict__ u;     // [B, H, NC, 64, V]: the UT-solved values ("new values")
     const float* __restrict__ kt;    // [B, H, NC, 64, K]: the keys decayed to the chunk's end
     const float* __restrict__ d;     // [B, H, NC]: the chunk's total decay exp(g summed)
     const float* __restrict__ s0;    // [B, H, K, V] or nullptr (zeros)
+    const float* __restrict__ dh;    // backward: [B, H, NC, K, V], the gradient of h
     float* __restrict__ h;           // [B, H, NC, K, V]: the state at each chunk's start
     float* __restrict__ v_new;       // [B, H, NC, 64, V]
     float* __restrict__ s_final;     // [B, H, K, V]

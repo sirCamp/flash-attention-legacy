@@ -103,6 +103,12 @@ def _register_fakes():
             V = u.shape[-1]
             return w.new_empty((B, H, NC, K, V)), u.new_empty((B, H, NC, 64, V)), w.new_empty((B, H, K, V))
 
+        @register("flash_attn_legacy::gdn_chunk_scan_backward")
+        def _(w, kt, d, dh, dv_new, d_final_state, v_dim):
+            B, H, NC, _, K = w.shape
+            V = v_dim
+            return w.new_empty((B, H, NC, K, V)), w.new_empty((B, H, NC, 64, V)), w.new_empty((B, H, K, V))
+
 
 _register_fakes()
 
