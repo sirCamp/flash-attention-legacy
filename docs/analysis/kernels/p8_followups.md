@@ -181,6 +181,73 @@ It measures:
 3 goes ahead only if the top-1 flips and perplexity are at the stock-FP16 noise floor, with the margins of P8's
 `--accuracy` table.
 
+**Gate result (P8.7, 2026-11-02 / 03; `attn_hfma2_emul.py` in this directory; revised after an independent review).**
+
+Method:
+- The emulation is faithful to the arithmetic, not to the tiling. Each fp16 FMA is the product and sum exact in fp64,
+  rounded to fp16 once.
+- S: Q prescaled and rounded to fp16, two lanes of 32 products per 64 dims (the first a multiply), fp32 fold.
+- P: online softmax in fp32 over blocks of 64 keys, p rounded to fp16 for PV.
+- PV: per output column an fp16 chain over the 64 keys of a block (half2(p, p)), folded into the fp32 O with alpha.
+- `EMUL_PARTS` selects S, PV or both; the other parts stay fp32. Two exact variants of S:
+  - `EMUL_K_CENTER`: K minus its per-head mean over the keys, which shifts each row of S by a constant;
+  - `EMUL_POW2`: Q prescaled by a power of 2 only, the remaining factor applied in fp32 after the fold.
+- Tensors: 2 x 1024 wikitext-2 tokens through each model; every attention call compared to fp64, with today's output
+  passed on (errors do not accumulate across layers). V100 with `FLASH_ATTN_LEGACY_FORCE_ARCH=pascal`, so "today" is
+  the same fp32 Pascal code as on the P100 (the P100 gave the same figures for the two models run there).
+- Models: P8's `--accuracy` setting (16 x 1024 tokens, 16,368 predictions), top-1 flips against the FP32 model.
+
+O error vs fp64, median / max over the layer calls. Today's kernel (flash_attn_legacy, fp32 path) has 2.1e-4 /
+2.1-2.4e-4 on every model.
+
+| model | S | S, K centered + pow2 | PV |
+|---|---|---|---|
+| Qwen2.5-0.5B | 2.3e-3 / 2.4e-2 | 2.5e-3 / 4.0e-3 | 6.2e-4 / 1.6e-3 |
+| TinyLlama-1.1B | 1.8e-3 / 2.5e-3 | - | 7.6e-4 / 1.2e-3 |
+| Qwen2.5-1.5B | 1.8e-3 / 6.1e-3 | - | 7.4e-4 / 1.4e-3 |
+| Qwen3-1.7B | 1.7e-3 / 2.5e-3 | 1.5e-3 / 2.5e-3 | 6.4e-4 / 8.1e-4 |
+
+S near each row's max: the keys within 16 log2 units of the row max, the only ones exp2 does not flush to ~0.
+
+| model | max abs error of S near the max (log2 units), S | K centered + pow2 | largest \|S\| near the max | largest fp16 lane |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 4.1 | 0.23 | 2490 | 1827 (centered: 51) |
+| TinyLlama-1.1B | 0.11 | - | 21 | 59 |
+| Qwen2.5-1.5B | 16.5 | - | 35000 | 10728 |
+| Qwen3-1.7B | 0.085 | 0.079 | 59 | 44 |
+
+Qwen2.5's attention-sink layers score up to |S| ≈ 2500 (0.5B) and 35000 (1.5B) in the log2 domain. An fp16 lane there
+has an ulp of 1-8, and the heaviest P weights are off by up to 70% (0.5B) and 730% (1.5B). Centering K removes most of
+that magnitude (lane 1827 -> 51), but the error of the ordinary layers remains: every model's median O error is 7-12x
+today's.
+
+Top-1 flips against FP32, as a ratio to today's kernel. The perplexity of every variant is within 0.0024 of today's.
+
+| model | PV | S | S + PV | S + PV, K centered + pow2 (V100 run) |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 1.18x | 1.53x | 1.70x | 1.10x |
+| TinyLlama-1.1B | 1.10x | 1.27x | 1.03x | 1.31x |
+| Qwen2.5-1.5B | 1.10x | 1.21x | 1.20x | 1.06x |
+| Qwen3-1.7B | 1.14x | 1.06x | 1.03x | 1.09x |
+
+The two stock FP16 variants differ by 0.90-1.58x (PLAN P8, `docs/bench/linear.md` "Accuracy"). With ~30-100 flips per
+model, these ratios are noisy: S alone gives 1.27x on TinyLlama and S + PV 1.03x.
+
+**Verdict.** The written bar is a forward error ≤ 2x today's (acceptance below).
+- **S on HFMA2 fails it** on all four models: median 8-12x, max up to 100x.
+  - The exact variants do not help: K centering + pow2 prescale is still 7-12x median.
+  - A finer fold would cut the error about with the number of roundings, but at |S| of thousands the lanes still round
+    at ulp 1-8, and the fold already costs ~28% at 64 products (section 3), so folding 4x more often removes the gain.
+- **PV alone also fails it**: 3.0-3.7x median.
+  - It passes the top-1 / perplexity part (1.10-1.18x, within the stock range).
+  - It would only be taken up if the error bar were relaxed on purpose: today's 2.1e-4 is near the fp16 output
+    rounding, so any fp16 accumulation exceeds 2x.
+  - Its speed ceiling is also low. S and PV each take L·Lk·d FMAs, so doubling PV's rate gives 1 / (0.5 + 0.25) =
+    1.33x if the forward is FMA-bound (Bc = 8 at d = 128). That is before exp2, the softmax bookkeeping, the
+    conversions and the fold. Reaching the 1.3x acceptance would leave < 3% of the forward for all of those.
+- **So 3 (and 3') are not taken up** (decided 2026-11-03). PV-only stays a recorded option, needing a deliberate change
+  of the error bar and a static instruction count ≥ 1.3x first.
+
 **Design, if the gate passes** (sm_60 fp16 inputs only):
 
 - **Q, K and V.** They stay fp16 in shared memory. Q is prescaled by softmax_scale·log2(e) (≈ 0.128 at d = 128) before
@@ -261,9 +328,10 @@ fp32 math on fp16 storage, not HFMA2.
 2. **P8.7 (3.0)**: the emulation gate for HFMA2 attention. It is cheap (PyTorch only) and decides whether 3 exists.
 3. **P8.8 (2b.1)**: fp32 weights under autocast. It brings the standard full fine-tuning recipe onto the kernel. It is
    profiled first, then estimated.
-4. **P8.9 (3)**: the HFMA2 attention forward, if the gate passed.
+4. ~~**P8.9 (3)**: the HFMA2 attention forward, if the gate passed.~~ The gate failed for S (section 3, "Gate result");
+   not scheduled.
 5. **P8.10 (2b.2)**: dW on the kernel, after the overflow histogram.
-6. **P8.11 (3')**: the HFMA2 attention backward.
+6. ~~**P8.11 (3')**: the HFMA2 attention backward.~~ Not scheduled (as P8.9).
 7. **P8.12 (4)**: the SASS main loop, after the tooling decision (A-D) and the assembler verification.
 
 Each one follows the usual process: analysis, plan, review, implement. Tests run on all boxes and get an independent
