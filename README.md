@@ -43,6 +43,8 @@ handle (listed in "What runs on the kernel").
 
 4. **Faster FP16 linear layers on the P100** (opt-in, `patch_linear`): a GEMM on paired FP16 FMAs with FP32 folds, for the matrix multiplications around attention. Prefill up to 1.82x, LoRA training up to 1.33x and full fine-tuning 1.19x (with the AdamW step; 1.27x forward + backward) faster on top of the attention kernels.
 
+5. **Qwen3.5-class hybrid models on these GPUs** (Qwen3.5, Qwen3.5-MoE, Qwen3-Next, OLMo-hybrid): their Gated DeltaNet (linear attention) layers run on our kernels, where `fla` and `causal-conv1d` do not run (and `fla` installed crashes the model). Qwen3.5-2B prefill up to 1.39x and LoRA training up to 3.3x faster than on transformers' PyTorch reference ([below](#qwen35-class-hybrid-models-gated-deltanet-layers)).
+
 ## Supported Hardware
 
 | Architecture | GPUs | SM | Tensor Cores | Kernel |
@@ -60,6 +62,8 @@ The kernels compute in **FP16**.
 Supports **MHA**, **GQA** (grouped-query), and **MQA** (multi-query) attention.
 
 The P100 (SM 6.0) also has an opt-in kernel for the FP16 linear layers ([below](#fp16-linear-layers-on-the-p100-opt-in)); on every other GPU it is a no-op.
+
+The Gated DeltaNet kernels of Qwen3.5-class models (the causal conv1d and the chunk delta rule; [below](#qwen35-class-hybrid-models-gated-deltanet-layers)) run on every GPU above, in fp16 / bf16 / fp32.
 
 ## Installation
 
@@ -81,7 +85,7 @@ pip install -e ".[test,bench]" --no-build-isolation
 compiles SM 6.0 / 6.1 / 7.0: use 12.x); PyTorch >= 1.12 built for that architecture (the cu126 wheels of PyTorch 2.7.1 cover
 all of them); transformers >= 5.0 for the HuggingFace integration.
 
-> **Tested configuration** (v1.0.0):
+> **Tested configuration** (v1.1.0):
 > - PyTorch 2.7.1 (cu126 wheels)
 > - Transformers 5.20.2
 > - CUDA 12.6 (12.8 on the P100)
@@ -245,6 +249,50 @@ faster; a 300-step full fine-tune (FP32 weights, autocast, GradScaler) too (±6.
 steps), 1.24x faster. Training needs loss scaling (GradScaler), as FP16 training does anyway: the kernel multiplies in
 FP16, so tiny unscaled gradients underflow where cuBLAS's FP32 products do not.
 
+### Qwen3.5-class hybrid models (Gated DeltaNet layers)
+
+Qwen3.5, Qwen3.5-MoE, Qwen3-Next and OLMo-hybrid interleave attention with Gated DeltaNet layers (linear attention: 3 layers
+in 4 in Qwen3.5). transformers runs those on `fla`'s Triton kernels and `causal-conv1d` when they import, else on its fp32
+PyTorch reference. Below SM 8.0 neither package helps:
+- `fla`'s chunk kernel fails to compile on all five GPUs here, which crashes the model;
+- `causal-conv1d` ships no code below SM 7.5.
+
+Loaded with `attn_implementation="flash_attn_legacy"`, these models get, with no code changes:
+
+- **The depthwise causal conv1d** on our kernels: forward, backward and the decode update, fp16 / bf16 / fp32, 6-20x
+  faster than the reference conv.
+- **The chunk gated delta rule** (prefill and training) on our kernels: the sequential scan as one kernel, forward and
+  backward, and the prologue and intra-chunk phase in one fused kernel with an analytic backward. fp32 inside, as the
+  reference; under strong decays closer to the exact rule than the reference.
+- **With `fla` installed:** its chunk kernel kept away below SM 8.0, and its recurrent kernel (decode, which works) kept
+  (generate 1.05-1.13x faster than without `fla`).
+
+Measured on Qwen3.5-2B fp16, the delta-rule kernels against transformers' reference (our conv in both):
+
+| | V100 | 2080 Ti | T4 | P100 | 1080 Ti |
+|---|---|---|---|---|---|
+| Prefill, 4k tokens | 1.39x | 1.38x | 1.14x | 1.09x | 1.04x |
+| LoRA step (rank 16, gradient checkpointing, fp16 autocast, 1k tokens) | 3.3x | 3.1x | 1.45x | 1.22x | 1.14x |
+
+These are products of two A/Bs with alternated rounds: the scan against the reference, then the fused intra-chunk kernel
+against the scan. Each step's own numbers, accuracy and memory are in
+[`docs/analysis/kernels/qwen35_delta_rule.md`](docs/analysis/kernels/qwen35_delta_rule.md) (and
+[`qwen35_conv1d.md`](docs/analysis/kernels/qwen35_conv1d.md) for the conv). Decode runs transformers' recurrent reference,
+or `fla`'s recurrent kernel when it is installed.
+
+Opt-outs (set them before loading the model):
+
+| Variable | Effect |
+|---|---|
+| `FLASH_ATTN_LEGACY_CONV1D=0` | transformers' conv |
+| `FLASH_ATTN_LEGACY_GDN_SCAN=0` | transformers' reference delta rule |
+| `FLASH_ATTN_LEGACY_GDN_PREP=0` | the scan kernel with the reference's PyTorch lines for the intra-chunk phase |
+| `FLASH_ATTN_LEGACY_FLA_CHUNK=fla` | `fla`'s chunk kernel left in place, for a newer `fla` / Triton that compiles it |
+
+The delta-rule kernels apply only to the reference source they were written from (transformers 5.20.2, checked by
+fingerprint); another transformers version runs its reference, with a warning. `fallback_stats()` counts the calls the
+kernels do not take.
+
 ### GPU compatibility check
 
 ```python
@@ -291,25 +339,25 @@ measured; compiled decode needs SM >= 7.0): `python benchmarks/models.py --summa
 | TinyLlama-1.1B-Chat-v1.0 | P100 | 1.71x, -3.9 GiB | 1.24x, -1.0 GiB | - | 1.26x, -1.0 GiB | >= 128k / 4k |
 | TinyLlama-1.1B-Chat-v1.0 | 1080 Ti | 1.72x, -3.9 GiB | 1.13x, -1.0 GiB | - | 1.21x, -1.0 GiB | 64k / 4k |
 | TinyLlama-1.1B-Chat-v1.0 | 2080 Ti | 3.21x, -3.9 GiB | 1.15x, -1.0 GiB | 1.30x, -1.0 GiB | 2.02x, -1.0 GiB | 64k / 4k |
-| Qwen3.5-2B | V100 32 GB | 1.07x, -0.7 GiB | 0.98x, -0.1 GiB | 1.02x, -0.1 GiB | 0.93x | >= 16k / >= 16k |
-| Qwen3.5-2B | T4 | 1.10x, -0.7 GiB | 1.02x, -0.1 GiB | 1.05x, -0.1 GiB | 1.01x | >= 16k / 8k |
-| Qwen3.5-2B | P100 | 0.99x, -0.7 GiB | 1.02x, -0.1 GiB | - | 0.99x | >= 16k / 8k |
-| Qwen3.5-2B | 1080 Ti | 0.99x, -0.7 GiB | 1.01x, -0.1 GiB | - | OOM | >= 16k / 8k |
-| Qwen3.5-2B | 2080 Ti | 1.07x, -0.7 GiB | 1.00x, -0.1 GiB | 1.03x, -0.1 GiB | OOM | >= 16k / 8k |
+| Qwen3.5-2B (v1.0.0) | V100 32 GB | 1.07x, -0.7 GiB | 0.98x, -0.1 GiB | 1.02x, -0.1 GiB | 0.93x | >= 16k / >= 16k |
+| Qwen3.5-2B (v1.0.0) | T4 | 1.10x, -0.7 GiB | 1.02x, -0.1 GiB | 1.05x, -0.1 GiB | 1.01x | >= 16k / 8k |
+| Qwen3.5-2B (v1.0.0) | P100 | 0.99x, -0.7 GiB | 1.02x, -0.1 GiB | - | 0.99x | >= 16k / 8k |
+| Qwen3.5-2B (v1.0.0) | 1080 Ti | 0.99x, -0.7 GiB | 1.01x, -0.1 GiB | - | OOM | >= 16k / 8k |
+| Qwen3.5-2B (v1.0.0) | 2080 Ti | 1.07x, -0.7 GiB | 1.00x, -0.1 GiB | 1.03x, -0.1 GiB | OOM | >= 16k / 8k |
 | gemma-2-2b-it | V100 32 GB | 1.39x, -0.9 GiB | 1.08x, -0.2 GiB | 1.10x, -0.2 GiB | 1.07x | >= 16k / >= 16k |
 | Qwen2.5-3B | V100 32 GB | 1.75x, -1.8 GiB | 1.11x, -0.4 GiB | 1.11x, -0.4 GiB | 1.33x | >= 128k / 8k |
 | Qwen2.5-3B | T4 | 1.96x, -1.8 GiB | 1.11x, -0.4 GiB | 1.17x, -0.4 GiB | 1.38x | 32k / 4k |
 | Qwen2.5-3B | P100 | 1.12x, -1.8 GiB | 1.28x, -0.4 GiB | - | 1.03x | 64k / 4k |
 | Qwen2.5-3B | 1080 Ti | 1.16x, -1.8 GiB | 1.08x, -0.4 GiB | - | 1.01x (LoRA) | 32k / 4k |
 | Qwen2.5-3B | 2080 Ti | 1.72x, -1.8 GiB | 1.12x, -0.4 GiB | 1.18x, -0.4 GiB | only ours (LoRA) | 16k / 4k |
-| Qwen3.5-4B | V100 32 GB | 1.08x, -1.3 GiB | 1.10x, -0.1 GiB | 1.05x, -0.2 GiB | 1.00x | >= 16k / 8k |
-| Qwen3.5-4B | T4 | 1.10x, -1.3 GiB | 1.02x, -0.1 GiB | 1.06x, -0.2 GiB | OOM (no ckpt) | >= 16k / 4k |
-| Qwen3.5-4B | P100 | 0.99x, -1.3 GiB | 1.08x, -0.1 GiB | - | OOM | 16k / 4k |
+| Qwen3.5-4B (v1.0.0) | V100 32 GB | 1.08x, -1.3 GiB | 1.10x, -0.1 GiB | 1.05x, -0.2 GiB | 1.00x | >= 16k / 8k |
+| Qwen3.5-4B (v1.0.0) | T4 | 1.10x, -1.3 GiB | 1.02x, -0.1 GiB | 1.06x, -0.2 GiB | OOM (no ckpt) | >= 16k / 4k |
+| Qwen3.5-4B (v1.0.0) | P100 | 0.99x, -1.3 GiB | 1.08x, -0.1 GiB | - | OOM | 16k / 4k |
 | Mistral-7B-Instruct-v0.2 | V100 32 GB | 1.66x, -3.8 GiB | 1.16x, -0.9 GiB | 1.13x, -0.9 GiB | OOM (no ckpt) | >= 16k / 4k |
 | Mistral-7B-Instruct-v0.2 | P100 | only ours | 1.26x, -0.9 GiB | - | OOM (no ckpt) | 4k / 1k |
 | Llama-3.1-8B-Instruct | V100 32 GB | 1.65x, -3.8 GiB | 1.32x, -0.9 GiB | 1.13x, -0.9 GiB | 1.29x (LoRA) | >= 16k / 4k |
 | Llama-3.1-8B-Instruct | P100 | OOM | only ours | - | OOM (LoRA) | 2k / 1k |
-| Qwen3.5-9B | V100 32 GB | 1.06x, -1.3 GiB | 0.98x, -0.1 GiB | 1.02x, -0.2 GiB | - | >= 32k / 8k |
+| Qwen3.5-9B (v1.0.0) | V100 32 GB | 1.06x, -1.3 GiB | 0.98x, -0.1 GiB | 1.02x, -0.2 GiB | - | >= 32k / 8k |
 | Qwen2.5-14B | V100 32 GB | only ours | 1.16x, -1.1 GiB | 1.12x, -1.2 GiB | OOM (LoRA) | 8k / 2k |
 
 Larger models: Llama 3.1 8B on the V100 prefills at least 16k tokens (the longest measured; SDPA / eager 4k; 1.65x and -3.8 GiB at 4k), decodes 8 x 2k prompts
@@ -319,14 +367,16 @@ Qwen3.5-9B at least 32k (others 8k).
 
 The attention memory is O(N) in the sequence instead of O(N^2), so contexts up to 32x longer fit (TinyLlama prefill on the T4 /
 P100; the same length where the weights or the KV cache, not the attention, set the limit), and where all fit the kernel is
-faster or at parity: the rows below 1x in the full tables (0.93-0.99x) are the Qwen3.5 models (host bound) and one Gemma 2 2B train step
+faster or at parity: the rows below 1x in the full tables (0.93-0.99x) are the Qwen3.5 models (host bound, v1.0.0) and one Gemma 2 2B train step
 on the V100 at 1k (0.98x), within the noise of the shared cloud boxes (see `docs/bench/models.md`). The training loss agrees with SDPA and eager in every case where more than one fits (largest
 difference 0.0007). With gradient checkpointing on the large-vocabulary models (Qwen2.5, Llama 3.1: vocabularies of 128k-152k) the
 full-vocabulary fp32 logits of HF's loss take most of the memory, so the length gain shrinks (LoRA on the V100: Qwen2.5-3B 8k
 for all, Llama 3.1 8B 8k against 4k) while the speedup stays (LoRA Qwen2.5-3B 4k: 1.54x V100, 2.68x T4); on TinyLlama (32k
 vocabulary) checkpointing with our kernel trains 4-8x longer sequences. On the 1080 Ti SDPA with a padding mask runs its fp16
 kernel, which sm_61 executes at 1/64 rate: hence 5.65x. Models whose time is not in attention (Qwen3.5: 3 linear-attention
-layers in 4, here on transformers' PyTorch reference) run at parity or faster (compiled decode 1.00-1.32x), with the memory saving. Decode reads the cache in place with
+layers in 4) run at parity or faster (compiled decode 1.00-1.32x), with the memory saving. Their rows, marked v1.0.0, were measured
+before the Gated DeltaNet kernels, with those layers on transformers' PyTorch reference in every column; the kernels' gains on
+top are [above](#qwen35-class-hybrid-models-gated-deltanet-layers). Decode reads the cache in place with
 a split-KV kernel (`flash_attn_with_kvcache`, paged caches too); HF's compiled decode steps (`generate` with a StaticCache,
 SM >= 7.0) run without graph breaks.
 
@@ -422,6 +472,9 @@ FLASH_ATTN_LEGACY_FORCE_ARCH=pascal pytest tests/test_flash_attn.py -v
 # P100 linear layers (on other GPUs only the no-op / fallback tests run), and their benchmark
 pytest tests/test_linear.py -v
 python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / --decode <hf id>
+
+# Gated DeltaNet kernels (Qwen3.5-class models), against transformers' reference and fp64
+pytest tests/test_gated_delta.py tests/test_causal_conv1d.py -v
 ```
 
 ## Limitations
@@ -437,7 +490,12 @@ python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / -
    - padded batches and static caches get FlashAttention-2's 2D `[batch, keys]` mask; models that index the attention mask as 4D (e.g. Doge) fail with it
    - Llama 4 (chunked attention) is not supported yet: transformers refuses chunked attention for backends whose name contains "flash"
 7. **P100 linear layers** (`patch_linear`, opt-in): SM 6.0 only, FP16 tensors, or FP32 ones under FP16 autocast (bf16 and other autocast dtypes stay on `F.linear`); training needs a loss scale (GradScaler); slightly less accurate than stock FP16 on near-ties (see above); the weight gradient stays on cuBLAS; with `FLASH_ATTN_LEGACY_LINEAR=1` a model moved to the GPU after its first forward needs `patch_linear(model)` by hand
-8. **Qwen3.5-class hybrid models with `fla` installed** (Qwen3.5, Qwen3.5-MoE, Qwen3-Next, OLMo-hybrid): `fla`'s chunk kernel does not compile below SM 8.0, which crashes these models on every GPU here. Loaded with `attn_implementation="flash_attn_legacy"`, their chunk delta rule runs on transformers' PyTorch reference instead, process-wide for that model class, and `fla`'s recurrent kernel keeps decoding: generate 1.05-1.13x faster than without `fla`, prefill unchanged. Packed sequences (`cu_seqlens`) still need `fla`'s chunk kernel: they raise. `FLASH_ATTN_LEGACY_FLA_CHUNK=fla` leaves `fla`'s chunk kernel in place (for a newer `fla` / Triton that compiles it). Their depthwise causal conv1d (which `causal-conv1d` does not cover below SM 7.5) runs on our kernels for these models: the conv 6-20x faster, prefill 1.03-1.04x and generate 1.04-1.06x on Qwen3.5-2B; `FLASH_ATTN_LEGACY_CONV1D=0` opts out. Their chunk delta rule runs on our kernels (the sequential scan forward and backward, the prologue and intra-chunk phase in one kernel with an analytic backward): Qwen3.5-2B prefill about 1.04-1.39x against transformers' reference (1.14-1.39x on the V100 / 2080 Ti / T4; products of two A/Bs, sections 7 and 9 of docs/analysis/kernels/qwen35_delta_rule.md), LoRA training about 1.14-3.3x (about 3x on the V100 / 2080 Ti); `FLASH_ATTN_LEGACY_GDN_SCAN=0` opts out, `FLASH_ATTN_LEGACY_GDN_PREP=0` keeps the reference's PyTorch lines for the intra-chunk phase
+8. **Qwen3.5-class hybrid models** ([above](#qwen35-class-hybrid-models-gated-deltanet-layers)):
+   - packed sequences (`cu_seqlens`) in their Gated DeltaNet layers need `fla`'s chunk kernel, which does not run below SM 8.0: they raise;
+   - the delta-rule kernels follow transformers 5.20.2's reference (another version runs the reference);
+   - the patches are process-wide for the model's modeling module (other models of its classes get them too);
+   - the intra-chunk phase's backward is PyTorch: training gains come from the scan's backward and the fused forward;
+   - torch.func transforms and forward-mode AD are not supported on the delta-rule path
 
 ## Roadmap
 
@@ -459,6 +517,8 @@ python benchmarks/linear.py                # GEMM shapes; --accuracy <hf id> / -
 - [x] End-to-end benchmarks on real models (prefill, decode, training, padded batches, LoRA; up to 14B; 5 GPUs)
 - [x] Short queries against a cache beyond 8 query rows per KV head (assisted / speculative decoding, MQA / GQA > 8:1): key splits and packed GQA rows in the forward (`docs/analysis/kernels/spec_decode_design.md`)
 - [x] FP16 linear layers on the P100 (HFMA2 GEMM with FP32 folds, opt-in `patch_linear`): prefill up to 1.82x, LoRA training up to 1.33x, full fine-tuning 1.19x
+- [x] Qwen3.5-class hybrid models (Gated DeltaNet) below SM 8.0: the `fla` guard, causal conv1d kernels, the chunk delta rule's scan (forward and backward) and fused intra-chunk kernel
+- [ ] A fused backward of the delta rule's intra-chunk phase (`docs/analysis/kernels/qwen35_delta_rule.md`, c2b)
 - [ ] Serving: one grid for mixed prefill + decode batches (they run today on the varlen kernel), a vLLM backend plugin
   (Turing only, see `docs/analysis/vllm_feasibility.md`)
 - [ ] Dropout and deterministic dQ in the kernel

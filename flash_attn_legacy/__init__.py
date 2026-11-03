@@ -30,7 +30,7 @@ and patch_linear(model), or FLASH_ATTN_LEGACY_LINEAR=1 for HF models loaded with
 attn_implementation="flash_attn_legacy".
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .flash_attn import (
     flash_attention,
